@@ -1,6 +1,6 @@
 {
   "name": "theoremts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Formal verification for TypeScript — prove your code is correct for all inputs using Z3",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -28,9 +28,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/tiagoschmitt/theorem"
+    "url": "https://github.com/theoremts/theorem"
   },
-  "homepage": "https://github.com/tiagoschmitt/theorem#readme",
+  "homepage": "https://github.com/theoremts/theorem#readme",
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "dev": "tsc --project tsconfig.json --watch",

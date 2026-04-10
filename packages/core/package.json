@@ -1,6 +1,6 @@
 {
   "name": "@theoremts/core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Core engine for Theorem — parser, translator, solver, scanner, suggester",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -32,7 +32,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/tiagoschmitt/theorem"
+    "url": "https://github.com/theoremts/theorem"
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",

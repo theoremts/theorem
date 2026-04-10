@@ -1,6 +1,6 @@
 {
   "name": "theoremts-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CLI for Theorem — formal verification for TypeScript",
   "license": "MIT",
   "bin": {
@@ -19,7 +19,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/tiagoschmitt/theorem"
+    "url": "https://github.com/theoremts/theorem"
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
@@ -28,7 +28,7 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "@theoremts/core": "0.1.0",
+    "@theoremts/core": "0.1.1",
     "commander": "^12.1.0"
   },
   "devDependencies": {
