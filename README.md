@@ -87,8 +87,7 @@ A 60-year member gets 120% discount → negative shipping cost. Z3 finds it in 0
 ## Installation
 
 ```bash
-npm install theoremts
-npm install -D theoremts-cli
+npm install -D theoremts theoremts-cli
 ```
 
 ## Usage
