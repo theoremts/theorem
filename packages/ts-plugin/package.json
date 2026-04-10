@@ -1,5 +1,5 @@
 {
-  "name": "theorem-ts-plugin",
+  "name": "theoremts-ts-plugin",
   "version": "0.1.0",
   "description": "TypeScript Language Service Plugin for Theorem — inline verification in VS Code",
   "license": "MIT",

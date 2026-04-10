@@ -1,4 +1,4 @@
-import { declare, requires, ensures, nonNegative, output } from 'theorem'
+import { declare, requires, ensures, nonNegative, output } from 'theoremts'
 
 declare(Math.sqrt, (x: number): number => {
   requires(x >= 0)

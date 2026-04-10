@@ -1,4 +1,4 @@
-import { proof, requires, ensures, positive, nonNegative, between, output } from 'theorem'
+import { proof, requires, ensures, positive, nonNegative, between, output } from 'theoremts'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // proof() wrapper style — for const/arrow functions

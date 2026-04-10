@@ -1,4 +1,4 @@
-import { defineConfig } from 'theorem'
+import { defineConfig } from 'theoremts'
 
 export default defineConfig({
   // Files to include/exclude

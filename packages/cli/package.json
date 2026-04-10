@@ -1,5 +1,5 @@
 {
-  "name": "theorem-cli",
+  "name": "theoremts-cli",
   "version": "0.1.0",
   "description": "CLI for Theorem — formal verification for TypeScript",
   "license": "MIT",

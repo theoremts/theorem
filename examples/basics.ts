@@ -2,7 +2,7 @@ import {
   requires, ensures, check,
   positive, nonNegative, between, output,
   invariant, decreases,
-} from 'theorem'
+} from 'theoremts'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Theorem basics — inline style (recommended)

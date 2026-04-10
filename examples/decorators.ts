@@ -1,4 +1,4 @@
-import { requires, ensures, positive, nonNegative, between, output } from 'theorem'
+import { requires, ensures, positive, nonNegative, between, output } from 'theoremts'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Decorator style — for class methods only (TypeScript limitation)

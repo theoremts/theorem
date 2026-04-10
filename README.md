@@ -3,7 +3,7 @@
 **Formal verification for TypeScript.** Prove your code is correct for *all* possible inputs — not by testing samples, but by mathematical proof using the Z3 SMT solver.
 
 ```typescript
-import { requires, ensures, positive, nonNegative, output } from 'theorem'
+import { requires, ensures, positive, nonNegative, output } from 'theoremts'
 
 function safeDivide(a: number, b: number): number {
   requires(positive(b))
@@ -87,8 +87,8 @@ A 60-year member gets 120% discount → negative shipping cost. Z3 finds it in 0
 ## Installation
 
 ```bash
-npm install theorem
-npm install -D theorem-cli
+npm install theoremts
+npm install -D theoremts-cli
 ```
 
 ## Usage
@@ -305,7 +305,7 @@ function calculateTax(income: number, rate: number): { gross: number; tax: numbe
 **Separate proof files** — keep proofs out of source code:
 ```typescript
 // payment.proof.ts — proves contracts for functions in payment.ts
-import { requires, ensures, positive, nonNegative, output } from 'theorem'
+import { requires, ensures, positive, nonNegative, output } from 'theoremts'
 
 function processPayment(amount: number, fee: number): number {
   requires(positive(amount))
@@ -363,7 +363,7 @@ Declare contracts for functions you don't own — like `.d.ts` for types, but fo
 
 ```typescript
 // contracts/math.contracts.ts
-import { declare, requires, ensures, nonNegative, output } from 'theorem'
+import { declare, requires, ensures, nonNegative, output } from 'theoremts'
 
 declare(Math.sqrt, (x: number): number => {
   requires(x >= 0)
@@ -373,7 +373,7 @@ declare(Math.sqrt, (x: number): number => {
 
 ```typescript
 // contracts/api.contracts.ts
-import { declare, ensures, nonNegative, output } from 'theorem'
+import { declare, ensures, nonNegative, output } from 'theoremts'
 
 declare(getBalance, (userId: string): number => {
   ensures(nonNegative(output()))
@@ -384,7 +384,7 @@ Auto-discovered from `node_modules/@theorem-contracts/*` or configured:
 
 ```typescript
 // theorem.config.ts
-import { defineConfig } from 'theorem'
+import { defineConfig } from 'theoremts'
 export default defineConfig({
   contracts: ['contracts/*.contracts.ts'],
 })
@@ -396,7 +396,7 @@ Publishable as npm packages — `@theorem-contracts/bignumber`, `@theorem-contra
 
 ```typescript
 // theorem.config.ts
-import { defineConfig } from 'theorem'
+import { defineConfig } from 'theoremts'
 export default defineConfig({
   include: ['src/**/*.ts'],
   exclude: ['**/*.test.ts'],
@@ -421,7 +421,7 @@ Strip contracts at build time — zero runtime overhead:
 
 ```typescript
 // vite.config.ts
-import { theoremVite } from 'theorem/vite'
+import { theoremVite } from 'theoremts/vite'
 export default { plugins: [theoremVite()] }
 ```
 
