@@ -17,6 +17,8 @@ $ theorem verify src/
   safeDivide
     ✓  nonNegative(output())    — proved for ALL inputs
        using: requires: positive(b)
+    ✓  safe division: b !== 0
+       using: requires: positive(b)
 ```
 
 ## Why Theorem?
@@ -38,6 +40,8 @@ If there's a bug, Z3 finds the exact input:
 ```
 
 ### The Bug Tests Won't Catch
+
+A shipping calculator with tiers, surcharges, and a loyalty discount:
 
 ```typescript
 function calculateShipping(weight: number, distance: number, memberYears: number): number {
@@ -78,7 +82,7 @@ $ theorem verify shipping.ts
        counterexample: weight = 1, distance = 1, memberYears = 51, result = -0.02
 ```
 
-A 60-year member gets 120% discount → negative shipping cost. Z3 finds it in 0.01s.
+A 60-year member gets 120% discount → negative shipping cost. Z3 finds it in 0.01s. No developer writes a test for a 60-year member — but the code allows it.
 
 ## Installation
 
@@ -99,11 +103,8 @@ theorem verify src/     # prove contracts with Z3
        using: requires: positive(price), requires: between(percent, 0, 100)
 
   transfer
-    ✓  conserved(from, to)
-       using: old: __old_from = from, old: __old_to = to
-
-  safeDivide(100, 0)
-    ✗  positive(b) — violation confirmed
+    ✓  nonNegative(output())
+       using: requires: amount <= fromBalance
 ```
 
 ## Writing Contracts
@@ -121,19 +122,124 @@ function applyDiscount(price: number, percent: number): number {
 }
 ```
 
+If `requires` is not satisfied → **caller's fault**. If `ensures` is not satisfied → **implementation bug**.
+
+### Caller Verification
+
+Theorem automatically verifies that callers satisfy the callee's `requires`:
+
+```typescript
+function safeDivide(a: number, b: number): number {
+  requires(positive(b))
+  return a / b
+}
+
+// Inside verified code — cross-function check
+function unitPrice(total: number, quantity: number): number {
+  requires(positive(quantity))
+  return safeDivide(total, quantity)  // ✓ quantity satisfies positive(b)
+}
+
+// Outside verified code — call-site check
+safeDivide(100, 0)   // ✗ violates requires: positive(b)
+safeDivide(100, -5)  // ✗ violates requires: positive(b)
+```
+
+```
+$ theorem verify src/
+  unitPrice
+    ✓  call safeDivide(total, quantity): positive(b)
+       using: requires: positive(quantity)
+
+  (call-site checks)
+    ✗  safeDivide(100, 0): positive(b)
+       violation confirmed (literal values)
+```
+
+Works with any call pattern — `service.calculate(x)`, `this.payments.process(x)`:
+
+```typescript
+class OrderProcessor {
+  @requires(positive(total))
+  processFee(total: number): number {
+    return this.payments.calculateFee(total, 5)  // ✓ verified against calculateFee's requires
+  }
+}
+```
+
+### Bugs Theorem Catches
+
+**Uncapped discount — result goes negative:**
+```typescript
+function applyBonus(salary: number, bonusPercent: number): number {
+  requires(positive(salary))
+  // missing: requires(nonNegative(bonusPercent))
+  ensures(nonNegative(output()))
+  return salary + salary * bonusPercent / 100
+}
+// ✗ counterexample: salary = 1, bonusPercent = -200, result = -1
+```
+
+**Commission exceeds sales — missing rate cap:**
+```typescript
+function commission(sales: number, years: number): number {
+  requires(positive(sales))
+  requires(nonNegative(years))
+  ensures(output() <= sales)  // commission shouldn't exceed sales
+  
+  let rate: number
+  if (sales > 100000) rate = 0.10
+  else rate = 0.05
+  
+  const bonus = years * 0.01  // 1% per year, no cap!
+  return sales * (rate + bonus)
+}
+// ✗ counterexample: sales = 1, years = 96, result = 1.01
+```
+
+**Rebalancing without weight check — allocation exceeds 100%:**
+```typescript
+function allocate(total: number, w1: number, w2: number, w3: number): number {
+  requires(positive(total))
+  requires(nonNegative(w1))
+  requires(nonNegative(w2))
+  requires(nonNegative(w3))
+  // missing: requires(w1 + w2 + w3 === 1)
+  ensures(output() <= total)
+  return total * w1 + total * w2 + total * w3
+}
+// ✗ counterexample: total = 1, w1 = 2, w2 = 0, w3 = 0, result = 2
+```
+
+### SSA-Aware Check
+
+`check()` sees the state **after** mutations — like Dafny's `assert`:
+
+```typescript
+function processPayroll(baseSalary: number): number {
+  requires(positive(baseSalary))
+  
+  if (baseSalary > 10000) baseSalary = 10000  // cap
+
+  check(between(baseSalary, 0, 10000))  // ✓ sees value after cap
+  
+  return baseSalary * 0.9
+}
+```
+
 ### All Contract Functions
 
 | Function | Purpose | Example |
 |---|---|---|
 | `requires(pred)` | Precondition | `requires(positive(x))` |
-| `ensures(pred)` | Postcondition | `ensures(nonNegative(output()))` |
+| `ensures(pred)` | Postcondition (sees final state) | `ensures(nonNegative(output()))` |
 | `output()` | Return value placeholder | `ensures(output() > 0)` |
 | `check(pred)` | Mid-point assertion (SSA-aware) | `check(between(x, 0, 100))` |
 | `assume(pred)` | Assume without proof | `assume(balance >= 0)` |
 | `invariant(pred)` | Loop invariant | `invariant(() => i >= 0)` |
 | `decreases(expr)` | Loop/recursive termination | `decreases(n)` |
 | `old(expr)` | Value at function entry | `old(balance)` |
-| `conserved(...vals)` | Sum preserved | `conserved(from, to)` |
+| `conserved(...vals)` | Sum preserved across mutation | `conserved(from, to)` |
 | `declare(fn, spec)` | External library contract | `declare(Math.sqrt, ...)` |
 
 ### Helpers
@@ -147,17 +253,21 @@ function applyDiscount(price: number, percent: number): number {
 
 ### Advanced Features
 
-**Mutation tracking:**
+**Pre/post mutation with `old()` and `conserved()`:**
 ```typescript
-function transfer(from: number, to: number, amount: number): number {
-  requires(amount > 0 && from >= amount)
-  ensures(output() === old(from) - amount)
-  ensures(conserved(from, to))
-  return from - amount
+function withdraw(balance: number, amount: number): number {
+  requires(positive(amount))
+  requires(balance >= amount)
+  
+  balance -= amount  // mutation
+  
+  ensures(output() >= 0)
+  ensures(output() === old(balance) - amount)  // old() = value before mutation
+  return balance
 }
 ```
 
-**Closures:**
+**Closures — factory functions with captured variables:**
 ```typescript
 function createDiscount(rate: number) {
   requires(between(rate, 0, 1))
@@ -173,6 +283,7 @@ function createDiscount(rate: number) {
 ```typescript
 function fibonacci(n: number): number {
   requires(n >= 0)
+  requires(integer(n))
   decreases(n)
   ensures(nonNegative(output()))
   if (n <= 1) return n
@@ -180,7 +291,7 @@ function fibonacci(n: number): number {
 }
 ```
 
-**Objects:**
+**Object return types:**
 ```typescript
 function calculateTax(income: number, rate: number): { gross: number; tax: number; net: number } {
   requires(positive(income))
@@ -191,15 +302,20 @@ function calculateTax(income: number, rate: number): { gross: number; tax: numbe
 }
 ```
 
-**Caller verification:**
+**Separate proof files** — keep proofs out of source code:
 ```typescript
-function safeDivide(a: number, b: number): number {
-  requires(positive(b))
-  return a / b
-}
+// payment.proof.ts — proves contracts for functions in payment.ts
+import { requires, ensures, positive, nonNegative, output } from 'theorem'
 
-safeDivide(100, 0)  // ✗ theorem verify catches: 0 violates positive(b)
+function processPayment(amount: number, fee: number): number {
+  requires(positive(amount))
+  requires(between(fee, 0, 0.1))
+  ensures(positive(output()))
+  return amount * (1 - fee)
+}
 ```
+
+Both source and `.proof.ts` files are picked up automatically by `theorem verify`.
 
 ### Alternative Styles
 
@@ -243,7 +359,7 @@ Shows contract violations inline — squiggly lines, hover tooltips, Problems pa
 
 ## External Library Contracts
 
-Declare contracts for functions you don't own — libraries, APIs, builtins:
+Declare contracts for functions you don't own — like `.d.ts` for types, but for logic:
 
 ```typescript
 // contracts/math.contracts.ts
@@ -251,10 +367,6 @@ import { declare, requires, ensures, nonNegative, output } from 'theorem'
 
 declare(Math.sqrt, (x: number): number => {
   requires(x >= 0)
-  ensures(nonNegative(output()))
-})
-
-declare(Math.abs, (x: number): number => {
   ensures(nonNegative(output()))
 })
 ```
@@ -268,7 +380,7 @@ declare(getBalance, (userId: string): number => {
 })
 ```
 
-Register in config:
+Auto-discovered from `node_modules/@theorem-contracts/*` or configured:
 
 ```typescript
 // theorem.config.ts
@@ -278,7 +390,7 @@ export default defineConfig({
 })
 ```
 
-Now Theorem knows `getBalance()` returns `>= 0` and uses it when verifying your code. Like `.d.ts` for types, but for logic.
+Publishable as npm packages — `@theorem-contracts/bignumber`, `@theorem-contracts/decimal`, etc.
 
 ## Configuration
 
@@ -338,12 +450,15 @@ theorem scan src/
     CRITICAL  division by `b`  line 12
              example: b = 0
 
-  calculatePercentage
-    CRITICAL  division by `total`  line 45
-             example: total = 0
+  processOrder
+    CRITICAL  safeDivide(total, quantity) may violate: positive(b)
+             example: quantity = 0
+
+  getValue
+    CRITICAL  `data.value` — `data` may be null/undefined (type: Data | null)
 ```
 
-Walks the AST, finds risky operations (division by zero, null access, array bounds, empty reduce), then uses Z3 to confirm if the risk is reachable. Path-sensitive — filters false positives from guards.
+Walks the AST, finds risky operations (division by zero, null access, array bounds, empty reduce, contract violations at call sites), then uses Z3 to confirm reachability. Path-sensitive — filters false positives from guards.
 
 ### suggest — auto-generate contracts
 
@@ -357,6 +472,9 @@ theorem suggest src/
 
   average(a, b)
     →  if you add requires(a >= b), then ensures(output() <= a) becomes provable
+
+  subtract(a, b)
+    →  if you add requires(a >= b), then ensures(nonNegative(output())) becomes provable
 ```
 
 Analyzes unannotated functions and suggests contracts that hold or would hold with specific preconditions.
