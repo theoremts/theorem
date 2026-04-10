@@ -1,0 +1,52 @@
+{
+  "name": "@theorem/core",
+  "version": "0.1.0",
+  "description": "Core engine for Theorem — parser, translator, solver, scanner, suggester",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./scanner": {
+      "import": "./dist/scanner/index.js",
+      "require": "./dist/scanner/index.js",
+      "types": "./dist/scanner/index.d.ts"
+    },
+    "./suggester": {
+      "import": "./dist/suggester/index.js",
+      "require": "./dist/suggester/index.js",
+      "types": "./dist/suggester/index.d.ts"
+    },
+    "./config": {
+      "import": "./dist/config/index.js",
+      "require": "./dist/config/index.js",
+      "types": "./dist/config/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tiagoschmitt/theorem"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --project tsconfig.json --watch",
+    "test": "node --test 'dist/*.test.js' 'dist/**/*.test.js'",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "ts-morph": "^24.0.0",
+    "z3-solver": "^4.14.0"
+  },
+  "devDependencies": {
+    "typescript": "*",
+    "@types/node": "*"
+  }
+}

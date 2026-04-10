@@ -1,0 +1,44 @@
+{
+  "name": "theorem",
+  "version": "0.1.0",
+  "description": "Formal verification for TypeScript — prove your code is correct for all inputs using Z3",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "formal-verification",
+    "z3",
+    "smt",
+    "contracts",
+    "design-by-contract",
+    "requires",
+    "ensures",
+    "static-analysis",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tiagoschmitt/theorem"
+  },
+  "homepage": "https://github.com/tiagoschmitt/theorem#readme",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --project tsconfig.json --watch",
+    "test": "node --test 'dist/**/*.test.js'",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "devDependencies": {
+    "typescript": "*"
+  }
+}
