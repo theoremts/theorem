@@ -11,8 +11,8 @@ import {
   verifyToSarif,
   buildRegistry,
   extractCallSiteObligations,
-} from '@theorem/core'
-import type { FunctionReport, TaskResult, FunctionIR, VerificationTask, FileReport, ContractRegistry, ResolvedConfig } from '@theorem/core'
+} from '@theoremts/core'
+import type { FunctionReport, TaskResult, FunctionIR, VerificationTask, FileReport, ContractRegistry, ResolvedConfig } from '@theoremts/core'
 import { resolveContractFiles } from '../contracts.js'
 
 interface VerifyOptions {

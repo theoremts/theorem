@@ -48,11 +48,11 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     // Z3 context — lazily initialized once
     // -------------------------------------------------------------------
 
-    let z3Ctx: import('@theorem/core').Z3Context | null = null
-    let z3InitPromise: Promise<import('@theorem/core').Z3Context> | null = null
+    let z3Ctx: import('@theoremts/core').Z3Context | null = null
+    let z3InitPromise: Promise<import('@theoremts/core').Z3Context> | null = null
     let z3Failed = false
 
-    async function getZ3(): Promise<import('@theorem/core').Z3Context | null> {
+    async function getZ3(): Promise<import('@theoremts/core').Z3Context | null> {
       if (z3Failed) return null
       if (z3Ctx !== null) return z3Ctx
 
@@ -60,7 +60,7 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         z3InitPromise = (async () => {
           try {
             log('initializing Z3 WASM...')
-            const core = await import('@theorem/core')
+            const core = await import('@theoremts/core')
             const ctx = await core.getContext()
             log('Z3 WASM initialized')
             return ctx
@@ -137,10 +137,10 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         // Check if a newer version was requested while we were waiting
         if (pendingVersions.get(fileName) !== hash) return
 
-        const core = await import('@theorem/core')
+        const core = await import('@theoremts/core')
         const failures: VerificationFailure[] = []
 
-        let irList: import('@theorem/core').FunctionIR[]
+        let irList: import('@theoremts/core').FunctionIR[]
         try {
           irList = core.extractFromSource(source, fileName)
         } catch (err) {
@@ -160,7 +160,7 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         const registry = core.buildRegistry(irList)
 
         for (const ir of irList) {
-          let tasks: import('@theorem/core').VerificationTask[]
+          let tasks: import('@theoremts/core').VerificationTask[]
           try {
             tasks = core.translate(ir, ctx, registry)
           } catch (err) {

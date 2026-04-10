@@ -1,5 +1,5 @@
 {
-  "name": "@theorem/core",
+  "name": "@theoremts/core",
   "version": "0.1.0",
   "description": "Core engine for Theorem — parser, translator, solver, scanner, suggester",
   "license": "MIT",

@@ -1,9 +1,9 @@
 import { readFileSync, statSync, readdirSync } from 'node:fs'
 import { resolve, join, relative } from 'node:path'
-import { getContext, scanToSarif, extractFromSource, extractDeclareContracts, buildRegistry } from '@theorem/core'
-import { scanSource } from '@theorem/core/scanner'
-import type { ScanFileResult, RiskLevel } from '@theorem/core/scanner'
-import type { ResolvedConfig } from '@theorem/core'
+import { getContext, scanToSarif, extractFromSource, extractDeclareContracts, buildRegistry } from '@theoremts/core'
+import { scanSource } from '@theoremts/core/scanner'
+import type { ScanFileResult, RiskLevel } from '@theoremts/core/scanner'
+import type { ResolvedConfig } from '@theoremts/core'
 import { resolveContractFiles } from '../contracts.js'
 
 interface ScanOptions {

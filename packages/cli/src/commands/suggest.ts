@@ -1,9 +1,9 @@
 import { readFileSync, statSync, readdirSync } from 'node:fs'
 import { resolve, join, relative } from 'node:path'
-import { extractFunctionsFromSource, getContext } from '@theorem/core'
-import { suggestContracts } from '@theorem/core/suggester'
-import type { SuggestFunctionResult, ConditionalSuggestion, GuardSuggestion } from '@theorem/core/suggester'
-import type { ResolvedConfig } from '@theorem/core'
+import { extractFunctionsFromSource, getContext } from '@theoremts/core'
+import { suggestContracts } from '@theoremts/core/suggester'
+import type { SuggestFunctionResult, ConditionalSuggestion, GuardSuggestion } from '@theoremts/core/suggester'
+import type { ResolvedConfig } from '@theoremts/core'
 
 // ---------------------------------------------------------------------------
 // ANSI

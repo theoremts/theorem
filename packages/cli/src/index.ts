@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander'
-import { loadConfig, resolveConfig } from '@theorem/core'
-import type { ResolvedConfig } from '@theorem/core'
+import { loadConfig, resolveConfig } from '@theoremts/core'
+import type { ResolvedConfig } from '@theoremts/core'
 import { verifyCommand } from './commands/verify.js'
 import { scanCommand } from './commands/scan.js'
 import { suggestCommand } from './commands/suggest.js'

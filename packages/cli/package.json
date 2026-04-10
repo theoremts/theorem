@@ -28,7 +28,7 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "@theorem/core": "0.1.0",
+    "@theoremts/core": "0.1.0",
     "commander": "^12.1.0"
   },
   "devDependencies": {
