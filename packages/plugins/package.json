@@ -1,6 +1,6 @@
 {
   "name": "theoremts-plugins",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Bundler plugins for Theorem — strip contracts at build time (vite, esbuild, tsup)",
   "license": "MIT",
   "exports": {

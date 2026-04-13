@@ -1,6 +1,6 @@
 {
   "name": "@theoremts/core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Core engine for Theorem — parser, translator, solver, scanner, suggester",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -20,6 +20,11 @@
       "import": "./dist/suggester/index.js",
       "require": "./dist/suggester/index.js",
       "types": "./dist/suggester/index.d.ts"
+    },
+    "./inferrer": {
+      "import": "./dist/inferrer/index.js",
+      "require": "./dist/inferrer/index.js",
+      "types": "./dist/inferrer/index.d.ts"
     },
     "./config": {
       "import": "./dist/config/index.js",

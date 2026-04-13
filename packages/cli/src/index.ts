@@ -5,6 +5,7 @@ import type { ResolvedConfig } from '@theoremts/core'
 import { verifyCommand } from './commands/verify.js'
 import { scanCommand } from './commands/scan.js'
 import { suggestCommand } from './commands/suggest.js'
+import { inferCommand } from './commands/infer.js'
 
 // Load config once at startup and make it available to commands
 let resolvedConfig: ResolvedConfig
@@ -51,6 +52,19 @@ program
   .action(async (paths: string[]) => {
     const config = await getConfig()
     return suggestCommand(paths, config)
+  })
+
+program
+  .command('infer <paths...>')
+  .description('Infer contracts from existing code')
+  .option('--output <path>', 'write contracts to a specific file')
+  .option('--dry-run', 'preview without writing files')
+  .option('--confidence <level>', 'minimum confidence: proven, guard, derived, propagated, heuristic')
+  .option('--strict', 'exit 1 if any function has no inferred contracts')
+  .option('--prove', 'enable Z3 verification of ensures candidates (slower)')
+  .action(async (paths: string[], opts: Record<string, unknown>) => {
+    const config = await getConfig()
+    return inferCommand(paths, opts, config)
   })
 
 program.parseAsync().catch((err: unknown) => {

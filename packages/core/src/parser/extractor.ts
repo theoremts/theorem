@@ -86,7 +86,7 @@ export function extractDeclareContracts(source: string, fileName = 'input.ts'): 
  * Parses a TypeScript source file and returns one FunctionIR for every
  * `proof(fn, ...contracts)` or `proof.fn(thunk, ...contracts)` call found.
  */
-export function extractFromSource(source: string, fileName = 'input.ts'): FunctionIR[] {
+export function extractFromSource(source: string, fileName = 'input.ts', registry?: import('../registry/index.js').ContractRegistry): FunctionIR[] {
   const file = makeFile(source, fileName)
   const results: FunctionIR[] = []
 
@@ -105,6 +105,32 @@ export function extractFromSource(source: string, fileName = 'input.ts'): Functi
   // 3. Decorated class methods: @requires(...) / @ensures(...)
   for (const ir of extractDecoratedMethods(file, proofNames as Set<string>)) {
     results.push(ir)
+  }
+
+  // 4. Declared contracts: if registry has contracts for functions in this file,
+  //    extract the function body and attach the declared contracts.
+  //    This allows `declare(fn, ...)` in a .contracts.ts file to be verified
+  //    against the actual implementation.
+  if (registry && registry.size > 0) {
+    const existingNames = new Set(results.map(r => r.name).filter(Boolean))
+    const allFunctions = extractFunctionsFromSource(source, fileName)
+    for (const fn of allFunctions) {
+      if (!fn.name || existingNames.has(fn.name)) continue
+      const contract = registry.get(fn.name)
+      if (!contract) continue
+      // Merge: implementation body + declared contracts
+      const contracts: Contract[] = [
+        ...contract.requires.map(p => ({ kind: 'requires' as const, predicate: p })),
+        ...contract.ensures.map(p => ({ kind: 'ensures' as const, predicate: p })),
+      ]
+      results.push({
+        name: fn.name,
+        params: fn.params,
+        returnSort: fn.returnSort,
+        body: fn.body,
+        contracts,
+      })
+    }
   }
 
   return results

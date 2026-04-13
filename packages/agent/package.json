@@ -1,10 +1,16 @@
 {
-  "name": "theoremts-ts-plugin",
+  "name": "theoremts-agent",
   "version": "0.2.0",
-  "description": "TypeScript Language Service Plugin for Theorem — inline verification in VS Code",
+  "description": "Programmatic verification API for AI agents — verify TypeScript code against contracts",
   "license": "MIT",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
   "files": [
     "dist"
   ],
@@ -15,6 +21,7 @@
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "dev": "tsc --project tsconfig.json --watch",
+    "test": "node --test 'dist/*.test.js' 'dist/**/*.test.js'",
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "clean": "rm -rf dist *.tsbuildinfo"
   },
@@ -24,5 +31,14 @@
   "devDependencies": {
     "typescript": "*",
     "@types/node": "*"
-  }
+  },
+  "keywords": [
+    "theorem",
+    "theoremts",
+    "formal-verification",
+    "ai",
+    "agent",
+    "code-validation",
+    "z3"
+  ]
 }

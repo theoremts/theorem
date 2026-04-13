@@ -176,7 +176,7 @@ async function verifyFile(
     return null
   }
 
-  const irs = extractFromSource(source, absPath)
+  const irs = extractFromSource(source, absPath, registry)
   if (irs.length === 0) return null
 
   if (opts.debug) debugParser(irs)
