@@ -77,12 +77,30 @@ export function extractArraySafetyFromBlock(body: Block): InferredContract[] {
   }
 
   // ── arr[i] with non-literal index ────────────────────────────────────────
+  // Only flag numeric array indexing, not property access like obj[key]
   for (const node of body.getDescendantsOfKind(SyntaxKind.ElementAccessExpression)) {
     const argNode = node.getArgumentExpression()
     if (argNode === undefined) continue
+    // Skip literal indices (safe)
     if (Node.isNumericLiteral(argNode) || Node.isStringLiteral(argNode)) continue
 
+    // Only flag if the index is likely numeric:
+    // - The index expression has a numeric type annotation
+    // - The index variable name suggests a number (i, j, k, idx, index, offset, pos)
+    // - The object has a .length property (array-like)
+    // Skip if the index is clearly a string key (property access pattern)
     const indexText = argNode.getText().trim()
+
+    // Heuristic: skip if index contains type assertions, casts, or string-like patterns
+    if (indexText.includes(' as ')) continue
+    if (indexText.includes('.')) continue  // e.g., field.in — not an array index
+
+    // Only flag known numeric index patterns
+    const numericIndexPattern = /^[ijk]$|^idx$|^index$|^offset$|^pos$|^n$|^len$|^count$|^start$|^end$|^row$|^col$/
+    const isNumericParam = argNode.getType?.()?.isNumber?.() ?? false
+
+    if (!numericIndexPattern.test(indexText) && !isNumericParam) continue
+
     const text = `${indexText} >= 0`
     if (seen.has(text)) continue
     seen.add(text)

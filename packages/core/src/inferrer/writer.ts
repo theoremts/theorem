@@ -1,5 +1,12 @@
+import { basename as pathBasename } from 'node:path'
 import type { InferResult, InferredFunction, InferredContract, Confidence } from './index.js'
 import type { Sort } from '../parser/ir.js'
+
+function shortPath(filePath: string): string {
+  const segments = filePath.replace(/\\/g, '/').split('/')
+  if (segments.length <= 2) return segments.join('/')
+  return segments.slice(-2).join('/')
+}
 
 export interface WriterOptions {
   /** Include confidence comments (default: true) */
@@ -104,6 +111,10 @@ export function generateDeclareFile(result: InferResult, options?: WriterOptions
   for (const { fn, contracts } of filteredFunctions) {
     lines.push('')
 
+    if (fn.fileName) {
+      lines.push(`// ${shortPath(fn.fileName)}`)
+    }
+
     const paramList = fn.params
       .map(p => `${p.name}: ${sortToType(p.sort)}`)
       .join(', ')
@@ -140,19 +151,31 @@ function cyan(s: string): string { return isTTY ? `\x1b[36m${s}\x1b[39m` : s }
 function green(s: string): string { return isTTY ? `\x1b[32m${s}\x1b[39m` : s }
 function dim(s: string): string { return isTTY ? `\x1b[2m${s}\x1b[22m` : s }
 
-export function generateReport(result: InferResult): string {
-  const totalContracts = result.functions.reduce((sum, fn) => sum + fn.contracts.length, 0)
+export function generateReport(result: InferResult, options?: { minConfidence?: Confidence }): string {
+  const minConf = options?.minConfidence
+
+  // Filter functions by confidence
+  const filteredFunctions: Array<{ fn: InferredFunction; contracts: InferredContract[] }> = []
+  for (const fn of result.functions) {
+    const contracts = filterContracts(fn.contracts, minConf)
+    if (contracts.length > 0) {
+      filteredFunctions.push({ fn, contracts })
+    }
+  }
+
+  const totalContracts = filteredFunctions.reduce((sum, { contracts }) => sum + contracts.length, 0)
   const lines: string[] = []
 
-  lines.push(`theorem infer — ${result.functions.length} functions analyzed, ${totalContracts} contracts inferred`)
+  lines.push(`theorem infer — ${filteredFunctions.length} functions analyzed, ${totalContracts} contracts inferred`)
   lines.push('')
 
-  for (const fn of result.functions) {
+  for (const { fn, contracts } of filteredFunctions) {
     const paramNames = fn.params.map(p => p.name).join(', ')
-    lines.push(`  ${bold(`${fn.name}(${paramNames})`)}`)
+    const loc = fn.fileName ? `  ${dim(`(${shortPath(fn.fileName)})`)}` : ''
+    lines.push(`  ${bold(`${fn.name}(${paramNames})`)}${loc}`)
 
-    const requires = fn.contracts.filter(c => c.kind === 'requires')
-    const ensures = fn.contracts.filter(c => c.kind === 'ensures')
+    const requires = contracts.filter(c => c.kind === 'requires')
+    const ensures = contracts.filter(c => c.kind === 'ensures')
 
     for (const c of requires) {
       const tag = dim(`[${c.confidence}]`)
@@ -170,12 +193,12 @@ export function generateReport(result: InferResult): string {
   }
 
   // Summary counts
-  const totalRequires = result.functions.reduce((s, fn) => s + fn.contracts.filter(c => c.kind === 'requires').length, 0)
-  const totalEnsures = result.functions.reduce((s, fn) => s + fn.contracts.filter(c => c.kind === 'ensures').length, 0)
+  const totalRequires = filteredFunctions.reduce((s, { contracts }) => s + contracts.filter(c => c.kind === 'requires').length, 0)
+  const totalEnsures = filteredFunctions.reduce((s, { contracts }) => s + contracts.filter(c => c.kind === 'ensures').length, 0)
 
   const confidenceCounts = new Map<Confidence, number>()
-  for (const fn of result.functions) {
-    for (const c of fn.contracts) {
+  for (const { contracts } of filteredFunctions) {
+    for (const c of contracts) {
       confidenceCounts.set(c.confidence, (confidenceCounts.get(c.confidence) ?? 0) + 1)
     }
   }

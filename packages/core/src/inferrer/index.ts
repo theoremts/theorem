@@ -7,6 +7,7 @@ import { analyzeBodyExpr } from './body.js'
 import { extractArithmeticFromBlock } from './arithmetic.js'
 import { extractNullSafetyFromNode } from './null-safety.js'
 import { extractArraySafetyFromBlock } from './array-safety.js'
+import { extractZodContracts } from './zod.js'
 import { analyzeReturns } from './returns.js'
 import { extractRelations } from './relations.js'
 import { verifyCandidates } from './candidates.js'
@@ -32,6 +33,7 @@ export interface InferredContract {
 
 export interface InferredFunction {
   name: string
+  fileName?: string | undefined
   params: Param[]
   returnSort: Sort
   contracts: InferredContract[]
@@ -200,6 +202,9 @@ export async function inferContracts(source: string, fileName = 'input.ts', opti
       // Strategy 6: Array safety
       contracts.push(...extractArraySafetyFromBlock(fn.body))
 
+      // Strategy 9: Zod schema validation (requires from z.parse())
+      contracts.push(...extractZodContracts(fn.body))
+
       // ── Z3-powered strategies (opt-in) ────────────────────────────
 
       if (ctx && irMap) {
@@ -235,6 +240,7 @@ export async function inferContracts(source: string, fileName = 'input.ts', opti
 
       functions.push({
         name: fn.name,
+        fileName,
         params: irParams,
         returnSort: fn.returnSort,
         contracts,

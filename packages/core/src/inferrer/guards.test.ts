@@ -14,14 +14,45 @@ describe('extractGuards', () => {
     assert.equal(guards[0]!.text, 'x > 0')
   })
 
-  it('if/return (not a throw) is NOT treated as a requires guard', async () => {
+  it('if/return with sentinel literal IS a guard', async () => {
     const result = await inferContracts(
       `function f(x: number) { if (x < 0) return -1; return x }`,
       'test.ts',
     )
     const guards = result.functions[0]?.contracts.filter(c => c.confidence === 'guard') ?? []
-    // Early returns handle the case gracefully — they are not preconditions
-    assert.equal(guards.length, 0, 'if/return should not produce guard requires')
+    // -1 is a sentinel value — this IS a precondition
+    assert.ok(guards.length >= 1, 'sentinel return should produce guard requires')
+    assert.equal(guards[0]!.text, 'x >= 0')
+  })
+
+  it('if/return with null IS a guard', async () => {
+    const result = await inferContracts(
+      `function f(session: any) { if (!session) return null; return session.name }`,
+      'test.ts',
+    )
+    const guards = result.functions[0]?.contracts.filter(c => c.confidence === 'guard') ?? []
+    assert.ok(guards.length >= 1, 'null return should produce guard requires')
+    assert.equal(guards[0]!.text, 'session')
+  })
+
+  it('if/return with call expression IS a guard', async () => {
+    const result = await inferContracts(
+      `function f(session: any) { if (!session) return redirect('/login'); return session.name }`,
+      'test.ts',
+    )
+    const guards = result.functions[0]?.contracts.filter(c => c.confidence === 'guard') ?? []
+    assert.ok(guards.length >= 1, 'redirect() return should produce guard requires')
+    assert.equal(guards[0]!.text, 'session')
+  })
+
+  it('if/return with parameter value is NOT a guard (clamp pattern)', async () => {
+    const result = await inferContracts(
+      `function clamp(x: number, min: number) { if (x < min) return min; return x }`,
+      'test.ts',
+    )
+    const guards = result.functions[0]?.contracts.filter(c => c.confidence === 'guard') ?? []
+    // Returning a parameter — not a sentinel, so not a guard
+    assert.equal(guards.length, 0, 'clamp pattern should not produce guard requires')
   })
 
   it('multiple guards', async () => {

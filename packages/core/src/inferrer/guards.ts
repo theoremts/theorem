@@ -1,5 +1,5 @@
 import type { FunctionIR } from '../parser/ir.js'
-import { SyntaxKind, type SourceFile, type Block, type Expression } from 'ts-morph'
+import { Node, SyntaxKind, type SourceFile, type Block, type Expression } from 'ts-morph'
 import type { InferredContract } from './index.js'
 import { parseExpr } from '../parser/expr.js'
 import { prettyExpr } from '../parser/pretty.js'
@@ -68,16 +68,25 @@ export function extractGuardsFromBlock(body: Block): InferredContract[] {
 
       const exitKind = getExitKind(thenBranch)
 
-      // Only treat throw-guards as requires.
-      // Early returns (e.g., `if (x < min) return min`) handle the case
-      // gracefully — they are NOT preconditions. The function works for all inputs.
-      if (exitKind !== 'throw') continue
+      // Throw-guards are always preconditions.
+      // Early returns are only preconditions if the return value is a sentinel
+      // (null, undefined, -1, error response, redirect, etc.).
+      // Clamp patterns like `if (x < min) return min` are NOT guards —
+      // the function handles all inputs gracefully.
+      if (exitKind === 'throw') {
+        // Always a guard
+      } else if (exitKind === 'return' && isSentinelReturn(thenBranch)) {
+        // Sentinel return — treat as guard
+      } else {
+        continue // Not a guard (e.g., clamp pattern)
+      }
 
       const condExpr: Expression = ifStmt.getExpression()
       const condIR = parseExpr(condExpr)
       if (!condIR) continue // unparseable, skip but don't stop
 
       const condText = condExpr.getText()
+      const exitLabel = exitKind === 'throw' ? 'throw' : 'return'
 
       // Split disjunction, negate each part
       const disjuncts = splitDisjunction(condIR)
@@ -88,7 +97,7 @@ export function extractGuardsFromBlock(body: Block): InferredContract[] {
           text: prettyExpr(negated),
           predicate: negated,
           confidence: 'guard',
-          source: `if (${condText}) throw`,
+          source: `if (${condText}) ${exitLabel}`,
         })
       }
       continue
@@ -157,6 +166,79 @@ function isUnconditionalExit(node: any): boolean {
   }
 
   return false
+}
+
+/**
+ * Checks whether an early-return branch returns a sentinel/error value
+ * (as opposed to a computed value derived from parameters, like a clamp).
+ *
+ * Sentinel returns: null, undefined, void, literals (-1, 0, false, strings),
+ * new expressions (new Response(...)), call expressions (redirect(...)),
+ * object literals with an `error` property ({ error: '...' }).
+ *
+ * Non-sentinel: identifiers (parameter names), arithmetic expressions.
+ */
+function isSentinelReturn(node: any): boolean {
+  // Get the return statement (may be the node itself or last stmt of block)
+  const returnStmt = getReturnStatement(node)
+  if (!returnStmt) return false
+
+  const expr = returnStmt.getExpression()
+
+  // `return` with no expression (void return) — sentinel
+  if (!expr) return true
+
+  const kind = expr.getKind()
+
+  // null literal
+  if (kind === SyntaxKind.NullKeyword) return true
+
+  // undefined identifier
+  if (Node.isIdentifier(expr) && expr.getText() === 'undefined') return true
+
+  // false / true literals
+  if (kind === SyntaxKind.FalseKeyword || kind === SyntaxKind.TrueKeyword) return true
+
+  // Numeric literal (e.g., -1, 0)
+  if (Node.isNumericLiteral(expr)) return true
+
+  // Prefix unary with numeric literal (e.g., -1)
+  if (Node.isPrefixUnaryExpression(expr)) {
+    const operand = expr.getOperand()
+    if (Node.isNumericLiteral(operand)) return true
+  }
+
+  // String literal
+  if (Node.isStringLiteral(expr)) return true
+
+  // new expression (new Response(...), new Error(...))
+  if (Node.isNewExpression(expr)) return true
+
+  // Call expression (redirect(...), notFound(), NextResponse.json(...), res.status(...).json(...))
+  if (Node.isCallExpression(expr)) return true
+
+  // Object literal with an `error` property
+  if (Node.isObjectLiteralExpression(expr)) {
+    const props = expr.getProperties()
+    for (const p of props) {
+      if (Node.isPropertyAssignment(p) && p.getName() === 'error') return true
+    }
+  }
+
+  return false
+}
+
+function getReturnStatement(node: any): any {
+  const kind = node.getKind()
+  if (kind === SyntaxKind.ReturnStatement) return node
+  if (kind === SyntaxKind.Block) {
+    const stmts = (node as Block).getStatements()
+    if (stmts.length > 0) {
+      const last = stmts[stmts.length - 1]!
+      if (last.getKind() === SyntaxKind.ReturnStatement) return last
+    }
+  }
+  return undefined
 }
 
 function getExitKind(node: any): string {

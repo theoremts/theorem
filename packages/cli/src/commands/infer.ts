@@ -98,7 +98,7 @@ export async function inferCommand(paths: string[], opts: InferOptions, config: 
     return
   }
 
-  const minConfidence = opts.confidence ? parseConfidence(opts.confidence) : undefined
+  const minConfidence: Confidence = opts.confidence ? parseConfidence(opts.confidence) : 'guard'
   const cwd = process.cwd()
 
   // Load external contracts from @theoremts/contracts-* packages
@@ -130,7 +130,7 @@ export async function inferCommand(paths: string[], opts: InferOptions, config: 
   }
 
   // Print report
-  console.log(generateReport(merged))
+  console.log(generateReport(merged, { minConfidence }))
 
   // Write output files
   if (!opts.dryRun) {
