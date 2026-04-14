@@ -155,9 +155,37 @@ export function toZ3(
     // ── Ternary: condition ? then : else → Z3 ITE ────────────────
     case 'ternary': {
       const cond = toZ3(expr.condition, vars, ctx)
-      const then = toZ3(expr.then,      vars, ctx)
-      const els  = toZ3(expr.else,      vars, ctx)
-      if (cond === null || then === null || els === null) return null
+      if (cond === null) return null
+
+      const thenIsNull = expr.then.kind === 'literal' && expr.then.value === null
+      const elseIsNull = expr.else.kind === 'literal' && expr.else.value === null
+
+      // Handle ternaries with null branches: cond ? null : expr or cond ? expr : null
+      // Constrain __is_null_result = cond (or !cond) so Z3 knows when result is null
+      if (thenIsNull || elseIsNull) {
+        const nonNullBranch = thenIsNull ? expr.else : expr.then
+        const nonNullZ3 = toZ3(nonNullBranch, vars, ctx)
+
+        // Set __is_null_result: true when the null branch is taken
+        const nullVarName = '__is_null_result'
+        let nullVar = vars.get(nullVarName)
+        if (!nullVar) {
+          nullVar = ctx.Bool.const(nullVarName)
+          vars.set(nullVarName, nullVar)
+        }
+        // __is_null_result === cond (if then is null) or __is_null_result === !cond (if else is null)
+        const nullCondition = thenIsNull ? cond : ctx.Not(cond as Z3Bool)
+        // Store as a domain constraint via a helper variable
+        const constraintName = '__null_constraint'
+        vars.set(constraintName, (nullVar as Z3Bool).eq(nullCondition as Z3Bool) as unknown as Z3Expr)
+
+        if (nonNullZ3 !== null) return nonNullZ3
+        return null
+      }
+
+      const then = toZ3(expr.then, vars, ctx)
+      const els  = toZ3(expr.else, vars, ctx)
+      if (then === null || els === null) return null
       try { return ctx.If(cond as Z3Bool, then, els) } catch { return null }
     }
 
@@ -171,6 +199,40 @@ export function toZ3(
           ((expr.left.kind === 'unary' && expr.left.op === 'typeof') ||
            (expr.right.kind === 'unary' && expr.right.op === 'typeof'))) {
         return ctx.Bool.val(true)
+      }
+
+      // null/undefined comparisons: x === null, output() === null, etc.
+      // Model as a boolean variable __is_null_<name> since Z3 has no null value.
+      if (expr.op === '===' || expr.op === '!==') {
+        const isNullLiteral = (e: Expr) => e.kind === 'literal' && e.value === null
+        const getNullSubject = (e: Expr): string | null => {
+          if (e.kind === 'ident') return e.name
+          if (e.kind === 'call' && e.callee === 'output') return 'result'
+          if (e.kind === 'member') {
+            const flat = flattenMember(e)
+            return flat
+          }
+          return null
+        }
+
+        if (isNullLiteral(expr.left) || isNullLiteral(expr.right)) {
+          const subject = isNullLiteral(expr.right)
+            ? getNullSubject(expr.left)
+            : getNullSubject(expr.right)
+          if (subject !== null) {
+            const nullVarName = `__is_null_${subject}`
+            let nullVar = vars.get(nullVarName)
+            if (!nullVar) {
+              nullVar = ctx.Bool.const(nullVarName)
+              vars.set(nullVarName, nullVar)
+            }
+            // x === null → __is_null_x, x !== null → NOT __is_null_x
+            if (expr.op === '===') {
+              return nullVar
+            }
+            return ctx.Not(nullVar as Z3Bool)
+          }
+        }
       }
 
       // String concatenation: s + other where s is a string

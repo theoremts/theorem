@@ -1,6 +1,6 @@
 {
   "name": "@theoremts/core",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Core engine for Theorem — parser, translator, solver, scanner, suggester",
   "license": "MIT",
   "main": "./dist/index.js",

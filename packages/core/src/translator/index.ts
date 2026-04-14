@@ -103,6 +103,13 @@ export function translate(
     }
   }
 
+  // Add null constraints from ternary null-branch handling
+  const nullConstraint = vars.get('__null_constraint')
+  if (nullConstraint !== undefined) {
+    assumptions.push(nullConstraint as Bool<'main'>)
+    assumptionLabels.push('null branch constraint')
+  }
+
   // Add callee postconditions as assumptions
   for (const ca of callAssumptions) {
     assumptions.push(ca)
