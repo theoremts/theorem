@@ -1,6 +1,6 @@
 {
   "name": "theoremts",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Formal verification for TypeScript — prove your code is correct for all inputs using Z3",
   "license": "MIT",
   "main": "./dist/index.js",

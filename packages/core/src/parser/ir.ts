@@ -24,6 +24,7 @@ export type BinaryOp =
   | '===' | '!=='
   | '&&' | '||'
   | '??'
+  | 'in'
 
 export type UnaryOp = '!' | '-' | 'typeof'
 

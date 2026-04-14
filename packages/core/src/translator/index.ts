@@ -110,6 +110,9 @@ export function translate(
     assumptionLabels.push('null branch constraint')
   }
 
+  // Object property existence constraints will be added after ensures translation
+  // (deferred because __has_*_result vars are created during ensures translation)
+
   // Add callee postconditions as assumptions
   for (const ca of callAssumptions) {
     assumptions.push(ca)
@@ -305,6 +308,25 @@ export function translate(
       domainConstraints,
       traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
     })
+  }
+
+  // 6c. Object property existence constraints (deferred from body analysis)
+  //     Now that ensures have been translated and __has_*_result vars exist,
+  //     we can connect them to the body's object structure.
+  if (ir.body !== undefined) {
+    const propAssumptions: Bool<'main'>[] = []
+    const propLabels: string[] = []
+    collectPropertyExistence(ir.body, ir.params, vars, ctx, propAssumptions, propLabels)
+    if (propAssumptions.length > 0) {
+      // Add to all existing tasks' assumptions
+      for (const task of tasks) {
+        task.assumptions.push(...propAssumptions)
+        task.assumptionLabels?.push(...propLabels)
+      }
+      // Also add to base assumptions for remaining tasks
+      assumptions.push(...propAssumptions)
+      assumptionLabels.push(...propLabels)
+    }
   }
 
   // 7. Call-site obligations + body safety obligations
@@ -789,6 +811,119 @@ function walkBodyForRisks(
     default:
       break
   }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Object property existence tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Analyzes the body expression and generates __has_<prop>_result constraints.
+ *
+ * Handles:
+ * - Object literal: `{ name, age }` → __has_name_result = true, __has_age_result = true
+ * - Spread: `{ ...data }` → __has_X_result === __has_X_data for all known X
+ * - Spread + explicit: `{ ...data, extra: 1 }` → spread + __has_extra_result = true
+ * - Identity return: `return data` → __has_X_result === __has_X_data for all known X
+ * - Ternary with null: `cond ? null : expr` → delegated to the non-null branch
+ */
+function collectPropertyExistence(
+  body: Expr,
+  params: Param[],
+  vars: Map<string, AnyExpr<'main'>>,
+  ctx: Z3Context,
+  assumptions: Bool<'main'>[],
+  labels: string[],
+): void {
+  // Unwrap ternaries with null branches (guard patterns)
+  let effectiveBody = body
+  if (body.kind === 'ternary') {
+    if (body.then.kind === 'literal' && body.then.value === null) effectiveBody = body.else
+    else if (body.else.kind === 'literal' && body.else.value === null) effectiveBody = body.then
+  }
+
+  if (effectiveBody.kind === 'object') {
+    // Object literal return — we know exactly which properties exist
+    const explicitProps = new Set<string>()
+    const spreadSources: string[] = []
+
+    for (const prop of effectiveBody.properties) {
+      if (prop.key === '...' && prop.value.kind === 'spread' && prop.value.operand.kind === 'ident') {
+        // Spread: { ...data }
+        spreadSources.push(prop.value.operand.name)
+      } else if (prop.key !== '...') {
+        explicitProps.add(prop.key)
+      }
+    }
+
+    // Explicit properties are definitely present
+    for (const propName of explicitProps) {
+      const hasVar = getOrCreateBool(`__has_${propName}_result`, vars, ctx)
+      assumptions.push(hasVar.eq(ctx.Bool.val(true)) as Bool<'main'>)
+      labels.push(`property existence: result.${propName}`)
+    }
+
+    // Spread sources: propagate property existence from source to result
+    // For any property X that the ensures/contract asks about, if the source
+    // has __has_X_<source>, then __has_X_result === __has_X_<source>
+    // We do this lazily: for any __has_*_result var that exists, check if there's
+    // a matching source var and connect them.
+    // But we don't know yet which props the contract will ask about.
+    // Solution: store the spread sources so when __has_X_result is created later,
+    // we can connect it. For now, connect any that already exist.
+    for (const source of spreadSources) {
+      for (const [name, expr] of vars) {
+        const hasPrefix = `__has_`
+        const resultSuffix = `_result`
+        if (name.startsWith(hasPrefix) && name.endsWith(resultSuffix)) {
+          const propName = name.slice(hasPrefix.length, -resultSuffix.length)
+          if (explicitProps.has(propName)) continue // already set explicitly
+          const sourceVarName = `__has_${propName}_${source}`
+          const sourceVar = getOrCreateBool(sourceVarName, vars, ctx)
+          assumptions.push((expr as Bool<'main'>).eq(sourceVar) as Bool<'main'>)
+          labels.push(`spread property: result.${propName} from ${source}`)
+        }
+      }
+      // Also store spread info for deferred resolution
+      vars.set(`__spread_source_result`, ctx.Bool.const(source) as unknown as AnyExpr<'main'>)
+    }
+
+    // If no spread, properties NOT in explicitProps are absent
+    if (spreadSources.length === 0) {
+      for (const [name] of vars) {
+        if (name.startsWith('__has_') && name.endsWith('_result')) {
+          const propName = name.slice('__has_'.length, -'_result'.length)
+          if (!explicitProps.has(propName)) {
+            const hasVar = vars.get(name) as Bool<'main'>
+            assumptions.push(hasVar.eq(ctx.Bool.val(false)) as Bool<'main'>)
+            labels.push(`property absence: result.${propName}`)
+          }
+        }
+      }
+    }
+  } else if (effectiveBody.kind === 'ident') {
+    // Identity return: return data → result has same properties as data
+    const sourceName = effectiveBody.name
+    for (const [name, expr] of vars) {
+      if (name.startsWith('__has_') && name.endsWith('_result')) {
+        const propName = name.slice('__has_'.length, -'_result'.length)
+        const sourceVarName = `__has_${propName}_${sourceName}`
+        const sourceVar = getOrCreateBool(sourceVarName, vars, ctx)
+        assumptions.push((expr as Bool<'main'>).eq(sourceVar) as Bool<'main'>)
+        labels.push(`identity return: result.${propName} from ${sourceName}`)
+      }
+    }
+  }
+}
+
+function getOrCreateBool(name: string, vars: Map<string, AnyExpr<'main'>>, ctx: Z3Context): Bool<'main'> {
+  let v = vars.get(name)
+  if (!v) {
+    v = ctx.Bool.const(name)
+    vars.set(name, v)
+  }
+  return v as Bool<'main'>
 }
 
 // ---------------------------------------------------------------------------

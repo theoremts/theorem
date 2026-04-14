@@ -256,6 +256,28 @@ export function toZ3(
         return null
       }
 
+      // 'prop' in obj → boolean variable __has_<prop>_<obj>
+      if (expr.op === 'in') {
+        const propName = expr.left.kind === 'literal' && typeof expr.left.value === 'string'
+          ? expr.left.value
+          : null
+        const objName = expr.right.kind === 'ident'
+          ? expr.right.name
+          : expr.right.kind === 'call' && expr.right.callee === 'output'
+            ? 'result'
+            : null
+        if (propName !== null && objName !== null) {
+          const hasVarName = `__has_${propName}_${objName}`
+          let hasVar = vars.get(hasVarName)
+          if (!hasVar) {
+            hasVar = ctx.Bool.const(hasVarName)
+            vars.set(hasVarName, hasVar)
+          }
+          return hasVar
+        }
+        return null
+      }
+
       const left  = toZ3(expr.left,  vars, ctx)
       const right = toZ3(expr.right, vars, ctx)
       if (left === null || right === null) return null
@@ -382,6 +404,8 @@ function applyBinaryOp(
     case '||':  return ctx.Or(l as Z3Bool, r as Z3Bool)
     // Nullish coalesce handled above in toZ3
     case '??':  return null
+    // 'in' handled above in toZ3
+    case 'in':  return null
     default:    return null
   }
 }
@@ -400,6 +424,29 @@ function translateCall(
 
   // ── String method calls: s.includes(x), s.startsWith(x), etc. ──
   const dotIdx = callee.lastIndexOf('.')
+  // Object.hasOwn(obj, 'prop') → __has_<prop>_<obj>
+  if (callee === 'Object.hasOwn' && argExprs.length >= 2) {
+    const objArg = argExprs[0]!
+    const propArg = argExprs[1]!
+    const objName = objArg.kind === 'ident'
+      ? objArg.name
+      : objArg.kind === 'call' && objArg.callee === 'output'
+        ? 'result'
+        : null
+    const propName = propArg.kind === 'literal' && typeof propArg.value === 'string'
+      ? propArg.value
+      : null
+    if (objName !== null && propName !== null) {
+      const hasVarName = `__has_${propName}_${objName}`
+      let hasVar = vars.get(hasVarName)
+      if (!hasVar) {
+        hasVar = ctx.Bool.const(hasVarName)
+        vars.set(hasVarName, hasVar)
+      }
+      return hasVar
+    }
+  }
+
   if (dotIdx > 0) {
     const objName = callee.slice(0, dotIdx)
     const method = callee.slice(dotIdx + 1)

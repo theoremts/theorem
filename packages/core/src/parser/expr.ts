@@ -809,6 +809,7 @@ const OPS: Record<string, BinaryOp> = {
   '===': '===', '!==': '!==',
   '&&': '&&', '||': '||',
   '??': '??',
+  'in': 'in',
   // Also accept loose equality for convenience
   '==': '===', '!=': '!==',
 }
