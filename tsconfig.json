@@ -12,6 +12,6 @@
     "sourceMap": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "plugins": [{ "name": "theorem-ts-plugin" }]
+    "plugins": [{ "name": "theoremts-ts-plugin" }]
   }
 }

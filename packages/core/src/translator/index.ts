@@ -1,6 +1,6 @@
 import type { AnyExpr, Arith, Bool } from 'z3-solver'
 import type { Z3Context } from '../solver/context.js'
-import type { Expr, FunctionIR, LoopInfo, Param, Predicate } from '../parser/ir.js'
+import type { Expr, FunctionIR, Loc, LoopInfo, Param, Predicate } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { createVariables, makeConst } from './variables.js'
@@ -24,6 +24,8 @@ export interface VerificationTask {
   domainConstraints: Bool<'main'>[]
   /** Named intermediate expressions to evaluate in counterexamples (SSA trace). */
   traceExprs?: Map<string, AnyExpr<'main'>> | undefined
+  /** Source locations of relevant expressions (body branches, assignments) for error highlighting. */
+  traceLocs?: Map<string, import('../parser/ir.js').Loc> | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -56,6 +58,7 @@ export function translate(
   const callObligations: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }> = []
   const callAssumptions: Bool<'main'>[] = []
   const traceExprs = new Map<string, AnyExpr<'main'>>()
+  const traceLocs = new Map<string, Loc>()
 
   if (ir.body !== undefined) {
     // Special case: body is an object literal { prop: expr, ... }
@@ -80,7 +83,7 @@ export function translate(
     }
 
     // Collect trace expressions for intermediate variable display in counterexamples
-    collectTraceExprs(ir.body, vars, ctx, traceExprs)
+    collectTraceExprs(ir.body, vars, ctx, traceExprs, traceLocs)
 
     const bodyZ3 = translateBody(ir.body, vars, ctx, registry, callObligations, callAssumptions)
     const resultVar = vars.get('result')
@@ -239,6 +242,7 @@ export function translate(
           goal: ctx.Not(goalZ3 as Bool<'main'>),
           domainConstraints,
           traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
+      traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
         })
       }
       if (step.kind === 'assume') {
@@ -275,6 +279,7 @@ export function translate(
         goal: ctx.Not(goalZ3 as Bool<'main'>),
         domainConstraints,
         traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
+      traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
       })
       continue
     }
@@ -290,6 +295,7 @@ export function translate(
         goal: ctx.Bool.val(true),   // negated goal: NOT false = true; solver checks SAT of (assumptions AND true)
         domainConstraints,
       traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
+      traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
       })
       continue
     }
@@ -307,6 +313,7 @@ export function translate(
       goal: ctx.Not(goalZ3 as Bool<'main'>),
       domainConstraints,
       traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
+      traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
     })
   }
 
@@ -352,6 +359,7 @@ export function translate(
       goal: ctx.Not(obligation.z3),
       domainConstraints,
       traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
+      traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
     })
   }
 
@@ -367,8 +375,9 @@ function collectTraceExprs(
   vars: Map<string, AnyExpr<'main'>>,
   ctx: Z3Context,
   out: Map<string, AnyExpr<'main'>>,
+  locs?: Map<string, Loc>,
 ): void {
-  collectTraceRecursive(body, vars, ctx, out, 0)
+  collectTraceRecursive(body, vars, ctx, out, locs, 0)
 }
 
 function collectTraceRecursive(
@@ -376,6 +385,7 @@ function collectTraceRecursive(
   vars: Map<string, AnyExpr<'main'>>,
   ctx: Z3Context,
   out: Map<string, AnyExpr<'main'>>,
+  locs: Map<string, Loc> | undefined,
   depth: number,
 ): void {
   if (depth > 3) return  // limit depth to avoid noise
@@ -389,21 +399,28 @@ function collectTraceRecursive(
           if (!out.has(text) && text.length < 60) {
             try {
               const z3 = toZ3(side, vars, ctx)
-              if (z3) out.set(text, z3)
+              if (z3) {
+                out.set(text, z3)
+                if (locs && side.loc) locs.set(text, side.loc)
+              }
             } catch {}
           }
-          collectTraceRecursive(side, vars, ctx, out, depth + 1)
+          collectTraceRecursive(side, vars, ctx, out, locs, depth + 1)
         }
       }
       break
     }
     case 'ternary': {
       try {
+        const condText = `(${prettyExpr(expr.condition)})`
         const condZ3 = toZ3(expr.condition, vars, ctx)
-        if (condZ3) out.set(`(${prettyExpr(expr.condition)})`, condZ3)
+        if (condZ3) {
+          out.set(condText, condZ3)
+          if (locs && expr.condition.loc) locs.set(condText, expr.condition.loc)
+        }
       } catch {}
-      collectTraceRecursive(expr.then, vars, ctx, out, depth + 1)
-      collectTraceRecursive(expr.else, vars, ctx, out, depth + 1)
+      collectTraceRecursive(expr.then, vars, ctx, out, locs, depth + 1)
+      collectTraceRecursive(expr.else, vars, ctx, out, locs, depth + 1)
       break
     }
     case 'call': {

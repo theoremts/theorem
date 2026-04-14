@@ -11,6 +11,8 @@ export type DisprovedResult = {
   allCounterexamples?: Record<string, unknown>[] | undefined
   /** Intermediate expression values — shows the computation trace. */
   trace?: Record<string, unknown> | undefined
+  /** Source locations of trace expressions for precise error highlighting. */
+  traceLocs?: Record<string, { line: number; column: number }> | undefined
 }
 
 export type UnknownResult = {

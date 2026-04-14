@@ -18,6 +18,12 @@ export interface NumericUnionSort {
 // Expression IR — subset of TypeScript expressible as Z3 formulas
 // ---------------------------------------------------------------------------
 
+/** Source location for mapping IR nodes back to source code. */
+export interface Loc {
+  line: number
+  column: number
+}
+
 export type BinaryOp =
   | '+' | '-' | '*' | '/' | '%' | '**'
   | '<' | '<=' | '>' | '>='
@@ -29,19 +35,19 @@ export type BinaryOp =
 export type UnaryOp = '!' | '-' | 'typeof'
 
 export type Expr =
-  | { kind: 'literal';        value: number | boolean | null | string }
-  | { kind: 'ident';          name: string }
-  | { kind: 'member';         object: Expr; property: string }
-  | { kind: 'element-access'; object: Expr; index: Expr }
-  | { kind: 'unary';          op: UnaryOp; operand: Expr }
-  | { kind: 'binary';         op: BinaryOp; left: Expr; right: Expr }
-  | { kind: 'call';           callee: string; args: Expr[] }
-  | { kind: 'ternary';        condition: Expr; then: Expr; else: Expr }
-  | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr }
-  | { kind: 'array';          elements: Expr[] }
-  | { kind: 'object';         properties: Array<{ key: string; value: Expr }> }
-  | { kind: 'spread';         operand: Expr }
-  | { kind: 'template';       parts: Array<string | Expr> }
+  | { kind: 'literal';        value: number | boolean | null | string; loc?: Loc | undefined }
+  | { kind: 'ident';          name: string; loc?: Loc | undefined }
+  | { kind: 'member';         object: Expr; property: string; loc?: Loc | undefined }
+  | { kind: 'element-access'; object: Expr; index: Expr; loc?: Loc | undefined }
+  | { kind: 'unary';          op: UnaryOp; operand: Expr; loc?: Loc | undefined }
+  | { kind: 'binary';         op: BinaryOp; left: Expr; right: Expr; loc?: Loc | undefined }
+  | { kind: 'call';           callee: string; args: Expr[]; loc?: Loc | undefined }
+  | { kind: 'ternary';        condition: Expr; then: Expr; else: Expr; loc?: Loc | undefined }
+  | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr; loc?: Loc | undefined }
+  | { kind: 'array';          elements: Expr[]; loc?: Loc | undefined }
+  | { kind: 'object';         properties: Array<{ key: string; value: Expr }>; loc?: Loc | undefined }
+  | { kind: 'spread';         operand: Expr; loc?: Loc | undefined }
+  | { kind: 'template';       parts: Array<string | Expr>; loc?: Loc | undefined }
 
 // ---------------------------------------------------------------------------
 // Contracts

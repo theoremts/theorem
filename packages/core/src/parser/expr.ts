@@ -1,12 +1,29 @@
 import { Node, SyntaxKind, type Expression, type Statement, type Block } from 'ts-morph'
-import type { BinaryOp, Expr, LoopInfo } from './ir.js'
+import type { BinaryOp, Expr, Loc, LoopInfo } from './ir.js'
 import { substituteExpr } from '../translator/substitution.js'
+
+/** Extract source location from a ts-morph node. */
+function getLoc(node: { getStartLineNumber(): number; getStart(): number }): Loc {
+  return { line: node.getStartLineNumber(), column: 0 }
+}
+
+/** Attach source location to an Expr if not already present. */
+function withLoc(expr: Expr | null, node: { getStartLineNumber(): number; getStart(): number }): Expr | null {
+  if (expr === null) return null
+  if (expr.loc) return expr
+  return { ...expr, loc: getLoc(node) } as Expr
+}
 
 /**
  * Converts a ts-morph expression node to our Expr IR.
  * Returns null when the node can't be represented.
  */
 export function parseExpr(node: Expression): Expr | null {
+  const result = parseExprInner(node)
+  return withLoc(result, node)
+}
+
+function parseExprInner(node: Expression): Expr | null {
   // Parenthesised — unwrap
   if (Node.isParenthesizedExpression(node)) {
     return parseExpr(node.getExpression())

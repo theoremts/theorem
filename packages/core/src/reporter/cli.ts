@@ -86,12 +86,14 @@ export function printFileReport(report: FileReport): void {
           console.log(`       ${c.dim}violation confirmed (literal values)${c.reset}`)
         }
 
-        // Show intermediate value trace if available
+        // Show intermediate value trace with source locations if available
         if (result.trace) {
           const traceEntries = Object.entries(result.trace).filter(([, v]) => v !== '?')
           if (traceEntries.length > 0) {
             for (const [name, value] of traceEntries) {
-              console.log(`       ${c.dim}  where ${name} = ${value}${c.reset}`)
+              const loc = result.traceLocs?.[name]
+              const locStr = loc ? ` ${c.dim}(line ${loc.line})${c.reset}` : ''
+              console.log(`       ${c.dim}  where ${name} = ${value}${locStr}${c.reset}`)
             }
           }
         }

@@ -29,6 +29,8 @@ export interface CheckInput {
   minimizeCounterexample?: boolean
   /** Named intermediate expressions to evaluate in counterexamples. */
   traceExprs?: Map<string, AnyExpr<'main'>> | undefined
+  /** Source locations of trace expressions for error highlighting. */
+  traceLocs?: Map<string, { line: number; column: number }> | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +139,16 @@ export async function check(input: CheckInput): Promise<SolverResult> {
     }
   }
 
-  return { status: 'disproved', counterexample, allCounterexamples, trace }
+  // Convert traceLocs from Map to Record for the result
+  let traceLocs: Record<string, { line: number; column: number }> | undefined
+  if (input.traceLocs && input.traceLocs.size > 0) {
+    traceLocs = {}
+    for (const [name, loc] of input.traceLocs) {
+      traceLocs[name] = loc
+    }
+  }
+
+  return { status: 'disproved', counterexample, allCounterexamples, trace, traceLocs }
 }
 
 // ---------------------------------------------------------------------------

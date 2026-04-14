@@ -2,6 +2,7 @@ import {
   requires, ensures, check,
   positive, nonNegative, between, output,
   invariant, decreases,
+  integer,
 } from 'theoremts'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12,6 +13,19 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Arithmetic ───────────────────────────────────────────────────────────────
+
+function nextOdd(n: number) {
+  requires(integer(n))
+  requires(n % 2 === 0)
+  ensures(output() % 2 !== 0)
+  return n + 1
+}
+
+
+
+
+
+var a = nextOdd(1)
 
 export function applyDiscount(price: number, percent: number): number {
   requires(positive(price))

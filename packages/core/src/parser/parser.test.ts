@@ -13,6 +13,18 @@ function getFirst(source: string): FunctionIR {
   return results[0] as FunctionIR
 }
 
+/** Strip loc fields from Expr trees for stable assertions. */
+function stripLocs(obj: unknown): unknown {
+  if (obj === null || obj === undefined || typeof obj !== 'object') return obj
+  if (Array.isArray(obj)) return obj.map(stripLocs)
+  const result: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (k === 'loc') continue
+    result[k] = stripLocs(v)
+  }
+  return result
+}
+
 function requiresContracts(ir: FunctionIR): RequiresContract[] {
   return ir.contracts.filter((c): c is RequiresContract => c.kind === 'requires')
 }
@@ -203,7 +215,7 @@ describe('ensures extraction', () => {
     assert.strictEqual(pred.kind, 'binary')
     assert.ok(pred.kind === 'binary')
     assert.strictEqual(pred.op, '>')
-    assert.deepEqual(pred.right, { kind: 'literal', value: 0 })
+    assert.deepEqual(stripLocs(pred.right), { kind: 'literal', value: 0 })
   })
 })
 
@@ -232,7 +244,7 @@ describe('expression body extraction', () => {
       )
     `
     const ir = getFirst(source)
-    assert.deepStrictEqual(ir.body, {
+    assert.deepStrictEqual(stripLocs(ir.body), {
       kind: 'binary', op: '*',
       left: { kind: 'ident', name: 'price' },
       right: { kind: 'literal', value: 2 },
@@ -294,9 +306,9 @@ describe('member access predicates', () => {
     assert.strictEqual(pred.op, '>=')
     assert.strictEqual(pred.left.kind, 'member')
     assert.ok(pred.left.kind === 'member')
-    assert.deepEqual(pred.left.object, { kind: 'ident', name: 'from' })
+    assert.deepEqual(stripLocs(pred.left.object), { kind: 'ident', name: 'from' })
     assert.strictEqual(pred.left.property, 'balance')
-    assert.deepEqual(pred.right, { kind: 'ident', name: 'amount' })
+    assert.deepEqual(stripLocs(pred.right), { kind: 'ident', name: 'amount' })
   })
 })
 
