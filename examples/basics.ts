@@ -21,11 +21,15 @@ function nextOdd(n: number) {
   return n + 1
 }
 
+var a = 2;
+var b = 4;
 
 
 
 
-var a = nextOdd(1)
+
+
+nextOdd(b - a)
 
 export function applyDiscount(price: number, percent: number): number {
   requires(positive(price))

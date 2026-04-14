@@ -61,6 +61,9 @@ export function extractCallSiteObligations(
       }
     }
 
+    // Collect variable assignments in scope before the call site (constant propagation)
+    const scopeAssignments = collectScopeAssignments(node)
+
     // For each requires, generate a verification task
     for (const req of contract.requires) {
       if (typeof req === 'string') continue
@@ -69,6 +72,21 @@ export function extractCallSiteObligations(
       // Create Z3 variables for all identifiers in the substituted expression
       const vars = new Map<string, AnyExpr<'main'>>()
       collectAndCreateVars(substituted, vars, ctx)
+
+      // Add scope assignments as assumptions (constant propagation)
+      const assumptions: Bool<'main'>[] = []
+      const assumptionLabels: string[] = []
+      for (const [varName, valueExpr] of scopeAssignments) {
+        collectAndCreateVars(valueExpr, vars, ctx)
+        const varZ3 = vars.get(varName)
+        const valZ3 = toZ3(valueExpr, vars, ctx)
+        if (varZ3 && valZ3) {
+          try {
+            assumptions.push((varZ3 as any).eq(valZ3) as Bool<'main'>)
+            assumptionLabels.push(`scope: ${varName} = ${prettyExpr(valueExpr)}`)
+          } catch { /* sort mismatch */ }
+        }
+      }
 
       const z3 = toZ3(substituted, vars, ctx)
       if (z3 === null) continue
@@ -79,8 +97,8 @@ export function extractCallSiteObligations(
         functionName: `(call-site) ${calleeName}`,
         contractText: `${calleeName}(${argTexts}): ${prettyExpr(req)}`,
         variables: vars,
-        assumptions: [],
-        assumptionLabels: [],
+        assumptions,
+        assumptionLabels,
         goal: ctx.Not(z3 as Bool<'main'>),
         domainConstraints: [],
       })
@@ -125,6 +143,66 @@ function isInsideContractContext(node: Node): boolean {
     current = current.getParent()
   }
   return false
+}
+
+/**
+ * Collects variable assignments (var/let/const with initializer) that are
+ * in scope before the given call-site node. This enables constant propagation
+ * so that `var a = 2; nextOdd(a)` knows `a === 2`.
+ *
+ * Walks backwards through sibling statements and up through parent blocks.
+ * Only collects simple literal or expression initializers — no complex patterns.
+ */
+function collectScopeAssignments(callNode: Node): Map<string, Expr> {
+  const assignments = new Map<string, Expr>()
+
+  // Walk up to find containing block/source file
+  let current: Node | undefined = callNode
+  while (current) {
+    const parent = current.getParent()
+    if (!parent) break
+
+    // If parent is a Block or SourceFile, walk its statements before `current`
+    if (Node.isBlock(parent) || Node.isSourceFile(parent)) {
+      const statements = parent.getStatements()
+      for (const stmt of statements) {
+        // Stop at the statement containing our call
+        if (stmt.getPos() >= callNode.getPos()) break
+
+        // Variable declarations: var a = 2, const b = 3
+        if (Node.isVariableStatement(stmt)) {
+          for (const decl of stmt.getDeclarationList().getDeclarations()) {
+            const name = decl.getName()
+            const init = decl.getInitializer()
+            if (init) {
+              const parsed = parseExpr(init as Expression)
+              if (parsed) {
+                assignments.set(name, parsed)
+              }
+            }
+          }
+        }
+
+        // Expression statement assignments: a = 5
+        if (Node.isExpressionStatement(stmt)) {
+          const expr = stmt.getExpression()
+          if (Node.isBinaryExpression(expr) && expr.getOperatorToken().getText() === '=') {
+            const left = expr.getLeft()
+            if (Node.isIdentifier(left)) {
+              const parsed = parseExpr(expr.getRight() as Expression)
+              if (parsed) {
+                assignments.set(left.getText(), parsed)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    current = parent
+  }
+
+  return assignments
 }
 
 /** Recursively collects identifiers from an expression and creates Z3 variables. */
