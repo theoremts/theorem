@@ -197,9 +197,45 @@ function tryExtractProof(call: CallExpression): FunctionIR | null {
   if (args.length < 2) return null
 
   const firstArg = args[0]
-  if (!Node.isArrowFunction(firstArg)) return null
 
-  const params = extractParams(firstArg)
+  // Resolve the function — either an inline arrow or a named function reference
+  let fnNode: ArrowFunction | FunctionDeclaration | undefined
+  let resolvedName: string | undefined
+
+  if (Node.isArrowFunction(firstArg)) {
+    fnNode = firstArg
+  } else if (Node.isFunctionExpression(firstArg)) {
+    // Treat FunctionExpression like ArrowFunction for extraction purposes
+    fnNode = firstArg as unknown as ArrowFunction
+  } else if (Node.isIdentifier(firstArg)) {
+    // proof(namedFn, requires(...)) — resolve identifier to its declaration
+    resolvedName = firstArg.getText()
+    const sourceFile = call.getSourceFile()
+
+    // Try function declaration: function foo() { ... }
+    const fnDecl = sourceFile.getFunction(resolvedName)
+    if (fnDecl) {
+      fnNode = fnDecl as unknown as ArrowFunction
+    }
+
+    // Try variable declaration: const foo = (...) => { ... }
+    if (!fnNode) {
+      const varDecl = sourceFile.getVariableDeclaration(resolvedName)
+      if (varDecl) {
+        const init = varDecl.getInitializer()
+        if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) {
+          fnNode = init as ArrowFunction
+        }
+      }
+    }
+  }
+
+  if (!fnNode) return null
+
+  const isFnDecl = Node.isFunctionDeclaration(fnNode as any)
+  const params = isFnDecl
+    ? extractFunctionDeclParams(fnNode as unknown as FunctionDeclaration)
+    : extractParams(fnNode as ArrowFunction)
   const contracts: Contract[] = []
 
   for (const arg of args.slice(1)) {
@@ -207,22 +243,24 @@ function tryExtractProof(call: CallExpression): FunctionIR | null {
     if (contract !== null) contracts.push(contract)
   }
 
-  const fnBody = firstArg.getBody()
+  const fnBody = (fnNode as any).getBody()
   let body: FunctionIR['body']
   let loops: LoopInfo[] | undefined
 
-  if (Node.isExpression(fnBody)) {
+  if (fnBody && Node.isExpression(fnBody)) {
     body = parseExpr(fnBody) ?? undefined
-  } else if (Node.isBlock(fnBody)) {
+  } else if (fnBody && Node.isBlock(fnBody)) {
     const result = parseBlockWithLoops(fnBody)
     body = result.body ?? undefined
     loops = result.loops.length > 0 ? result.loops : undefined
   }
 
   return {
-    name: inferName(call),
+    name: resolvedName ?? inferName(call),
     params,
-    returnSort: inferReturnSort(firstArg),
+    returnSort: isFnDecl
+      ? inferFunctionDeclReturnSort(fnNode as unknown as FunctionDeclaration)
+      : inferReturnSort(fnNode as ArrowFunction),
     body,
     contracts,
     loops,
