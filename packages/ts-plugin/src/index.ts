@@ -45,6 +45,55 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     log('plugin created')
 
     // -------------------------------------------------------------------
+    // Contract registry — loaded once from .theorem/contracts/ and config
+    // -------------------------------------------------------------------
+
+    let externalRegistry: import('@theoremts/core').ContractRegistry | null = null
+    let registryLoaded = false
+
+    async function loadExternalRegistry(): Promise<import('@theoremts/core').ContractRegistry> {
+      if (externalRegistry !== null) return externalRegistry
+
+      try {
+        const core = await import('@theoremts/core')
+        const { readFileSync, statSync, readdirSync } = await import('fs')
+        const { join, resolve } = await import('path')
+        const cwd = info.project.getCurrentDirectory()
+
+        const allIRs: import('@theoremts/core').FunctionIR[] = []
+
+        // Try to load .theorem/contracts/ directory
+        const contractsDir = join(cwd, '.theorem', 'contracts')
+        try {
+          const findContracts = (dir: string): void => {
+            for (const entry of readdirSync(dir)) {
+              const p = join(dir, entry)
+              try {
+                const stat = statSync(p)
+                if (stat.isFile() && p.endsWith('.contracts.ts')) {
+                  const source = readFileSync(p, 'utf-8')
+                  allIRs.push(...core.extractDeclareContracts(source, p))
+                } else if (stat.isDirectory()) {
+                  findContracts(p)
+                }
+              } catch {}
+            }
+          }
+          findContracts(contractsDir)
+        } catch {}
+
+        externalRegistry = core.buildRegistry(allIRs)
+        registryLoaded = true
+        log(`loaded ${externalRegistry.size} external contracts`)
+      } catch (err) {
+        log(`failed to load external contracts: ${err}`)
+        externalRegistry = new Map() as import('@theoremts/core').ContractRegistry
+      }
+
+      return externalRegistry
+    }
+
+    // -------------------------------------------------------------------
     // Z3 context — lazily initialized once
     // -------------------------------------------------------------------
 
@@ -144,7 +193,10 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
           return
         }
 
-        if (irList.length === 0) {
+        // Load external contracts registry
+        const extRegistry = await loadExternalRegistry()
+
+        if (irList.length === 0 && extRegistry.size === 0) {
           cache.set(fileName, { sourceHash: hash, diagnostics: [] })
           refreshDiags(fileName)
           return
@@ -152,7 +204,11 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
 
         if (pendingVersions.get(fileName) !== hash) return
 
+        // Merge local IRs with external registry
         const registry = core.buildRegistry(irList)
+        for (const [name, contract] of extRegistry) {
+          if (!registry.has(name)) registry.set(name, contract)
+        }
 
         for (const ir of irList) {
           let tasks: import('@theoremts/core').VerificationTask[]

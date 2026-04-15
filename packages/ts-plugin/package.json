@@ -1,6 +1,6 @@
 {
   "name": "theoremts-ts-plugin",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "TypeScript Language Service Plugin for Theorem — inline verification in VS Code",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -19,7 +19,7 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "@theoremts/core": "0.3.1"
+    "@theoremts/core": "0.3.2"
   },
   "devDependencies": {
     "typescript": "*",
