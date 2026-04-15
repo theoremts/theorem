@@ -28,7 +28,9 @@ var b = 4;
 
 
 function nextOdd2e(n: number) {
-  if (n % 2 === 0) {
+  requires(integer(n))
+
+  if (n % 2 !== 0) {
     nextOdd(n);
   }
 }

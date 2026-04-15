@@ -67,6 +67,9 @@ export function extractCallSiteObligations(
     // Collect path conditions — if-statement guards enclosing the call site
     const pathConditions = collectPathConditions(node)
 
+    // Collect enclosing function's inline requires as assumptions
+    const enclosingRequires = collectEnclosingRequires(node)
+
     // For each requires, generate a verification task
     for (const req of contract.requires) {
       if (typeof req === 'string') continue
@@ -104,6 +107,18 @@ export function extractCallSiteObligations(
         }
       }
 
+      // Add enclosing function's requires as assumptions
+      for (const reqExpr of enclosingRequires) {
+        collectAndCreateVars(reqExpr, vars, ctx)
+        const reqZ3 = toZ3(reqExpr, vars, ctx)
+        if (reqZ3) {
+          try {
+            assumptions.push(reqZ3 as Bool<'main'>)
+            assumptionLabels.push(`enclosing requires: ${prettyExpr(reqExpr)}`)
+          } catch { /* skip */ }
+        }
+      }
+
       const z3 = toZ3(substituted, vars, ctx)
       if (z3 === null) continue
 
@@ -124,38 +139,31 @@ export function extractCallSiteObligations(
   return tasks
 }
 
-/** Check if a node is inside proof(), proof.fn(), requires(), ensures(), or other contract calls. */
+/**
+ * Check if a node is directly inside a proof() wrapper or a contract call.
+ * Calls inside regular functions with inline contracts are NOT skipped —
+ * those still need call-site verification.
+ */
 function isInsideContractContext(node: Node): boolean {
   let current = node.getParent()
   while (current !== undefined) {
     if (Node.isCallExpression(current)) {
       const callee = current.getExpression().getText()
+      // Skip calls that are arguments to proof(), requires(), ensures(), etc.
       if (callee === 'proof' || callee === 'proof.fn' ||
           callee === 'requires' || callee === 'ensures' ||
           callee === 'check' || callee === 'assume' ||
           callee === 'invariant' || callee === 'decreases') return true
     }
-    // Inside a decorated method — also handled by translator
+    // Inside a decorated method with @requires/@ensures — handled by translator
     if (Node.isMethodDeclaration(current)) {
       const decorators = current.getDecorators()
       if (decorators.some(d => ['requires', 'ensures'].includes(d.getName()))) return true
     }
-    // Inside a function with inline contracts
-    if (Node.isFunctionDeclaration(current) || Node.isArrowFunction(current)) {
-      // Check if the function body has requires/ensures statements
-      const body = Node.isFunctionDeclaration(current) ? current.getBody() : current.getBody()
-      if (body && Node.isBlock(body)) {
-        for (const stmt of body.getStatements()) {
-          if (Node.isExpressionStatement(stmt)) {
-            const expr = stmt.getExpression()
-            if (Node.isCallExpression(expr)) {
-              const name = expr.getExpression().getText()
-              if (name === 'requires' || name === 'ensures') return true
-            }
-          }
-        }
-      }
-    }
+    // NOTE: we deliberately do NOT skip calls inside functions with inline
+    // requires/ensures. The translator verifies the function's own contracts,
+    // but calls to other contracted functions inside the body still need
+    // call-site verification.
     current = current.getParent()
   }
   return false
@@ -219,6 +227,53 @@ function collectScopeAssignments(callNode: Node): Map<string, Expr> {
   }
 
   return assignments
+}
+
+/**
+ * Collects inline requires() calls from the enclosing function.
+ * If the call is inside `function f(x) { requires(x > 0); ... call() }`,
+ * then `x > 0` is an assumption for the call.
+ */
+function collectEnclosingRequires(callNode: Node): Expr[] {
+  const requires: Expr[] = []
+
+  let current: Node | undefined = callNode
+  while (current) {
+    const parent = current.getParent()
+    if (!parent) break
+
+    if (Node.isFunctionDeclaration(parent) || Node.isArrowFunction(parent) || Node.isFunctionExpression(parent)) {
+      const body = (parent as any).getBody()
+      if (body && Node.isBlock(body)) {
+        for (const stmt of body.getStatements()) {
+          if (!Node.isExpressionStatement(stmt)) continue
+          const expr = stmt.getExpression()
+          if (!Node.isCallExpression(expr)) continue
+          const callee = expr.getExpression().getText()
+          if (callee !== 'requires') continue
+          const args = expr.getArguments()
+          if (args.length === 0) continue
+          const firstArg = args[0]!
+          // Handle arrow-wrapped: requires(({x}) => x > 0)
+          if (Node.isArrowFunction(firstArg)) {
+            const argBody = (firstArg as any).getBody()
+            if (argBody) {
+              const parsed = parseExpr(argBody as Expression)
+              if (parsed) requires.push(parsed)
+            }
+          } else {
+            const parsed = parseExpr(firstArg as Expression)
+            if (parsed) requires.push(parsed)
+          }
+        }
+      }
+      break // only collect from the immediate enclosing function
+    }
+
+    current = parent
+  }
+
+  return requires
 }
 
 /**
