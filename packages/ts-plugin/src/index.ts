@@ -88,11 +88,10 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     // -------------------------------------------------------------------
 
     const cache = new Map<string, CachedDiagnostics>()
-    const pendingVersions = new Map<string, string>()  // fileName → hash being verified
-    let debounceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    const pendingVersions = new Map<string, string>()
+    const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
     function hashSource(source: string): string {
-      // Fast hash for change detection
       let h = 0
       for (let i = 0; i < source.length; i++) {
         h = ((h << 5) - h + source.charCodeAt(i)) | 0
@@ -110,11 +109,9 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       sourceFile: tslib.SourceFile,
       hash: string,
     ): void {
-      // Clear existing debounce timer for this file
       const existing = debounceTimers.get(fileName)
       if (existing) clearTimeout(existing)
 
-      // Debounce 300ms — avoids re-verifying on every keystroke
       const timer = setTimeout(() => {
         debounceTimers.delete(fileName)
         pendingVersions.set(fileName, hash)
@@ -134,7 +131,6 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         const ctx = await getZ3()
         if (ctx === null) return
 
-        // Check if a newer version was requested while we were waiting
         if (pendingVersions.get(fileName) !== hash) return
 
         const core = await import('@theoremts/core')
@@ -150,11 +146,10 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
 
         if (irList.length === 0) {
           cache.set(fileName, { sourceHash: hash, diagnostics: [] })
-          refreshProject()
+          refreshDiags(fileName)
           return
         }
 
-        // Check again if source changed during extraction
         if (pendingVersions.get(fileName) !== hash) return
 
         const registry = core.buildRegistry(irList)
@@ -221,12 +216,11 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
           log(`call-site extraction failed for ${fileName}: ${err}`)
         }
 
-        // Only cache if source hasn't changed since we started
         if (pendingVersions.get(fileName) === hash) {
           const diagnostics = failures.map(f => toDiagnostic(f, sourceFile))
           cache.set(fileName, { sourceHash: hash, diagnostics })
           pendingVersions.delete(fileName)
-          refreshProject()
+          refreshDiags(fileName)
         }
 
       } catch (err) {
@@ -237,30 +231,14 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     }
 
     // -------------------------------------------------------------------
-    // Project refresh
+    // Trigger diagnostic refresh
     // -------------------------------------------------------------------
 
-    function refreshProject(): void {
+    function refreshDiags(_fileName: string): void {
       try {
-        // The most reliable way to trigger VS Code to re-request diagnostics:
-        // Use the project's language service host to signal script version change
-        const project = info.project as any
-
-        // Method 1: refreshDiagnostics (TS 4.9+)
-        if (typeof project.refreshDiagnostics === 'function') {
-          project.refreshDiagnostics()
-          return
-        }
-
-        // Method 2: Mark project dirty + update graph
-        if (typeof project.markAsDirty === 'function') {
-          project.markAsDirty()
-          if (typeof project.updateGraph === 'function') {
-            project.updateGraph()
-          }
-        }
-      } catch (err) {
-        log(`refreshProject failed: ${err}`)
+        info.project.refreshDiagnostics()
+      } catch {
+        try { (info.project as any).markAsDirty?.() } catch {}
       }
     }
 
@@ -293,17 +271,14 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       _contractText: string,
     ): number {
       if (fnName) {
-        // For function declarations: highlight the name, not "function" keyword
         const fnPattern = new RegExp(`function\\s+(${escapeRegex(fnName)})\\b`)
         const fnMatch = fnPattern.exec(source)
         if (fnMatch) return fnMatch.index + fnMatch[0].indexOf(fnName)
 
-        // For const/let declarations
         const constPattern = new RegExp(`(?:const|let|var)\\s+(${escapeRegex(fnName)})\\b`)
         const constMatch = constPattern.exec(source)
         if (constMatch) return constMatch.index + constMatch[0].indexOf(fnName)
 
-        // For class methods
         const methodPattern = new RegExp(`\\b(${escapeRegex(fnName)})\\s*\\(`)
         const methodMatch = methodPattern.exec(source)
         if (methodMatch) return methodMatch.index
@@ -404,22 +379,18 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       const source = sourceFile.getText()
       const hash = hashSource(source)
 
-      // Return cached if fresh
+      // Return cached if fresh — re-bind sourceFile to current version
       const cached = cache.get(fileName)
       if (cached && cached.sourceHash === hash) {
-        return [...original, ...cached.diagnostics]
+        const rebound = cached.diagnostics.map(d => ({ ...d, file: sourceFile }))
+        return [...original, ...rebound]
       }
 
-      // If we have a stale cache, clear it and show previous results temporarily
-      // while the new verification runs (avoids flashing)
-      const staleResults = cached ? cached.diagnostics : []
-
-      // Schedule verification (debounced) — when done, it will update cache
-      // and trigger a refresh so getSemanticDiagnostics is called again
+      // Schedule verification (debounced)
       scheduleVerification(fileName, source, sourceFile, hash)
 
-      // Return original + stale results while verification runs
-      return [...original, ...staleResults]
+      // Return original only — don't show stale diagnostics with wrong offsets
+      return original
     }
 
     return proxy

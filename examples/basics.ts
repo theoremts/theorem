@@ -27,13 +27,10 @@ var b = 4;
 
 
 
-
-function nextOdd2(n: number) {
-  if (n % 2 !== 0) {
-    nextOdd(n)
+function nextOdd2e(n: number) {
+  if (n % 2 === 0) {
+    nextOdd(n);
   }
-
-  return 0;
 }
 
 export function applyDiscount(price: number, percent: number): number {

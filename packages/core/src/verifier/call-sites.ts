@@ -64,6 +64,9 @@ export function extractCallSiteObligations(
     // Collect variable assignments in scope before the call site (constant propagation)
     const scopeAssignments = collectScopeAssignments(node)
 
+    // Collect path conditions — if-statement guards enclosing the call site
+    const pathConditions = collectPathConditions(node)
+
     // For each requires, generate a verification task
     for (const req of contract.requires) {
       if (typeof req === 'string') continue
@@ -85,6 +88,19 @@ export function extractCallSiteObligations(
             assumptions.push((varZ3 as any).eq(valZ3) as Bool<'main'>)
             assumptionLabels.push(`scope: ${varName} = ${prettyExpr(valueExpr)}`)
           } catch { /* sort mismatch */ }
+        }
+      }
+
+      // Add path conditions as assumptions (if-guards enclosing the call)
+      for (const { expr: condExpr, negated } of pathConditions) {
+        collectAndCreateVars(condExpr, vars, ctx)
+        const condZ3 = toZ3(condExpr, vars, ctx)
+        if (condZ3) {
+          try {
+            const assumption = negated ? ctx.Not(condZ3 as Bool<'main'>) : condZ3 as Bool<'main'>
+            assumptions.push(assumption)
+            assumptionLabels.push(`path: ${negated ? '!' : ''}${prettyExpr(condExpr)}`)
+          } catch { /* skip */ }
         }
       }
 
@@ -203,6 +219,86 @@ function collectScopeAssignments(callNode: Node): Map<string, Expr> {
   }
 
   return assignments
+}
+
+/**
+ * Collects if-statement conditions that guard the call site.
+ * If the call is inside `if (cond) { call() }`, then `cond` is a path condition.
+ * If the call is in the else branch, the condition is negated.
+ * Also handles early-exit guards: `if (!cond) return; call()` → cond is assumed.
+ */
+function collectPathConditions(callNode: Node): Array<{ expr: Expr; negated: boolean }> {
+  const conditions: Array<{ expr: Expr; negated: boolean }> = []
+
+  let current: Node | undefined = callNode
+  while (current) {
+    const parent = current.getParent()
+    if (!parent) break
+
+    if (Node.isIfStatement(parent)) {
+      const condNode = parent.getExpression()
+      const parsed = parseExpr(condNode as Expression)
+      if (parsed) {
+        const thenStmt = parent.getThenStatement()
+        const elseStmt = parent.getElseStatement()
+
+        // Is the call in the then-branch or else-branch?
+        if (thenStmt && isDescendantOf(current, thenStmt)) {
+          // In then-branch: condition is true
+          conditions.push({ expr: parsed, negated: false })
+        } else if (elseStmt && isDescendantOf(current, elseStmt)) {
+          // In else-branch: condition is false (negated)
+          conditions.push({ expr: parsed, negated: true })
+        }
+      }
+    }
+
+    // Early-exit guard: if (!cond) return/throw; ...call()
+    // If we're in a block and there's an if/return before us, assume the guard
+    if (Node.isBlock(parent)) {
+      const statements = parent.getStatements()
+      for (const stmt of statements) {
+        // Stop at the statement containing our call
+        if (stmt.getPos() >= callNode.getPos()) break
+
+        if (Node.isIfStatement(stmt) && !stmt.getElseStatement()) {
+          const thenBranch = stmt.getThenStatement()
+          if (isUnconditionalExit(thenBranch)) {
+            // Guard: if (BAD) return → after this, !BAD holds
+            const condNode = stmt.getExpression()
+            const parsed = parseExpr(condNode as Expression)
+            if (parsed) {
+              conditions.push({ expr: parsed, negated: true })
+            }
+          }
+        }
+      }
+    }
+
+    current = parent
+  }
+
+  return conditions
+}
+
+function isDescendantOf(node: Node, ancestor: Node): boolean {
+  let current: Node | undefined = node
+  while (current) {
+    if (current === ancestor) return true
+    current = current.getParent()
+  }
+  return false
+}
+
+function isUnconditionalExit(node: Node): boolean {
+  if (Node.isReturnStatement(node) || Node.isThrowStatement(node)) return true
+  if (Node.isBlock(node)) {
+    const stmts = node.getStatements()
+    if (stmts.length === 0) return false
+    const last = stmts[stmts.length - 1]!
+    return Node.isReturnStatement(last) || Node.isThrowStatement(last)
+  }
+  return false
 }
 
 /** Recursively collects identifiers from an expression and creates Z3 variables. */
