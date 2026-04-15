@@ -1,6 +1,6 @@
 {
   "name": "theoremts-agent",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Programmatic verification API for AI agents — verify TypeScript code against contracts",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -26,7 +26,7 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "@theoremts/core": "0.2.6"
+    "@theoremts/core": "0.2.7"
   },
   "devDependencies": {
     "typescript": "*",

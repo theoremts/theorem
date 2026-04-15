@@ -114,7 +114,7 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       const existing = debounceTimers.get(fileName)
       if (existing) clearTimeout(existing)
 
-      // Debounce 500ms — avoids re-verifying on every keystroke
+      // Debounce 300ms — avoids re-verifying on every keystroke
       const timer = setTimeout(() => {
         debounceTimers.delete(fileName)
         pendingVersions.set(fileName, hash)
@@ -242,13 +242,25 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
 
     function refreshProject(): void {
       try {
-        info.project.refreshDiagnostics()
-      } catch {
-        // refreshDiagnostics may not exist on all TS server versions
-        try {
-          // Alternative: mark project as dirty
-          (info.project as any).markAsDirty?.()
-        } catch {}
+        // The most reliable way to trigger VS Code to re-request diagnostics:
+        // Use the project's language service host to signal script version change
+        const project = info.project as any
+
+        // Method 1: refreshDiagnostics (TS 4.9+)
+        if (typeof project.refreshDiagnostics === 'function') {
+          project.refreshDiagnostics()
+          return
+        }
+
+        // Method 2: Mark project dirty + update graph
+        if (typeof project.markAsDirty === 'function') {
+          project.markAsDirty()
+          if (typeof project.updateGraph === 'function') {
+            project.updateGraph()
+          }
+        }
+      } catch (err) {
+        log(`refreshProject failed: ${err}`)
       }
     }
 
@@ -398,14 +410,16 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         return [...original, ...cached.diagnostics]
       }
 
-      // Invalidate stale cache
-      if (cached) cache.delete(fileName)
+      // If we have a stale cache, clear it and show previous results temporarily
+      // while the new verification runs (avoids flashing)
+      const staleResults = cached ? cached.diagnostics : []
 
-      // Schedule verification (debounced)
+      // Schedule verification (debounced) — when done, it will update cache
+      // and trigger a refresh so getSemanticDiagnostics is called again
       scheduleVerification(fileName, source, sourceFile, hash)
 
-      // Return original while verification runs
-      return original
+      // Return original + stale results while verification runs
+      return [...original, ...staleResults]
     }
 
     return proxy

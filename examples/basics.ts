@@ -28,8 +28,13 @@ var b = 4;
 
 
 
+function nextOdd2(n: number) {
+  if (n % 2 !== 0) {
+    nextOdd(n)
+  }
 
-nextOdd(b - a)
+  return 0;
+}
 
 export function applyDiscount(price: number, percent: number): number {
   requires(positive(price))
