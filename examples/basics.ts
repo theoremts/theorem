@@ -18,15 +18,8 @@ function nextOdd(n: number) {
   requires(integer(n))
   requires(n % 2 === 0)
   ensures(output() % 2 !== 0)
+
   return n + 1
-}
-
-function nextOddCaller(n: number) {
-  requires(integer(n))
-
-  if (n % 2 === 0) {
-    nextOdd(n);
-  }
 }
 
 export function applyDiscount(price: number, percent: number): number {
