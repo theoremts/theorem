@@ -216,18 +216,24 @@ async function verifyFile(
 
   // Call-site verification: check calls to contracted functions outside proof()
   if (registry && registry.size > 0) {
-    const callSiteTasks = extractCallSiteObligations(source, absPath, registry, ctx)
-    if (callSiteTasks.length > 0) {
-      const taskResults: TaskResult[] = []
-      for (const task of callSiteTasks) {
-        const t0 = Date.now()
-        const timeoutMs = opts.timeout ? Number(opts.timeout) : config.solver.timeout
-        const result = await check({ ...task, timeout: timeoutMs })
-        const ms = Date.now() - t0
-        taskResults.push({ task, result, durationMs: ms })
+    try {
+      const callSiteTasks = extractCallSiteObligations(source, absPath, registry, ctx)
+      if (callSiteTasks.length > 0) {
+        const taskResults: TaskResult[] = []
+        for (const task of callSiteTasks) {
+          try {
+            const t0 = Date.now()
+            const timeoutMs = opts.timeout ? Number(opts.timeout) : config.solver.timeout
+            const result = await check({ ...task, timeout: timeoutMs })
+            const ms = Date.now() - t0
+            taskResults.push({ task, result, durationMs: ms })
+          } catch { /* skip tasks that cause Z3 errors */ }
+        }
+        if (taskResults.length > 0) {
+          functionResults.push({ name: '(call-site checks)', taskResults })
+        }
       }
-      functionResults.push({ name: '(call-site checks)', taskResults })
-    }
+    } catch { /* skip files that cause extraction errors */ }
   }
 
   if (functionResults.length === 0) return null

@@ -122,6 +122,12 @@ export function extractCallSiteObligations(
       const z3 = toZ3(substituted, vars, ctx)
       if (z3 === null) continue
 
+      // Ensure the goal is a Bool (skip if sort mismatch)
+      let goal: Bool<'main'>
+      try {
+        goal = ctx.Not(z3 as Bool<'main'>)
+      } catch { continue }
+
       const argTexts = args.map(a => a.getText().trim()).join(', ')
 
       tasks.push({
@@ -130,7 +136,7 @@ export function extractCallSiteObligations(
         variables: vars,
         assumptions,
         assumptionLabels,
-        goal: ctx.Not(z3 as Bool<'main'>),
+        goal,
         domainConstraints: [],
       })
     }

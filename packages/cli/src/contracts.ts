@@ -20,9 +20,16 @@ export function resolveContractFiles(patterns: string[], cwd: string): string[] 
 
   for (const pattern of patterns) {
     if (pattern.startsWith('**/')) {
-      // Recursive glob: **/*.contracts.ts
-      const suffix = pattern.slice(3) // e.g. "*.contracts.ts"
+      // Recursive glob from cwd: **/*.contracts.ts
+      const suffix = pattern.slice(3)
       collectMatchingFiles(cwd, suffix, files, true)
+    } else if (pattern.includes('**')) {
+      // Recursive glob with base dir: .theorem/contracts/**/*.contracts.ts
+      const doubleStarIdx = pattern.indexOf('**')
+      const baseDir = pattern.slice(0, doubleStarIdx).replace(/\/$/, '')
+      const suffix = pattern.slice(doubleStarIdx + 2).replace(/^\//, '') // *.contracts.ts
+      const absDir = resolve(cwd, baseDir)
+      collectMatchingFiles(absDir, suffix, files, true)
     } else if (pattern.includes('*')) {
       // Directory glob: contracts/*.contracts.ts
       const slashIdx = pattern.lastIndexOf('/')
@@ -31,10 +38,16 @@ export function resolveContractFiles(patterns: string[], cwd: string): string[] 
       const absDir = resolve(cwd, dir)
       collectMatchingFiles(absDir, filePattern, files, false)
     } else {
-      // Direct file path
+      // Direct file path or directory
       const absPath = resolve(cwd, pattern)
       try {
-        if (statSync(absPath).isFile()) files.push(absPath)
+        const stat = statSync(absPath)
+        if (stat.isFile()) {
+          files.push(absPath)
+        } else if (stat.isDirectory()) {
+          // If a directory is given, recursively find .contracts.ts files
+          collectMatchingFiles(absPath, '*.contracts.ts', files, true)
+        }
       } catch { /* skip missing files */ }
     }
   }
