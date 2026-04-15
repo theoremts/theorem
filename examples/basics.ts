@@ -21,16 +21,10 @@ function nextOdd(n: number) {
   return n + 1
 }
 
-var a = 2;
-var b = 4;
-
-
-
-
-function nextOdd2e(n: number) {
+function nextOddCaller(n: number) {
   requires(integer(n))
 
-  if (n % 2 !== 0) {
+  if (n % 2 === 0) {
     nextOdd(n);
   }
 }

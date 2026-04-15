@@ -177,9 +177,11 @@ async function verifyFile(
   }
 
   const irs = extractFromSource(source, absPath, registry)
-  if (irs.length === 0) return null
 
-  if (opts.debug) debugParser(irs)
+  // Skip files with no contracts AND no registry (nothing to verify)
+  if (irs.length === 0 && (!registry || registry.size === 0)) return null
+
+  if (opts.debug && irs.length > 0) debugParser(irs)
 
   const ctx = await getContext()
   const functionResults: FunctionReport[] = []
@@ -318,7 +320,11 @@ async function runVerify(
   }
 
   if (filesWithContracts === 0) {
-    process.stdout.write(`${dim}No proof() calls found in ${files.length === 1 ? files[0]! : `${files.length} files`}.${reset}\n`)
+    if (registry.size > 0) {
+      process.stdout.write(`${dim}No contract violations found in ${files.length === 1 ? files[0]! : `${files.length} files`} (${registry.size} contracts loaded).${reset}\n`)
+    } else {
+      process.stdout.write(`${dim}No contracts found. Run 'theorem infer' to generate contracts, or add requires()/ensures() to your code.${reset}\n`)
+    }
   }
 
   return { totalFailed }
