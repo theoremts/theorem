@@ -112,8 +112,14 @@ export function ensures(...conditions: Array<((params: any) => boolean) | (() =>
 
 export function invariant(condition: () => boolean): Invariant
 export function invariant(description: string): Invariant
-export function invariant(_: unknown): Invariant {
-  return { __type: 'invariant' }
+/** Class invariant: assumed at every method entry, proved at every exit. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function invariant(...conditions: Array<((self: any) => boolean) | string>): Invariant & ((target: any, context?: any) => any)
+export function invariant(..._: unknown[]): any {
+  // Callable so it works as a class decorator; carries __type for inline use
+  const dec = (target: unknown, _context?: unknown): unknown => target
+  ;(dec as { __type?: string }).__type = 'invariant'
+  return dec
 }
 
 // ---------------------------------------------------------------------------

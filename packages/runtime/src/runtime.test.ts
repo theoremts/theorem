@@ -166,14 +166,20 @@ describe('ensures', () => {
 })
 
 describe('invariant', () => {
-  test('returns object with __type: invariant (arrow function form)', () => {
-    const contract = invariant(() => true)
-    assert.deepEqual(contract, { __type: 'invariant' })
+  test('returns contract with __type: invariant (arrow function form)', () => {
+    const contract = invariant(() => true) as any
+    assert.strictEqual(contract.__type, 'invariant')
   })
 
-  test('returns object with __type: invariant (string form)', () => {
-    const contract = invariant('state is valid')
-    assert.deepEqual(contract, { __type: 'invariant' })
+  test('returns contract with __type: invariant (string form)', () => {
+    const contract = invariant('state is valid') as any
+    assert.strictEqual(contract.__type, 'invariant')
+  })
+
+  test('is usable as a class decorator (returns the target unchanged)', () => {
+    const contract = invariant((self: any) => self.x >= 0) as any
+    class Target { x = 1 }
+    assert.strictEqual(contract(Target), Target)
   })
 })
 

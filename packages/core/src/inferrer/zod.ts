@@ -1,6 +1,8 @@
-import { SyntaxKind, Node, type Block } from 'ts-morph'
+import { SyntaxKind, Node, Project, type Block, type SourceFile, type Expression } from 'ts-morph'
 import type { InferredContract } from './index.js'
 import type { Expr } from '../parser/ir.js'
+import { parseExpr } from '../parser/expr.js'
+import { substituteExpr } from '../translator/substitution.js'
 
 /**
  * Extract contracts from Zod schema validation patterns.
@@ -57,6 +59,19 @@ export function extractZodContracts(body: Block): InferredContract[] {
 
     // Extract constraints from the schema text
     const extracted = extractConstraintsFromSchemaText(schemaText, varName)
+
+    // Cross-field invariants from .refine(): bind to the parsed variable
+    for (const inv of extractRefinePredicates(schemaText)) {
+      const bound = bindRefineInvariant(inv, { kind: 'ident', name: varName })
+      extracted.push({
+        kind: 'requires',
+        text: `refine invariant on ${varName}`,
+        predicate: bound,
+        confidence: 'guard',
+        source: 'from Zod schema: .refine(...)',
+      })
+    }
+
     for (const c of extracted) {
       if (!seen.has(c.text)) {
         seen.add(c.text)
@@ -72,7 +87,7 @@ export function extractZodContracts(body: Block): InferredContract[] {
  * Try to find a variable declaration for the schema name in the enclosing
  * scope (the block itself, or any ancestor scope up to the source file).
  */
-function resolveSchemaVariable(body: Block, name: string): string | undefined {
+export function resolveSchemaVariable(body: Block, name: string): string | undefined {
   // Search in the body itself
   for (const decl of body.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
     if (decl.getName() === name) {
@@ -92,9 +107,55 @@ function resolveSchemaVariable(body: Block, name: string): string | undefined {
         }
       }
     }
+    if (Node.isSourceFile(current)) {
+      // Not declared in this file — follow a relative import
+      const imported = resolveImportedSchema(current, name)
+      if (imported !== undefined) return imported
+    }
     current = current.getParent()
   }
 
+  return undefined
+}
+
+/**
+ * Cross-file resolution: if `name` is imported from a relative module, read
+ * that file from disk and extract the schema initializer text.
+ * One level deep — schemas composing other imported schemas resolve partially.
+ */
+export function resolveImportedSchema(file: SourceFile, name: string): string | undefined {
+  try {
+    for (const imp of file.getImportDeclarations()) {
+      const names = imp.getNamedImports().map(n => n.getName())
+      if (!names.includes(name)) continue
+
+      const spec = imp.getModuleSpecifierValue()
+      if (!spec.startsWith('.')) return undefined  // only relative imports
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { readFileSync } = require('fs') as typeof import('fs')
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { dirname, resolve } = require('path') as typeof import('path')
+
+      const base = resolve(dirname(file.getFilePath()), spec)
+      for (const candidate of [base, `${base}.ts`, `${base}/index.ts`, base.replace(/\.js$/, '.ts')]) {
+        let source: string
+        try {
+          source = readFileSync(candidate, 'utf-8')
+        } catch { continue }
+
+        const imported = getRefineProject().createSourceFile('__imported__.ts', source, { overwrite: true })
+        for (const decl of imported.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+          if (decl.getName() === name) {
+            const init = decl.getInitializer()
+            if (init) return init.getText().trim()
+          }
+        }
+        return undefined  // file found but schema not in it
+      }
+      return undefined
+    }
+  } catch { /* fs unavailable or unreadable — same-file only */ }
   return undefined
 }
 
@@ -110,13 +171,15 @@ interface FieldConstraint {
   isLength: boolean
   /** Source description for the contract */
   source: string
+  /** For .int(): emit Number.isInteger instead of a comparison. */
+  isInt?: boolean
 }
 
 /**
  * Starting from position `start` (just after an opening paren), find the
  * matching closing paren, handling nested parens.  Returns -1 if not found.
  */
-function findBalancedParen(text: string, start: number): number {
+export function findBalancedParen(text: string, start: number): number {
   let depth = 1
   for (let i = start; i < text.length; i++) {
     if (text[i] === '(') depth++
@@ -128,7 +191,7 @@ function findBalancedParen(text: string, start: number): number {
   return -1
 }
 
-function extractConstraintsFromSchemaText(schemaText: string, varName: string): InferredContract[] {
+export function extractConstraintsFromSchemaText(schemaText: string, varName: string): InferredContract[] {
   const constraints: FieldConstraint[] = []
 
   // Match z.object({ field: z.number().<method>(), ... }) patterns
@@ -147,7 +210,7 @@ function extractConstraintsFromSchemaText(schemaText: string, varName: string): 
 
     // Extract the remaining chain after the base call's closing paren
     const rest = schemaText.slice(closeIdx + 1)
-    const chainMatch = /^((?:\.\w+\([^)]*\))*)/.exec(rest)
+    const chainMatch = /^((?:\.\w+(?:<[^>]*>)?\([^)]*\))*)/.exec(rest)
     const chainText = chainMatch?.[1] ?? ''
 
     extractChainConstraints(fieldName, baseType, chainText, constraints)
@@ -156,7 +219,7 @@ function extractConstraintsFromSchemaText(schemaText: string, varName: string): 
   // Also handle top-level (non-object) schemas: z.number().positive().parse(x)
   // In this case the schema itself is the chain with no field name.
   if (constraints.length === 0) {
-    const topLevelPattern = /^z\.(number|string|array)\s*\([^)]*\)((?:\.\w+\([^)]*\))*)$/
+    const topLevelPattern = /^z\.(number|string|array)\s*\([^)]*\)((?:\.\w+(?:<[^>]*>)?\([^)]*\))*)$/
     const topMatch = topLevelPattern.exec(schemaText)
     if (topMatch) {
       const baseType = topMatch[1]!
@@ -168,6 +231,16 @@ function extractConstraintsFromSchemaText(schemaText: string, varName: string): 
 
   // Convert field constraints to InferredContracts
   return constraints.map(c => {
+    if (c.isInt) {
+      const intExpr = buildFieldExpr(varName, c.field, false)
+      return {
+        kind: 'requires' as const,
+        text: `Number.isInteger(${c.field ? `${varName}.${c.field}` : varName})`,
+        predicate: { kind: 'call' as const, callee: 'Number.isInteger', args: [intExpr] },
+        confidence: 'guard' as const,
+        source: `from Zod schema: ${c.source}`,
+      }
+    }
     const fieldExpr = buildFieldExpr(varName, c.field, c.isLength)
     const text = buildText(varName, c.field, c.op, c.value, c.isLength)
 
@@ -228,6 +301,9 @@ function extractChainConstraints(
     if (ltMatch) {
       out.push({ field, op: '<', value: Number(ltMatch[1]), isLength: false, source: `z.number().lt(${ltMatch[1]})` })
     }
+    if (/\.int\(\)/.test(chainText)) {
+      out.push({ field, op: '>=', value: 0, isLength: false, source: 'z.number().int()', isInt: true })
+    }
     const lteMatch = /\.lte\(\s*(-?\d+(?:\.\d+)?)\s*\)/.exec(chainText)
     if (lteMatch) {
       out.push({ field, op: '<=', value: Number(lteMatch[1]), isLength: false, source: `z.number().lte(${lteMatch[1]})` })
@@ -265,7 +341,7 @@ function extractChainConstraints(
   }
 }
 
-function buildFieldExpr(varName: string, field: string, isLength: boolean): Expr {
+export function buildFieldExpr(varName: string, field: string, isLength: boolean): Expr {
   let base: Expr
 
   if (field) {
@@ -285,8 +361,163 @@ function buildFieldExpr(varName: string, field: string, isLength: boolean): Expr
   return base
 }
 
-function buildText(varName: string, field: string, op: string, value: number, isLength: boolean): string {
+export function buildText(varName: string, field: string, op: string, value: number, isLength: boolean): string {
   const base = field ? `${varName}.${field}` : varName
   const prop = isLength ? `${base}.length` : base
   return `${prop} ${op} ${value}`
+}
+
+// ---------------------------------------------------------------------------
+// .refine() invariants — cross-field predicates lifted from schema chains
+// ---------------------------------------------------------------------------
+
+/** A cross-field invariant extracted from `.refine(arrow)` on a schema. */
+export interface RefineInvariant {
+  /** Simple param (`t => t.a === t.b`) or destructured names (`({a, b}) => a === b`). */
+  binding: { kind: 'param'; name: string } | { kind: 'destructured'; names: string[] }
+  predicate: Expr
+  /** Original arrow text, for reporting. */
+  text: string
+}
+
+let refineProject: Project | null = null
+
+function getRefineProject(): Project {
+  if (refineProject === null) {
+    refineProject = new Project({
+      useInMemoryFileSystem: true,
+      skipFileDependencyResolution: true,
+      compilerOptions: { strict: false, skipLibCheck: true },
+    })
+  }
+  return refineProject
+}
+
+/**
+ * Finds every top-level `.refine(...)` in a schema chain and parses the
+ * predicate arrow into IR. `superRefine` is skipped (imperative — can't lift).
+ */
+export function extractRefinePredicates(schemaText: string): RefineInvariant[] {
+  return extractArrowPredicates(schemaText, '.refine(')
+}
+
+/**
+ * Generic arrow-predicate extraction for any `<marker>arrow...)` pattern —
+ * `.refine(` for Zod, `filter(` for Effect Schema.
+ */
+export function extractArrowPredicates(schemaText: string, marker: string): RefineInvariant[] {
+  const out: RefineInvariant[] = []
+  let idx = 0
+
+  while ((idx = schemaText.indexOf(marker, idx)) !== -1) {
+    const argStart = idx + marker.length
+    const close = findBalancedParen(schemaText, argStart)
+    if (close === -1) break
+    const argText = schemaText.slice(argStart, close)
+    idx = close
+
+    try {
+      const file = getRefineProject().createSourceFile('__refine__.ts', `__r(${argText})`, { overwrite: true })
+      const call = file.getFirstDescendantByKind(SyntaxKind.CallExpression)
+      const arrow = call?.getArguments()[0]
+      if (!arrow || !Node.isArrowFunction(arrow)) continue
+
+      const params = arrow.getParameters()
+      if (params.length !== 1) continue
+      const paramNode = params[0]!.getNameNode()
+
+      let binding: RefineInvariant['binding'] | null = null
+      if (Node.isIdentifier(paramNode)) {
+        binding = { kind: 'param', name: paramNode.getText() }
+      } else if (Node.isObjectBindingPattern(paramNode)) {
+        const names: string[] = []
+        for (const el of paramNode.getElements()) {
+          names.push(el.getNameNode().getText())
+        }
+        binding = { kind: 'destructured', names }
+      }
+      if (binding === null) continue
+
+      const bodyNode = arrow.getBody()
+      let exprNode: Expression | null = null
+      if (Node.isExpression(bodyNode)) {
+        exprNode = bodyNode as Expression
+      } else if (Node.isBlock(bodyNode)) {
+        const stmts = bodyNode.getStatements()
+        if (stmts.length === 1 && Node.isReturnStatement(stmts[0]!)) {
+          exprNode = (stmts[0]! as import('ts-morph').ReturnStatement).getExpression() ?? null
+        }
+      }
+      if (exprNode === null) continue
+
+      const predicate = parseExpr(exprNode)
+      if (predicate === null) continue
+
+      out.push({ binding, predicate, text: arrow.getText() })
+    } catch { /* unparseable refine — skip */ }
+  }
+
+  return out
+}
+
+/**
+ * Binds a refine invariant's predicate to a concrete target expression:
+ * the parse-result variable (`order`) or `output()` for producer functions.
+ */
+export function bindRefineInvariant(inv: RefineInvariant, target: Expr): Expr {
+  const mapping = new Map<string, Expr>()
+  if (inv.binding.kind === 'param') {
+    mapping.set(inv.binding.name, target)
+  } else {
+    for (const name of inv.binding.names) {
+      mapping.set(name, { kind: 'member', object: target, property: name })
+    }
+  }
+  return substituteExpr(inv.predicate, mapping)
+}
+
+// ---------------------------------------------------------------------------
+// File-level schema scan — schemas with invariants + type aliases
+// ---------------------------------------------------------------------------
+
+export interface FileSchemaInvariants {
+  /** schema variable name → its refine invariants */
+  schemas: Map<string, RefineInvariant[]>
+  /** type alias name → schema variable name (via z.output/z.infer<typeof S>) */
+  aliases: Map<string, string>
+}
+
+/**
+ * Scans a file for schema declarations carrying `.refine()` invariants and
+ * for type aliases derived from them (`type T = z.output<typeof S>`).
+ */
+export function extractSchemaInvariantsFromFile(file: SourceFile): FileSchemaInvariants {
+  const schemas = new Map<string, RefineInvariant[]>()
+  const aliases = new Map<string, string>()
+
+  for (const decl of file.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+    const init = decl.getInitializer()
+    if (!init) continue
+    const text = init.getText()
+    if (!text.startsWith('z.') || !text.includes('.refine(')) continue
+    const invs = extractRefinePredicates(text)
+    if (invs.length > 0) schemas.set(decl.getName(), invs)
+  }
+
+  for (const alias of file.getTypeAliases()) {
+    const m = /z\.(?:output|infer|input)<\s*typeof\s+(\w+)\s*>/.exec(alias.getTypeNode()?.getText() ?? '')
+    if (m) aliases.set(alias.getName(), m[1]!)
+  }
+
+  // Aliases referencing schemas imported from other files
+  for (const schemaName of new Set(aliases.values())) {
+    if (schemas.has(schemaName)) continue
+    const importedText = resolveImportedSchema(file, schemaName)
+    if (importedText !== undefined && importedText.includes('.refine(')) {
+      const invs = extractRefinePredicates(importedText)
+      if (invs.length > 0) schemas.set(schemaName, invs)
+    }
+  }
+
+  return { schemas, aliases }
 }

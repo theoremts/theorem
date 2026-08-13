@@ -9,10 +9,25 @@ import {
   type VariableDeclaration,
   type FunctionDeclaration,
   type MethodDeclaration,
+  type SourceFile,
 } from 'ts-morph'
 import type { BodyStep, Contract, Expr, FunctionIR, LoopInfo, Param, Predicate, Sort } from './ir.js'
 import { parseExpr, parseBlockToExpr, parseBlockWithLoops, parseStmtListDirect, getResolvedPositionalContracts, getFinalSSABindings } from './expr.js'
 import { substituteExpr } from '../translator/substitution.js'
+import {
+  extractZodContracts,
+  extractSchemaInvariantsFromFile,
+  bindRefineInvariant,
+  extractConstraintsFromSchemaText,
+  extractRefinePredicates,
+  resolveImportedSchema,
+} from '../inferrer/zod.js'
+import {
+  extractEffectContracts,
+  extractEffectSchemaInvariantsFromFile,
+  extractEffectConstraintsFromSchemaText,
+  extractEffectFilterInvariants,
+} from '../inferrer/effect-schema.js'
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -106,6 +121,20 @@ export function extractFromSource(source: string, fileName = 'input.ts', registr
   for (const ir of extractDecoratedMethods(file, proofNames as Set<string>)) {
     results.push(ir)
   }
+
+  // 3b. Schema invariants: a function whose declared return type derives from
+  //     a schema with .refine() invariants must PROVE those invariants on its
+  //     output — the schema-first equivalent of a class invariant.
+  try {
+    attachSchemaInvariantObligations(file, source, fileName, results)
+  } catch { /* best-effort */ }
+
+  // 3c. tRPC procedures: `t.procedure.input(Schema).mutation(handler)` —
+  //     the input schema's constraints hold inside the handler (tRPC
+  //     validates before invoking it).
+  try {
+    for (const ir of extractTrpcProcedures(file)) results.push(ir)
+  } catch { /* best-effort */ }
 
   // 4. Declared contracts: if registry has contracts for functions in this file,
   //    extract the function body and attach the declared contracts.
@@ -336,12 +365,23 @@ function extractDecoratedMethods(
   const results: FunctionIR[] = []
 
   for (const cls of file.getClasses()) {
+    // Class-level @invariant decorators: predicates over instance fields,
+    // normalized to `this.x` identifiers.
+    const classInvariants: Expr[] = []
+    for (const dec of cls.getDecorators()) {
+      if (dec.getName() !== 'invariant') continue
+      for (const arg of dec.getArguments()) {
+        const pred = extractClassInvariantPredicate(arg as Expression)
+        if (pred !== null) classInvariants.push(pred)
+      }
+    }
+
     for (const method of cls.getMethods()) {
       const name = method.getName()
       if (alreadyExtracted.has(name)) continue
 
       const decorators = method.getDecorators()
-      if (decorators.length === 0) continue
+      if (decorators.length === 0 && classInvariants.length === 0) continue
 
       const contracts: Contract[] = []
       for (const dec of decorators) {
@@ -363,17 +403,36 @@ function extractDecoratedMethods(
         }
       }
 
-      if (contracts.length === 0) continue
-
       const params = extractFunctionDeclParams(method)
       const fnBody = method.getBody()
       let body: FunctionIR['body']
       let loops: LoopInfo[] | undefined
+      let finalBindings = new Map<string, Expr>()
 
       if (fnBody && Node.isBlock(fnBody)) {
+        // Inline contracts in the method body (requires/ensures as statements)
+        for (const s of fnBody.getStatements()) {
+          if (!Node.isExpressionStatement(s)) continue
+          const contract = tryExtractContract(s.getExpression() as Expression)
+          if (contract !== null) contracts.push(contract)
+        }
+
         const result = parseBlockWithLoops(fnBody)
         body = result.body ?? undefined
         loops = result.loops.length > 0 ? result.loops : undefined
+        finalBindings = getFinalSSABindings()
+      }
+
+      if (contracts.length === 0 && classInvariants.length === 0) continue
+
+      // Class invariants: assumed at entry, must hold over the final state
+      // of `this.*` fields at exit.
+      for (const inv of classInvariants) {
+        contracts.push({ kind: 'requires', predicate: inv })
+        contracts.push({
+          kind: 'ensures',
+          predicate: finalBindings.size > 0 ? substituteExpr(inv, finalBindings) : inv,
+        })
       }
 
       results.push({
@@ -385,9 +444,96 @@ function extractDecoratedMethods(
         loops,
       })
     }
+
+    // Constructor: must ESTABLISH the invariant (no entry assumption)
+    if (classInvariants.length > 0) {
+      const ctor = cls.getConstructors()[0]
+      if (ctor) {
+        const fnBody = ctor.getBody()
+        let finalBindings = new Map<string, Expr>()
+        let body: FunctionIR['body']
+        const contracts: Contract[] = []
+        if (fnBody && Node.isBlock(fnBody)) {
+          for (const s of fnBody.getStatements()) {
+            if (!Node.isExpressionStatement(s)) continue
+            const contract = tryExtractContract(s.getExpression() as Expression)
+            if (contract !== null) contracts.push(contract)
+          }
+          body = parseBlockToExpr(fnBody) ?? undefined
+          finalBindings = getFinalSSABindings()
+        }
+        contracts.push(...classInvariants.map(inv => ({
+          kind: 'ensures' as const,
+          predicate: finalBindings.size > 0 ? substituteExpr(inv, finalBindings) : inv,
+        })))
+        results.push({
+          name: `${cls.getName() ?? 'anonymous'}.constructor`,
+          params: ctor.getParameters().map(p => ({
+            name: p.getName(),
+            sort: 'real' as Sort,
+          })),
+          returnSort: 'real',
+          body,
+          contracts,
+        })
+      }
+    }
   }
 
   return results
+}
+
+/**
+ * Parses a class @invariant predicate arrow into an Expr over `this.*` fields:
+ *   (self) => self.balance >= 0        → this.balance >= 0
+ *   ({ balance }) => balance >= 0      → this.balance >= 0
+ */
+function extractClassInvariantPredicate(arg: Expression): Expr | null {
+  if (!Node.isArrowFunction(arg)) return null
+  const params = arg.getParameters()
+  const bodyNode = arg.getBody()
+  if (!Node.isExpression(bodyNode)) return null
+  const parsed = parseExpr(bodyNode as Expression)
+  if (parsed === null) return null
+  if (params.length === 0) return parsed
+
+  const nameNode = params[0]!.getNameNode()
+  if (Node.isIdentifier(nameNode)) {
+    // (self) => self.balance >= 0 — rebase member accesses on the param to this.*
+    return rebaseParamToThis(parsed, nameNode.getText())
+  }
+  if (Node.isObjectBindingPattern(nameNode)) {
+    const mapping = new Map<string, Expr>()
+    for (const el of nameNode.getElements()) {
+      const n = el.getNameNode().getText()
+      mapping.set(n, { kind: 'ident', name: `this.${n}` })
+    }
+    return substituteExpr(parsed, mapping)
+  }
+  return parsed
+}
+
+/** Rewrites member(ident(param), p) → ident('this.p') recursively. */
+function rebaseParamToThis(expr: Expr, param: string): Expr {
+  switch (expr.kind) {
+    case 'member':
+      if (expr.object.kind === 'ident' && expr.object.name === param) {
+        return { kind: 'ident', name: `this.${expr.property}` }
+      }
+      return { kind: 'member', object: rebaseParamToThis(expr.object, param), property: expr.property }
+    case 'binary':
+      return { kind: 'binary', op: expr.op, left: rebaseParamToThis(expr.left, param), right: rebaseParamToThis(expr.right, param) }
+    case 'unary':
+      return { kind: 'unary', op: expr.op, operand: rebaseParamToThis(expr.operand, param) }
+    case 'ternary':
+      return { kind: 'ternary', condition: rebaseParamToThis(expr.condition, param), then: rebaseParamToThis(expr.then, param), else: rebaseParamToThis(expr.else, param) }
+    case 'call':
+      return { kind: 'call', callee: expr.callee, args: expr.args.map(a => rebaseParamToThis(a, param)) }
+    case 'element-access':
+      return { kind: 'element-access', object: rebaseParamToThis(expr.object, param), index: rebaseParamToThis(expr.index, param) }
+    default:
+      return expr
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +571,177 @@ function extractInlineContracts(
   return results
 }
 
+/**
+ * Attaches schema-invariant obligations to functions that produce values of a
+ * schema-derived type: `type T = z.output<typeof S>` where S has `.refine()`
+ * invariants means every function returning T must prove them on its output.
+ * Functions without any other contracts get a fresh IR (they become
+ * verifiable purely by returning the type).
+ */
+function attachSchemaInvariantObligations(
+  file: SourceFile,
+  source: string,
+  fileName: string,
+  results: FunctionIR[],
+): void {
+  const { schemas, aliases } = extractSchemaInvariantsFromFile(file)
+
+  // Merge Effect Schema Struct/filter invariants and aliases
+  const effect = extractEffectSchemaInvariantsFromFile(file)
+  for (const [name, invs] of effect.schemas) {
+    if (!schemas.has(name)) schemas.set(name, invs)
+  }
+  for (const [alias, schemaName] of effect.aliases) {
+    if (!aliases.has(alias)) aliases.set(alias, schemaName)
+  }
+
+  if (schemas.size === 0) return
+
+  const outputCall: Expr = { kind: 'call', callee: 'output', args: [] }
+  const byName = new Map<string, FunctionIR>()
+  for (const r of results) if (r.name) byName.set(r.name, r)
+
+  let plainFunctions: FunctionIR[] | null = null
+
+  for (const fnDecl of file.getFunctions()) {
+    const name = fnDecl.getName()
+    if (!name) continue
+    const retText = fnDecl.getReturnTypeNode()?.getText()
+    if (!retText) continue
+
+    let schemaName = aliases.get(retText)
+    if (!schemaName) {
+      const m = /z\.(?:output|infer)<\s*typeof\s+(\w+)\s*>/.exec(retText)
+        ?? /(?:\w+\.)?Schema\.Type<\s*typeof\s+(\w+)\s*>/.exec(retText)
+        ?? /^typeof\s+(\w+)\.Type$/.exec(retText.trim())
+      if (m) schemaName = m[1]!
+    }
+    if (!schemaName) continue
+
+    const invs = schemas.get(schemaName)
+    if (!invs || invs.length === 0) continue
+
+    const ensures: Contract[] = invs.map(inv => ({
+      kind: 'ensures' as const,
+      predicate: bindRefineInvariant(inv, outputCall),
+    }))
+
+    const existing = byName.get(name)
+    if (existing) {
+      existing.contracts.push(...ensures)
+      continue
+    }
+
+    // No inline contracts — the return type alone makes the function verifiable
+    if (plainFunctions === null) plainFunctions = extractFunctionsFromSource(source, fileName)
+    const plain = plainFunctions.find(f => f.name === name)
+    if (plain) {
+      results.push({ ...plain, contracts: ensures })
+    }
+  }
+}
+
+/**
+ * Extracts tRPC procedure handlers:
+ *   key: t.procedure.input(Schema).mutation(({ input }) => ...)
+ *
+ * tRPC validates `input` against the schema BEFORE invoking the handler, so
+ * the schema's constraints (and refine/filter invariants) hold throughout the
+ * handler body. Works for .mutation/.query/.subscription, Zod and Effect
+ * Schema inputs, with .output(...) or other links between input and the
+ * handler. Handler param must destructure `{ input }` (optionally renamed).
+ */
+function extractTrpcProcedures(file: SourceFile): FunctionIR[] {
+  const results: FunctionIR[] = []
+
+  for (const call of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const callee = call.getExpression()
+    if (!Node.isPropertyAccessExpression(callee)) continue
+    const method = callee.getName()
+    if (method !== 'mutation' && method !== 'query' && method !== 'subscription') continue
+
+    // Walk down the chain looking for .input(Schema)
+    let schemaArg: Expression | undefined
+    let chainNode: Node = callee.getExpression()
+    while (Node.isCallExpression(chainNode)) {
+      const inner = chainNode.getExpression()
+      if (!Node.isPropertyAccessExpression(inner)) break
+      if (inner.getName() === 'input') {
+        schemaArg = chainNode.getArguments()[0] as Expression | undefined
+        break
+      }
+      chainNode = inner.getExpression()
+    }
+    if (schemaArg === undefined) continue
+
+    // Resolve the schema text (identifier → declaration, possibly imported)
+    let schemaText = schemaArg.getText().trim()
+    if (Node.isIdentifier(schemaArg)) {
+      const name = schemaArg.getText()
+      const local = file.getVariableDeclaration(name)?.getInitializer()?.getText().trim()
+      schemaText = local ?? resolveImportedSchema(file, name) ?? schemaText
+    }
+
+    // Handler arrow with destructured { input } (optionally renamed)
+    const handler = call.getArguments()[0]
+    if (!handler || !Node.isArrowFunction(handler)) continue
+    const inputVar = trpcInputBindingName(handler)
+    if (inputVar === null) continue
+
+    // Constraints: try Zod patterns, then Effect Schema patterns
+    const contracts: Contract[] = []
+    const zodConstraints = extractConstraintsFromSchemaText(schemaText, inputVar)
+    const effectConstraints = zodConstraints.length > 0 ? [] : extractEffectConstraintsFromSchemaText(schemaText, inputVar)
+    for (const c of [...zodConstraints, ...effectConstraints]) {
+      contracts.push({ kind: 'assume', predicate: c.predicate })
+    }
+    const invariants = [
+      ...extractRefinePredicates(schemaText),
+      ...extractEffectFilterInvariants(schemaText),
+    ]
+    for (const inv of invariants) {
+      contracts.push({ kind: 'assume', predicate: bindRefineInvariant(inv, { kind: 'ident', name: inputVar }) })
+    }
+    if (contracts.length === 0) continue
+
+    // Procedure name from the enclosing router key, if any
+    const prop = call.getFirstAncestorByKind(SyntaxKind.PropertyAssignment)
+    const name = prop?.getName() ?? `(trpc ${method})`
+
+    // Parse the handler body
+    const fnBody = handler.getBody()
+    let body: FunctionIR['body']
+    if (Node.isBlock(fnBody)) {
+      body = parseStmtListToExpr(fnBody.getStatements()) ?? undefined
+    } else if (Node.isExpression(fnBody)) {
+      body = parseExpr(fnBody as Expression) ?? undefined
+    }
+
+    results.push({
+      name,
+      params: [],
+      returnSort: 'real',
+      body,
+      contracts,
+    })
+  }
+
+  return results
+}
+
+/** Name bound to tRPC's input in the handler: `({ input }) =>` or `({ input: order }) =>`. */
+function trpcInputBindingName(handler: import('ts-morph').ArrowFunction): string | null {
+  const param = handler.getParameters()[0]
+  if (!param) return null
+  const nameNode = param.getNameNode()
+  if (!Node.isObjectBindingPattern(nameNode)) return null
+  for (const el of nameNode.getElements()) {
+    const propName = el.getPropertyNameNode()?.getText() ?? el.getNameNode().getText()
+    if (propName === 'input') return el.getNameNode().getText()
+  }
+  return null
+}
+
 function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
   const fnBody = fn.getBody()
   if (!fnBody || !Node.isBlock(fnBody)) return null
@@ -460,6 +777,19 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
     }
     codeStmts.push(s)
   }
+
+  // Zod schemas are first-class contracts: `const x = Schema.parse(input)`
+  // throws on invalid data, so the schema's refinements hold for x afterwards.
+  // Inject them as assume contracts — this alone makes the function verifiable
+  // (division safety etc.) with zero annotations.
+  try {
+    for (const zc of extractZodContracts(fnBody)) {
+      contracts.push({ kind: 'assume', predicate: zc.predicate })
+    }
+    for (const ec of extractEffectContracts(fnBody)) {
+      contracts.push({ kind: 'assume', predicate: ec.predicate })
+    }
+  } catch { /* schema extraction is best-effort */ }
 
   if (contracts.length === 0) return null
 
@@ -527,6 +857,19 @@ function tryExtractInlineArrow(fn: ArrowFunction, name: string): FunctionIR | nu
     }
     codeStmts.push(s)
   }
+
+  // Zod schemas are first-class contracts: `const x = Schema.parse(input)`
+  // throws on invalid data, so the schema's refinements hold for x afterwards.
+  // Inject them as assume contracts — this alone makes the function verifiable
+  // (division safety etc.) with zero annotations.
+  try {
+    for (const zc of extractZodContracts(fnBody)) {
+      contracts.push({ kind: 'assume', predicate: zc.predicate })
+    }
+    for (const ec of extractEffectContracts(fnBody)) {
+      contracts.push({ kind: 'assume', predicate: ec.predicate })
+    }
+  } catch { /* schema extraction is best-effort */ }
 
   if (contracts.length === 0) return null
 

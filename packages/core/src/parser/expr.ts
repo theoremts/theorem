@@ -141,6 +141,11 @@ function parseExprInner(node: Expression): Expr | null {
 
   // Property access: obj.prop
   if (Node.isPropertyAccessExpression(node)) {
+    // this.x is normalized to a flat identifier so SSA bindings and
+    // substitution treat instance fields like ordinary variables
+    if (node.getExpression().getKind() === SyntaxKind.ThisKeyword) {
+      return { kind: 'ident', name: `this.${node.getName()}` }
+    }
     const obj = parseExpr(node.getExpression())
     if (obj === null) return null
     return { kind: 'member', object: obj, property: node.getName() }
@@ -389,8 +394,37 @@ function parseStmtList(stmts: Statement[], bindings?: Map<string, Expr>): Expr |
  * All bindings are resolved eagerly: when creating binding N, all bindings
  * 0..N-1 are applied to the RHS first. This ensures correct mutation tracking.
  */
+/**
+ * True for schema-decode initializers that must stay FREE variables:
+ *   <schema>.parse(x) / .safeParse(x)                     (Zod)
+ *   Schema.decodeUnknownSync(S)(x) / decodeSync(S)(x)     (Effect Schema)
+ */
+function isSchemaParseCall(init: Node): boolean {
+  if (!Node.isCallExpression(init)) return false
+  const callee = init.getExpression()
+
+  if (Node.isPropertyAccessExpression(callee)) {
+    const name = callee.getName()
+    return name === 'parse' || name === 'safeParse'
+  }
+
+  // Curried Effect decode: decodeUnknownSync(S)(input)
+  if (Node.isCallExpression(callee)) {
+    const text = callee.getExpression().getText()
+    const last = text.includes('.') ? text.slice(text.lastIndexOf('.') + 1) : text
+    return last === 'decodeUnknownSync' || last === 'decodeSync'
+  }
+
+  return false
+}
+
 function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Expr | null {
-  if (stmts.length === 0) return null
+  if (stmts.length === 0) {
+    // Void bodies (e.g. mutating methods) never hit a return statement —
+    // save the final SSA state here so exit invariants see the mutations
+    _finalSSABindings = new Map(bindings)
+    return null
+  }
 
   const [first, ...rest] = stmts as [Statement, ...Statement[]]
 
@@ -491,6 +525,12 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
 
       const varName = decl.getName()
       const init = decl.getInitializer()
+
+      // Zod parse results stay FREE variables: `const x = Schema.parse(input)`
+      // is opaque to Z3 (binding x to the call would make x.field untranslatable),
+      // and the schema constraints on x.* are injected as assume contracts.
+      if (init && isSchemaParseCall(init)) continue
+
       if (init) {
         let parsed = parseExpr(init as Expression)
         if (parsed !== null) {
@@ -533,8 +573,10 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
       const op = expr.getOperatorToken().getText()
       const left = expr.getLeft()
 
-      if (Node.isIdentifier(left) && isAssignmentOp(op)) {
-        const varName = left.getText()
+      const isThisField = Node.isPropertyAccessExpression(left) &&
+        left.getExpression().getKind() === SyntaxKind.ThisKeyword
+      if ((Node.isIdentifier(left) || isThisField) && isAssignmentOp(op)) {
+        const varName = left.getText()  // 'x' or 'this.x' — matches the normalized ident
         let rhs = parseAssignmentRHS(op, varName, expr.getRight() as Expression, bindings)
         if (rhs !== null) {
           const newBindings = new Map(bindings)
@@ -647,7 +689,9 @@ function extractIfAssignments(
     if (!Node.isBinaryExpression(expr)) return null
     const op = expr.getOperatorToken().getText()
     const left = expr.getLeft()
-    if (!Node.isIdentifier(left)) return null
+    const isThisField = Node.isPropertyAccessExpression(left) &&
+      left.getExpression().getKind() === SyntaxKind.ThisKeyword
+    if (!Node.isIdentifier(left) && !isThisField) return null
 
     const varName = left.getText()
     const rhs = parseAssignmentRHS(op, varName, expr.getRight() as Expression, bindings)

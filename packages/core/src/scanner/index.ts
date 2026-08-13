@@ -10,6 +10,7 @@ import type { Z3Context } from '../solver/context.js'
 import type { Expr, Param, Predicate, Sort } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
 import { parseExpr } from '../parser/expr.js'
+import { collectZodAssumptions } from './zod-assumptions.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { substituteExpr } from '../translator/substitution.js'
 import { makeConst } from '../translator/variables.js'
@@ -114,6 +115,8 @@ interface RawCandidate {
   trigger: Expr | null
   line: number
   pathConditions: RawPathCondition[]
+  /** Constraints from Zod schema parse() calls in the enclosing function. */
+  zodAssumptions?: Expr[] | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +146,7 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
       trigger: parseExpr(denominator as Expression),
       line: node.getStartLineNumber(),
       pathConditions: collectPathConditions(node),
+      zodAssumptions: collectZodAssumptions(node),
     })
   }
 
@@ -171,6 +175,7 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
       trigger: parseExpr(argNode as Expression),
       line: node.getStartLineNumber(),
       pathConditions: collectPathConditions(node),
+      zodAssumptions: collectZodAssumptions(node),
     })
   }
 
@@ -191,6 +196,7 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
       trigger: parseExpr(argNode as Expression),
       line: node.getStartLineNumber(),
       pathConditions: collectPathConditions(node),
+      zodAssumptions: collectZodAssumptions(node),
     })
   }
 
@@ -365,6 +371,7 @@ function collectContractViolations(
         trigger: substituted,
         line: node.getStartLineNumber(),
         pathConditions: collectPathConditions(node),
+      zodAssumptions: collectZodAssumptions(node),
       })
     }
   }
@@ -505,8 +512,9 @@ async function checkCandidates(
       if (parsed !== null) parsedConditions.push({ expr: parsed, negated: raw.negated })
     }
 
-    // Build Z3 variables (trigger + all path condition identifiers)
-    const vars = buildVars(c.trigger, parsedConditions.map(p => p.expr), c.params, ctx)
+    // Build Z3 variables (trigger + path condition + Zod constraint identifiers)
+    const zodAssumptions = c.zodAssumptions ?? []
+    const vars = buildVars(c.trigger, [...parsedConditions.map(p => p.expr), ...zodAssumptions], c.params, ctx)
 
     // Domain constraints: .length >= 0
     const domainConstraints: Bool<'main'>[] = []
@@ -524,6 +532,14 @@ async function checkCandidates(
         if (z3 === null) continue
         assumptions.push(pc.negated ? ctx.Not(z3 as Bool<'main'>) : z3 as Bool<'main'>)
       } catch { /* skip untranslatable condition */ }
+    }
+
+    // Zod schema constraints: parse() throws on invalid data, so they hold here
+    for (const zc of zodAssumptions) {
+      try {
+        const z3 = toZ3(zc, vars, ctx)
+        if (z3 !== null) assumptions.push(z3 as Bool<'main'>)
+      } catch { /* skip untranslatable constraint */ }
     }
 
     let goalZ3
