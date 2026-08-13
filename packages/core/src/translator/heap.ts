@@ -44,15 +44,22 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   for (const c of ir.contracts) {
     if ('predicate' in c && typeof c.predicate === 'object') contractPredicates.push(c.predicate as Expr)
   }
-  for (const step of steps) {
-    if (step.kind === 'field-write') {
-      fields.add(step.field)
-      collectFields(step.object, fields)
-      collectFields(step.value, fields)
-    } else if (step.kind === 'local') {
-      collectFields(step.value, fields)
+  const collectStepFields = (list: typeof steps): void => {
+    for (const step of list) {
+      if (step.kind === 'field-write') {
+        fields.add(step.field)
+        collectFields(step.object, fields)
+        collectFields(step.value, fields)
+      } else if (step.kind === 'local') {
+        collectFields(step.value, fields)
+      } else if (step.kind === 'branch') {
+        collectFields(step.condition, fields)
+        collectStepFields(step.then)
+        collectStepFields(step.else)
+      }
     }
   }
+  collectStepFields(steps)
   for (const p of contractPredicates) collectFields(p, fields)
 
   const refFields = inferRefFields(steps, contractPredicates, rootNames, aliasOf)
@@ -175,42 +182,80 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   }
 
   // ── Execute steps over the heap ──────────────────────────────────────────
+  //
+  // Branches use the guarded-command encoding: every write becomes a
+  // conditional store `heap' = ITE(pathCond ∧ alive, Store(...), heap)`.
+  // Sequential processing composes correctly — a then-branch mutation read
+  // from the else-branch resolves to the original value because its ITE
+  // guard is false there. Early returns clear `alive` for their paths.
   const env: Env = { heap: new Map(initialHeap), locals: new Map() }
   const modifiesContract = ir.contracts.find(c => c.kind === 'modifies')
   const allowedWrites = modifiesContract !== undefined
     ? new Set((modifiesContract as { refs: string[] }).refs.map(r => resolveAlias(r, aliasOf)))
     : null
 
-  for (const step of steps) {
-    if (step.kind === 'alias') continue
-    if (step.kind === 'local') {
-      const v = translate(step.value, env, oldEnv)
-      if (v !== null) env.locals.set(step.name, v)
-      continue
-    }
-    // field-write (possibly through a pointer path)
-    const target = translate(step.object, env, oldEnv)
-    const heap = env.heap.get(step.field)
-    const value = translate(step.value, env, oldEnv)
-    if (target === null || heap === undefined || value === null) continue
+  let alive: Bool<'main'> = ctx.Bool.val(true)
 
-    // Level 3: framing — undeclared BASE roots are contract violations
-    const root = resolveAlias(step.root, aliasOf)
-    if (allowedWrites !== null && !allowedWrites.has(root)) {
-      tasks.push({
-        functionName: ir.name,
-        contractText: `modifies violation: writes through ${step.root} (${prettyExpr(step.object)}.${step.field}), not declared in modifies(${[...allowedWrites].join(', ')})`,
-        variables: new Map(refs as unknown as Map<string, AnyExpr<'main'>>),
-        assumptions: [],
-        assumptionLabels: [],
-        goal: ctx.Bool.val(true),
-        domainConstraints: [],
-      })
-    }
+  const processSteps = (list: import('../parser/ir.js').HeapStep[], pc: Bool<'main'> | null): void => {
+    for (const step of list) {
+      if (step.kind === 'alias') continue
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
-    env.heap.set(step.field, heap.store(target, value))
+      if (step.kind === 'local') {
+        const v = translate(step.value, env, oldEnv)
+        if (v !== null) env.locals.set(step.name, v)
+        continue
+      }
+
+      if (step.kind === 'exit') {
+        alive = pc === null ? ctx.Bool.val(false) : ctx.And(alive, ctx.Not(pc))
+        continue
+      }
+
+      if (step.kind === 'branch') {
+        // Condition evaluated against the state at branch ENTRY
+        const condZ3 = translate(step.condition, env, oldEnv)
+        // Untranslatable condition → fresh unconstrained Bool: the solver
+        // explores both branches, which over-approximates soundly for proofs
+        const cond = condZ3 !== null
+          ? condZ3 as Bool<'main'>
+          : ctx.Bool.const(`__cond_${branchCounter++}`)
+        const pcThen = pc === null ? cond : ctx.And(pc, cond)
+        const pcElse = pc === null ? ctx.Not(cond) : ctx.And(pc, ctx.Not(cond))
+        processSteps(step.then, pcThen)
+        processSteps(step.else, pcElse)
+        continue
+      }
+
+      // field-write (possibly through a pointer path)
+      const target = translate(step.object, env, oldEnv)
+      const heap = env.heap.get(step.field)
+      const value = translate(step.value, env, oldEnv)
+      if (target === null || heap === undefined || value === null) continue
+
+      // Level 3: framing — undeclared BASE roots are contract violations
+      const root = resolveAlias(step.root, aliasOf)
+      if (allowedWrites !== null && !allowedWrites.has(root)) {
+        tasks.push({
+          functionName: ir.name,
+          contractText: `modifies violation: writes through ${step.root} (${prettyExpr(step.object)}.${step.field}), not declared in modifies(${[...allowedWrites].join(', ')})`,
+          variables: new Map(refs as unknown as Map<string, AnyExpr<'main'>>),
+          assumptions: [],
+          assumptionLabels: [],
+          goal: ctx.Bool.val(true),
+          domainConstraints: [],
+        })
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+      const stored = heap.store(target, value)
+      const guard = pc === null ? alive : ctx.And(alive, pc)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+      env.heap.set(step.field, ctx.If(guard, stored, heap))
+    }
   }
+
+  let branchCounter = 0
+  processSteps(steps, null)
 
   // ── Ensures: hold in the final state ─────────────────────────────────────
   const variables = new Map<string, AnyExpr<'main'>>()
@@ -288,17 +333,25 @@ function inferRefFields(
     }
   }
 
-  // Two passes reach the fixpoint for practical chains
-  for (let pass = 0; pass < 2; pass++) {
-    for (const step of steps) {
+  const walkSteps = (list: typeof steps): void => {
+    for (const step of list) {
       if (step.kind === 'field-write') {
         if (isRefExpr(step.value)) refFields.add(step.field)
         if (step.object.kind === 'member') refFields.add(step.object.property)
         walk(step.object); walk(step.value)
       } else if (step.kind === 'local') {
         walk(step.value)
+      } else if (step.kind === 'branch') {
+        walk(step.condition)
+        walkSteps(step.then)
+        walkSteps(step.else)
       }
     }
+  }
+
+  // Two passes reach the fixpoint for practical chains
+  for (let pass = 0; pass < 2; pass++) {
+    walkSteps(steps)
     for (const p of predicates) walk(p)
   }
 

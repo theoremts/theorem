@@ -14,12 +14,9 @@ interface Node { value: number; next: Node | null; prev: Node | null }
 
 // ✓ PROVED — correct doubly-linked front insertion.
 export function linkFront(head: Node, node: Node): void {
-  requires(head !== node)
-  requires(node.next === null)
-  requires(node.prev === null)
-  ensures(node.next === head)
-  ensures(head.prev === node)
-  ensures(node.prev === null)
+  requires(head !== node && node.next === null && node.prev === null)
+  ensures(node.prev === null && node.next === head && head.prev === node)
+
   node.next = head
   head.prev = node
 }
@@ -52,7 +49,20 @@ export function unlinkSecond(head: Node): void {
   requires(head.next!.prev === head)
   requires(head.next!.next === null)
   ensures(head.next === null)
+
   const second = head.next!
   head.next = second.next
   second.prev = null
+}
+
+// ✓ PROVED — early return + pointer surgery: the moveToFront skeleton.
+// The guard's negation flows into the proof of everything after it.
+export function moveToFront(head: Node, node: Node): void {
+  requires(head.prev === null)
+  requires(node !== head)
+  ensures(node === head || node.prev === null)
+  if (node === head) return
+  node.prev = null
+  node.next = head
+  head.prev = node
 }

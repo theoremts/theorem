@@ -200,6 +200,73 @@ describe('heap mode: pointer-valued fields', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F1: branches + early returns over the heap
+// ---------------------------------------------------------------------------
+
+describe('heap mode: branches and early returns', () => {
+  const source = `
+    interface Acc { value: number }
+    interface Node { value: number; next: Node | null; prev: Node | null }
+
+    export function withdraw(acc: Acc, amount: number): void {
+      requires(nonNegative(acc.value))
+      requires(positive(amount))
+      ensures(nonNegative(acc.value))
+      if (amount <= acc.value) {
+        acc.value = acc.value - amount
+      }
+    }
+
+    export function clampTransfer(from: Acc, to: Acc, amount: number): void {
+      requires(from !== to)
+      requires(nonNegative(from.value))
+      requires(nonNegative(to.value))
+      requires(positive(amount))
+      ensures(nonNegative(from.value))
+      ensures(to.value === old(to.value) + old(from.value) - from.value)
+      if (amount <= from.value) {
+        from.value = from.value - amount
+        to.value = to.value + amount
+      } else {
+        to.value = to.value + from.value
+        from.value = 0
+      }
+    }
+
+    export function moveToFront(head: Node, node: Node): void {
+      requires(head.prev === null)
+      requires(node !== head)
+      ensures(node === head || node.prev === null)
+      if (node === head) return
+      node.prev = null
+      node.next = head
+      head.prev = node
+    }
+  `
+
+  test('if-guarded mutation preserves the ensures', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'withdraw')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.join(', ')}`)
+  })
+
+  test('if/else merge: relational two-state ensures holds across both branches', async () => {
+    const results = await verifyAll(source)
+    for (const r of results.filter(x => x.fn === 'clampTransfer')) {
+      assert.strictEqual(r.status, 'proved', `${r.text}`)
+    }
+  })
+
+  test('early return + pointer surgery (moveToFront skeleton)', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'moveToFront')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 

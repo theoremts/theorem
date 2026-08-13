@@ -859,71 +859,159 @@ function tryExtractHeapSteps(
   }
   if (allWrites.length === 0) return null
 
-  const steps: HeapStep[] = []
-  const writes: string[] = []
+  const extracted = extractHeapStmtList(stmts, true)
+  if (extracted === null || !hasFieldWrite(extracted)) return { unsupported: allWrites }
+  const steps = extracted
+
+  // Roots: write bases + member objects + idents ref-compared against them
   const roots = new Set<string>()
-  let supported = true
+  collectHeapRoots(steps, roots)
+  const predicates: Expr[] = []
+  for (const c of contracts) {
+    if (typeof c === 'object' && 'predicate' in c && typeof c.predicate !== 'string') {
+      predicates.push(c.predicate)
+    }
+  }
+  for (const p of predicates) collectMemberRoots(p, roots)
+  // Second pass: bare idents equality-compared with known roots become roots
+  // (e.g. `if (node === head) return` where only head is written)
+  for (let pass = 0; pass < 2; pass++) {
+    for (const p of predicates) collectRefComparisonRoots(p, roots)
+    walkHeapExprs(steps, e => collectRefComparisonRoots(e, roots))
+  }
+
+  return { steps, roots: [...roots] }
+}
+
+/** Recursively extracts heap steps from a statement list; null = unsupported. */
+function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] | null {
+  const steps: HeapStep[] = []
 
   for (const s of stmts) {
-    if (Node.isReturnStatement(s)) break  // trailing return: ensures use fields, not output()
+    if (Node.isReturnStatement(s)) {
+      steps.push({ kind: 'exit' })
+      break  // statements after return are dead code
+    }
 
     if (Node.isExpressionStatement(s)) {
       const expr = s.getExpression()
-      if (Node.isCallExpression(expr)) continue  // check/assume/etc — positional contracts
+      if (Node.isCallExpression(expr)) continue  // check/assume — positional contracts
       if (Node.isBinaryExpression(expr) && expr.getOperatorToken().getText() === '=') {
         const left = expr.getLeft()
-        // `a.f = v` or a pointer-path write `a.next.prev = v`
         if (Node.isPropertyAccessExpression(left)) {
           const base = memberChainBase(left)
           if (base !== null && base !== 'this') {
             const objectExpr = parseExpr(left.getExpression() as Expression)
             const value = parseExpr(expr.getRight() as Expression)
-            writes.push(left.getText())
-            if (objectExpr === null || value === null) { supported = false; continue }
-            roots.add(base)
+            if (objectExpr === null || value === null) return null
             steps.push({ kind: 'field-write', root: base, object: objectExpr, field: left.getName(), value })
             continue
           }
         }
       }
-      supported = false
-      continue
+      return null
     }
 
     if (Node.isVariableStatement(s)) {
-      let ok = true
+      if (!topLevel) return null  // branch-local consts: deferred
       for (const decl of s.getDeclarations()) {
         const init = decl.getInitializer()
-        if (!init) { ok = false; break }
+        if (!init) return null
         if (Node.isIdentifier(init)) {
           steps.push({ kind: 'alias', name: decl.getName(), of: init.getText() })
           continue
         }
         const value = parseExpr(init as Expression)
-        if (value === null) { ok = false; break }
+        if (value === null) return null
         steps.push({ kind: 'local', name: decl.getName(), value })
       }
-      if (!ok) supported = false
       continue
     }
 
-    supported = false
+    if (Node.isIfStatement(s)) {
+      const condition = parseExpr(s.getExpression() as Expression)
+      if (condition === null) return null
+      const thenSteps = extractHeapStmtList(blockStatements(s.getThenStatement()), false)
+      if (thenSteps === null) return null
+      let elseSteps: HeapStep[] = []
+      const elseNode = s.getElseStatement()
+      if (elseNode !== undefined) {
+        const extracted = extractHeapStmtList(
+          Node.isIfStatement(elseNode) ? [elseNode] : blockStatements(elseNode),
+          false,
+        )
+        if (extracted === null) return null
+        elseSteps = extracted
+      }
+      steps.push({ kind: 'branch', condition, then: thenSteps, else: elseSteps })
+      continue
+    }
+
+    return null
   }
 
-  if (!supported || writes.length === 0) return { unsupported: allWrites }
+  return steps
+}
 
-  // Roots also include objects read via members in contracts
-  for (const c of contracts) {
-    if (typeof c === 'object' && 'predicate' in c && typeof c.predicate !== 'string') {
-      collectMemberRoots(c.predicate, roots)
+function blockStatements(node: Node): Statement[] {
+  if (Node.isBlock(node)) return node.getStatements()
+  return [node as Statement]
+}
+
+function hasFieldWrite(steps: HeapStep[]): boolean {
+  return steps.some(s =>
+    s.kind === 'field-write' ||
+    (s.kind === 'branch' && (hasFieldWrite(s.then) || hasFieldWrite(s.else))))
+}
+
+function collectHeapRoots(steps: HeapStep[], roots: Set<string>): void {
+  for (const s of steps) {
+    if (s.kind === 'field-write') {
+      roots.add(s.root)
+      collectMemberRoots(s.object, roots)
+      collectMemberRoots(s.value, roots)
+    } else if (s.kind === 'local') {
+      collectMemberRoots(s.value, roots)
+    } else if (s.kind === 'branch') {
+      collectMemberRoots(s.condition, roots)
+      collectHeapRoots(s.then, roots)
+      collectHeapRoots(s.else, roots)
     }
   }
-  // And in step values
-  for (const st of steps) {
-    if (st.kind !== 'alias') collectMemberRoots(st.value, roots)
-  }
+}
 
-  return { steps, roots: [...roots] }
+function walkHeapExprs(steps: HeapStep[], visit: (e: Expr) => void): void {
+  for (const s of steps) {
+    if (s.kind === 'field-write') { visit(s.object); visit(s.value) }
+    else if (s.kind === 'local') visit(s.value)
+    else if (s.kind === 'branch') {
+      visit(s.condition)
+      walkHeapExprs(s.then, visit)
+      walkHeapExprs(s.else, visit)
+    }
+  }
+}
+
+/** `x === root` / `x !== root` makes x a reference root too. */
+function collectRefComparisonRoots(expr: Expr, roots: Set<string>): void {
+  if (expr.kind === 'binary') {
+    if (expr.op === '===' || expr.op === '!==') {
+      const l = expr.left
+      const r = expr.right
+      const isRefish = (e: Expr): boolean =>
+        (e.kind === 'ident' && roots.has(e.name)) || e.kind === 'member'
+      if (l.kind === 'ident' && isRefish(r)) roots.add(l.name)
+      if (r.kind === 'ident' && isRefish(l)) roots.add(r.name)
+    }
+    collectRefComparisonRoots(expr.left, roots)
+    collectRefComparisonRoots(expr.right, roots)
+  } else if (expr.kind === 'unary') {
+    collectRefComparisonRoots(expr.operand, roots)
+  } else if (expr.kind === 'ternary') {
+    collectRefComparisonRoots(expr.condition, roots)
+    collectRefComparisonRoots(expr.then, roots)
+    collectRefComparisonRoots(expr.else, roots)
+  }
 }
 
 /** Base identifier of a member chain (`a.next.prev` → 'a'), or null. */

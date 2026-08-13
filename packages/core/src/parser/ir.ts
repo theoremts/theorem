@@ -152,3 +152,11 @@ export type HeapStep =
     }
   | { kind: 'local'; name: string; value: Expr }
   | { kind: 'alias'; name: string; of: string }
+  | {
+      kind: 'branch'
+      condition: Expr
+      then: HeapStep[]
+      else: HeapStep[]
+    }
+  /** A `return` statement — executions reaching it stop (no further writes). */
+  | { kind: 'exit' }
