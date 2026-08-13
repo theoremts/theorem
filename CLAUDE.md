@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Production-ready. 302 tests passing. Five CLI commands: verify, scan, suggest, infer, prisma. Zod AND Effect Schema work as out-of-the-box contracts in verify/scan/ts-plugin, including cross-field invariants (`.refine()` / `Schema.filter()`), `.brand()`/`.int()`, cross-file schema resolution, tRPC `.input()` boundaries, and dead-error-branch analysis (`Effect.fail` proved unreachable under contracts). Class `@invariant` decorators implement Design-by-Contract object invariants. `theorem prisma` generates schemas from schema.prisma (Int → integer facts).
+Production-ready. 309 tests passing. Five CLI commands: verify, scan, suggest, infer, prisma. Zod AND Effect Schema work as out-of-the-box contracts in verify/scan/ts-plugin, including cross-field invariants (`.refine()` / `Schema.filter()`), `.brand()`/`.int()`, cross-file schema resolution, tRPC `.input()` boundaries, and dead-error-branch analysis (`Effect.fail` proved unreachable under contracts). Class `@invariant` decorators implement Design-by-Contract object invariants. `theorem prisma` generates schemas from schema.prisma (Int → integer facts).
 
 ## What This Is
 
@@ -132,3 +132,6 @@ TypeScript source (.ts / .proof.ts)
 - Dead error branches: `Effect.fail`/`Effect.die` under path conditions produce informational tasks (goal = branch reachable; UNSAT ⇒ dead code, reported as ✓; reachable is normal and hidden). CLI drops informational non-proved results; ts-plugin skips them.
 - tRPC: `t.procedure.input(Schema).mutation/query/subscription(handler)` — the handler (named after its router key) assumes the input schema's constraints and invariants; `{ input }` destructuring with renames supported; Zod or Effect Schema.
 - `theorem prisma` (`prisma/index.ts`): parses schema.prisma → Zod-style row schemas; Int/BigInt → `.int()` (integer facts), optional → `.nullable()`, relations/lists skipped, enums documented.
+- Refinement types: a parameter typed with a schema-derived alias (`rate: Rate` where `type Rate = z.output<typeof RateSchema>`) carries the schema constraints as requires — assumed inside the function, PROVED at call sites (`as`-casts satisfy tsc, not Z3).
+- Heap mode (`translator/heap.ts`): functions mutating fields of object params are encoded with the heap as Z3 arrays (select/store), object roots as Int references — aliasing (`from === to`) is explored by the solver, not assumed away. `old(x.f)` reads the initial heap. `modifies(a, b)` restricts writable roots (undeclared write = violation). Unsupported body shapes (loops/branches over mutations) fall back with a visible "unmodeled field mutation" warning label. Straight-line bodies only for now.
+- Scanner suppresses access-then-check patterns (`const x = arr[i]; if (!x) return`) and `as keyof typeof` record lookups — idiomatic safe JS, not risks.

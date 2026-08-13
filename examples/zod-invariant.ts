@@ -49,3 +49,5 @@ export function effectiveRate(input: unknown): number {
   // gross > 0 comes from the schema — division proved safe
   return rec.tax / rec.gross
 }
+
+
