@@ -28,3 +28,7 @@ Thumbs.db
 
 # Theorem cache
 .theorem-cache.json
+
+# Theorem local state (inferred contracts, plugin debug)
+.theorem/
+examples/.theorem/

@@ -208,6 +208,10 @@ async function verifyFile(
 
       if (opts.debug) debugSolver(task, result, ms)
 
+      // Informational tasks (e.g. "unreachable error branch"): a reachable
+      // error branch is normal — only proved dead branches are worth showing.
+      if (task.informational && result.status !== 'proved') continue
+
       taskResults.push({ task, result, durationMs: ms })
     }
 

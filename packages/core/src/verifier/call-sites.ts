@@ -11,7 +11,7 @@ import type { ContractRegistry } from '../registry/index.js'
 import type { VerificationTask } from '../translator/index.js'
 import { parseExpr } from '../parser/expr.js'
 import { prettyExpr } from '../parser/pretty.js'
-import { substituteExpr } from '../translator/substitution.js'
+import { substituteExpr, substituteOutput } from '../translator/substitution.js'
 import { makeConst } from '../translator/variables.js'
 import { toZ3 } from '../translator/expr.js'
 
@@ -41,10 +41,7 @@ export function extractCallSiteObligations(
 
   for (const node of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const calleeName = node.getExpression().getText()
-    const resolvedName = registry.has(calleeName)
-      ? calleeName
-      : calleeName.includes('.') ? calleeName.slice(calleeName.lastIndexOf('.') + 1) : null
-    const contract = resolvedName ? registry.get(resolvedName) : undefined
+    const contract = resolveContract(calleeName, registry)
     if (!contract) continue
 
     // Skip calls inside proof() / proof.fn() / requires() / ensures() — already handled by translator
@@ -70,6 +67,10 @@ export function extractCallSiteObligations(
     // Collect enclosing function's inline requires as assumptions
     const enclosingRequires = collectEnclosingRequires(node)
 
+    // Collect enclosing function's decreases() expressions — recursion counters
+    // are integers, mirroring the translator's "decreases integer" assumption
+    const enclosingDecreases = collectEnclosingDecreases(node)
+
     // For each requires, generate a verification task
     for (const req of contract.requires) {
       if (typeof req === 'string') continue
@@ -83,13 +84,31 @@ export function extractCallSiteObligations(
       const assumptions: Bool<'main'>[] = []
       const assumptionLabels: string[] = []
       for (const [varName, valueExpr] of scopeAssignments) {
-        collectAndCreateVars(valueExpr, vars, ctx)
+        // Calls to contracted functions can't be encoded in Z3 directly.
+        // Replace each one with a fresh variable constrained by the callee's
+        // ensures (instantiated with the actual arguments), so that
+        // `var a = safeAdd(1, 2) - 10` yields `a = __ret - 10` with
+        // `__ret >= 1 ∧ __ret >= 2` instead of dropping the assignment.
+        const { expr: encodable, ensures: callEnsures } = instantiateContractCalls(valueExpr, registry)
+
+        for (const { callee, predicate } of callEnsures) {
+          collectAndCreateVars(predicate, vars, ctx)
+          const ensZ3 = toZ3(predicate, vars, ctx)
+          if (ensZ3) {
+            try {
+              assumptions.push(ensZ3 as Bool<'main'>)
+              assumptionLabels.push(`ensures(${callee}): ${prettyExpr(predicate)}`)
+            } catch { /* sort mismatch */ }
+          }
+        }
+
+        collectAndCreateVars(encodable, vars, ctx)
         const varZ3 = vars.get(varName)
-        const valZ3 = toZ3(valueExpr, vars, ctx)
+        const valZ3 = toZ3(encodable, vars, ctx)
         if (varZ3 && valZ3) {
           try {
             assumptions.push((varZ3 as any).eq(valZ3) as Bool<'main'>)
-            assumptionLabels.push(`scope: ${varName} = ${prettyExpr(valueExpr)}`)
+            assumptionLabels.push(`scope: ${varName} = ${prettyExpr(encodable)}`)
           } catch { /* sort mismatch */ }
         }
       }
@@ -119,6 +138,18 @@ export function extractCallSiteObligations(
         }
       }
 
+      // decreases(x) implies x is an integer recursion counter
+      for (const decExpr of enclosingDecreases) {
+        collectAndCreateVars(decExpr, vars, ctx)
+        const decZ3 = toZ3(decExpr, vars, ctx)
+        if (decZ3) {
+          try {
+            assumptions.push((ctx.ToInt(decZ3 as any) as any).eq(decZ3) as Bool<'main'>)
+            assumptionLabels.push(`decreases integer: ${prettyExpr(decExpr)} is integer`)
+          } catch { /* not arithmetic */ }
+        }
+      }
+
       const z3 = toZ3(substituted, vars, ctx)
       if (z3 === null) continue
 
@@ -144,6 +175,87 @@ export function extractCallSiteObligations(
 
   return tasks
 }
+
+/**
+ * Resolves a callee name against the registry: tries the full text first,
+ * then the last segment of a dotted name (e.g. `utils.safeAdd` → `safeAdd`).
+ */
+function resolveContract(calleeName: string, registry: ContractRegistry) {
+  if (registry.has(calleeName)) return registry.get(calleeName)
+  if (calleeName.includes('.')) {
+    return registry.get(calleeName.slice(calleeName.lastIndexOf('.') + 1))
+  }
+  return undefined
+}
+
+let freshCallCounter = 0
+
+/**
+ * Walks an expression and replaces every call to a contracted function with a
+ * fresh identifier. Each replacement contributes the callee's ensures,
+ * instantiated with the (recursively transformed) actual arguments and with
+ * output()/result mapped to the fresh identifier. Calls to unknown functions
+ * are left in place (toZ3 later rejects them, keeping the value unconstrained).
+ */
+function instantiateContractCalls(
+  expr: Expr,
+  registry: ContractRegistry,
+): { expr: Expr; ensures: Array<{ callee: string; predicate: Expr }> } {
+  const collected: Array<{ callee: string; predicate: Expr }> = []
+
+  function walk(e: Expr): Expr {
+    switch (e.kind) {
+      case 'call': {
+        const args = e.args.map(walk)
+        const contract = resolveContract(e.callee, registry)
+        if (!contract) {
+          return args.some((a, i) => a !== e.args[i]) ? { kind: 'call', callee: e.callee, args } : e
+        }
+        const fresh: Expr = { kind: 'ident', name: `__ret_${contract.name}_${freshCallCounter++}` }
+        const mapping = new Map<string, Expr>()
+        for (let i = 0; i < Math.min(contract.params.length, args.length); i++) {
+          mapping.set(contract.params[i]!.name, args[i]!)
+        }
+        mapping.set('result', fresh)
+        for (const ens of contract.ensures) {
+          if (typeof ens === 'string') continue
+          collected.push({ callee: e.callee, predicate: substituteOutput(substituteExpr(ens, mapping), fresh) })
+        }
+        return fresh
+      }
+      case 'binary': {
+        const left = walk(e.left)
+        const right = walk(e.right)
+        return left === e.left && right === e.right ? e : { kind: 'binary', op: e.op, left, right }
+      }
+      case 'unary': {
+        const operand = walk(e.operand)
+        return operand === e.operand ? e : { kind: 'unary', op: e.op, operand }
+      }
+      case 'ternary': {
+        const condition = walk(e.condition)
+        const then = walk(e.then)
+        const els = walk(e.else)
+        return condition === e.condition && then === e.then && els === e.else
+          ? e : { kind: 'ternary', condition, then, else: els }
+      }
+      case 'member': {
+        const object = walk(e.object)
+        return object === e.object ? e : { kind: 'member', object, property: e.property }
+      }
+      case 'element-access': {
+        const object = walk(e.object)
+        const index = walk(e.index)
+        return object === e.object && index === e.index ? e : { kind: 'element-access', object, index }
+      }
+      default:
+        return e
+    }
+  }
+
+  return { expr: walk(expr), ensures: collected }
+}
+
 
 /**
  * Check if a node is directly inside a proof() wrapper or a contract call.
@@ -283,6 +395,41 @@ function collectEnclosingRequires(callNode: Node): Expr[] {
 }
 
 /**
+ * Collects the argument expressions of decreases() calls in the immediate
+ * enclosing function (e.g. `decreases(exp)` → the `exp` expression).
+ */
+function collectEnclosingDecreases(callNode: Node): Expr[] {
+  const decreases: Expr[] = []
+
+  let current: Node | undefined = callNode
+  while (current) {
+    const parent = current.getParent()
+    if (!parent) break
+
+    if (Node.isFunctionDeclaration(parent) || Node.isArrowFunction(parent) || Node.isFunctionExpression(parent)) {
+      const body = (parent as any).getBody()
+      if (body && Node.isBlock(body)) {
+        for (const stmt of body.getStatements()) {
+          if (!Node.isExpressionStatement(stmt)) continue
+          const expr = stmt.getExpression()
+          if (!Node.isCallExpression(expr)) continue
+          if (expr.getExpression().getText() !== 'decreases') continue
+          const args = expr.getArguments()
+          if (args.length === 0) continue
+          const parsed = parseExpr(args[0]! as Expression)
+          if (parsed) decreases.push(parsed)
+        }
+      }
+      break // only the immediate enclosing function
+    }
+
+    current = parent
+  }
+
+  return decreases
+}
+
+/**
  * Collects if-statement conditions that guard the call site.
  * If the call is inside `if (cond) { call() }`, then `cond` is a path condition.
  * If the call is in the else branch, the condition is negated.
@@ -319,8 +466,9 @@ function collectPathConditions(callNode: Node): Array<{ expr: Expr; negated: boo
     if (Node.isBlock(parent)) {
       const statements = parent.getStatements()
       for (const stmt of statements) {
-        // Stop at the statement containing our call
-        if (stmt.getPos() >= callNode.getPos()) break
+        // Stop at the statement containing our call. Comparing end positions
+        // matters: a call INSIDE `if (c) return f(x)` must not assume !c.
+        if (stmt.getEnd() > callNode.getPos()) break
 
         if (Node.isIfStatement(stmt) && !stmt.getElseStatement()) {
           const thenBranch = stmt.getThenStatement()

@@ -6,7 +6,7 @@ import { prettyExpr } from '../parser/pretty.js'
 import { createVariables, makeConst } from './variables.js'
 import { toZ3 } from './expr.js'
 import { translateStringContract } from './string-contracts.js'
-import { substituteExpr } from './substitution.js'
+import { substituteExpr, substituteOutput } from './substitution.js'
 
 export type { Z3Context }
 
@@ -26,6 +26,11 @@ export interface VerificationTask {
   traceExprs?: Map<string, AnyExpr<'main'>> | undefined
   /** Source locations of relevant expressions (body branches, assignments) for error highlighting. */
   traceLocs?: Map<string, import('../parser/ir.js').Loc> | undefined
+  /**
+   * Informational task: proved is worth reporting (e.g. "error branch
+   * unreachable"), but disproved is NORMAL and must not count as a failure.
+   */
+  informational?: boolean | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +44,16 @@ export function translate(
 ): VerificationTask[] {
   const vars = createVariables(ir.params, ir.returnSort, ctx)
   const tasks: VerificationTask[] = []
+
+  // Register free variables for identifiers that are not params — e.g. Zod
+  // parse results (`const rate = Schema.parse(x)` deliberately leaves `rate`
+  // unbound; the schema constraints on it arrive as assume contracts).
+  for (const contract of ir.contracts) {
+    if ((contract.kind === 'assume' || contract.kind === 'requires') && typeof contract.predicate !== 'string') {
+      ensureIdentVars(contract.predicate, vars, ctx)
+    }
+  }
+  if (ir.body !== undefined) ensureIdentVars(ir.body, vars, ctx)
 
   // 1. Translate requires → assumptions (with labels for unsat core)
   const assumptions: Bool<'main'>[] = []
@@ -122,9 +137,11 @@ export function translate(
     assumptionLabels.push('callee ensures')
   }
 
-  // 3. Body safety obligations — division by zero, etc.
+  // 3. Body safety obligations — division by zero, etc. — plus dead
+  //    typed-error branches (Effect.fail under contradictory conditions).
+  const unreachableFails: Array<{ text: string; conditions: Expr[] }> = []
   if (ir.body !== undefined) {
-    collectBodySafetyObligations(ir.body, vars, ctx, callObligations)
+    collectBodySafetyObligations(ir.body, vars, ctx, callObligations, unreachableFails)
   }
 
   // 4. Domain constraints — .length >= 0, numeric union domain
@@ -363,6 +380,29 @@ export function translate(
     })
   }
 
+  // 8. Dead error branches: prove the path conditions guarding a typed-error
+  //    constructor contradict the contracts (informational — reachable is normal).
+  for (const fail of unreachableFails) {
+    let conj: Bool<'main'> | null = null
+    for (const cond of fail.conditions) {
+      const condZ3 = toZ3(cond, vars, ctx)
+      if (condZ3 === null) { conj = null; break }
+      conj = conj === null ? condZ3 as Bool<'main'> : ctx.And(conj, condZ3 as Bool<'main'>)
+    }
+    if (conj === null) continue
+    tasks.push({
+      functionName: ir.name,
+      contractText: `unreachable error branch: ${fail.text}`,
+      variables: vars,
+      assumptions: [...assumptions],
+      assumptionLabels: [...assumptionLabels],
+      // goal is the VIOLATION: the branch being reachable. UNSAT ⇒ dead code.
+      goal: conj,
+      domainConstraints,
+      informational: true,
+    })
+  }
+
   return tasks
 }
 
@@ -453,18 +493,14 @@ function translateBody(
   callAssumptions: Bool<'main'>[],
   pathConditions: Expr[] = [],
 ): AnyExpr<'main'> | null {
-  // For call expressions to registered functions, handle modular verification
-  if (expr.kind === 'call' && registry) {
-    const resolved = resolveCallee(expr.callee, registry)
-    if (resolved !== null) {
-      return translateModularCall(resolved, expr.args, vars, ctx, registry, obligations, callAssumptions, pathConditions)
-    }
-  }
-
-  // For all other expressions, fall through to the normal toZ3
-  // But we need to recurse into sub-expressions to find nested calls
+  // Calls to registered functions can't be encoded by toZ3. Rewrite the
+  // expression first: each such call becomes a fresh __ret identifier whose
+  // requires are emitted as obligations and whose ensures become assumptions
+  // (modular assume-guarantee). The rewritten expression is then translated
+  // as a whole, so the `result = <body>` equation survives nested calls.
   if (registry && hasCallTo(expr, registry)) {
-    return translateExprWithCalls(expr, vars, ctx, registry, obligations, callAssumptions, pathConditions)
+    const rewritten = rewriteRegisteredCalls(expr, vars, ctx, registry, obligations, callAssumptions, pathConditions)
+    return toZ3(rewritten, vars, ctx)
   }
 
   return toZ3(expr, vars, ctx)
@@ -496,7 +532,7 @@ function translateModularCall(
   obligations: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }>,
   callAssumptions: Bool<'main'>[],
   pathConditions: Expr[] = [],
-): AnyExpr<'main'> | null {
+): { retVar: AnyExpr<'main'>; retName: string } | null {
   const contract = registry.get(callee)
   if (!contract) return null
 
@@ -507,9 +543,11 @@ function translateModularCall(
   }
 
   // Create a fresh variable for the return value
-  const retVar = makeConst(`__ret_${callee}_${callCounter++}`, contract.returnSort, ctx)
-  mapping.set('result', { kind: 'ident', name: `__ret_${callee}_${callCounter - 1}` })
-  vars.set(`__ret_${callee}_${callCounter - 1}`, retVar)
+  const retName = `__ret_${callee}_${callCounter++}`
+  const retIdent: Expr = { kind: 'ident', name: retName }
+  const retVar = makeConst(retName, contract.returnSort, ctx)
+  mapping.set('result', retIdent)
+  vars.set(retName, retVar)
 
   // Generate caller obligations: each requires must be satisfied
   for (const req of contract.requires) {
@@ -526,21 +564,30 @@ function translateModularCall(
     }
   }
 
-  // Add callee postconditions as assumptions (substituted)
+  // Add callee postconditions as assumptions (substituted).
+  // output() must refer to THIS call's fresh return variable — never to the
+  // enclosing function's `result` (which toZ3 would otherwise resolve it to,
+  // asserting the callee's ensures about the caller's own output).
   for (const ens of contract.ensures) {
     if (typeof ens === 'string') continue
-    const substituted = substituteExpr(ens, mapping)
+    const substituted = substituteOutput(substituteExpr(ens, mapping), retIdent)
     const z3 = toZ3(substituted, vars, ctx)
     if (z3 !== null) {
       callAssumptions.push(z3 as Bool<'main'>)
     }
   }
 
-  return retVar
+  return { retVar, retName }
 }
 
-/** Recursively translates an expression, handling calls to registered functions. */
-function translateExprWithCalls(
+/**
+ * Rewrites an expression, replacing every call to a registered function with
+ * a fresh `__ret_*` identifier (already bound in `vars` by
+ * translateModularCall, which also emits the call's obligations and
+ * assumptions). Ternary branches extend the path conditions so obligations
+ * inside a branch are only required under that branch's guard.
+ */
+function rewriteRegisteredCalls(
   expr: Expr,
   vars: Map<string, AnyExpr<'main'>>,
   ctx: Z3Context,
@@ -548,39 +595,57 @@ function translateExprWithCalls(
   obligations: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }>,
   callAssumptions: Bool<'main'>[],
   pathConditions: Expr[] = [],
-): AnyExpr<'main'> | null {
+): Expr {
+  const recurse = (e: Expr, pcs: Expr[]): Expr =>
+    rewriteRegisteredCalls(e, vars, ctx, registry, obligations, callAssumptions, pcs)
+
   switch (expr.kind) {
     case 'call': {
+      const args = expr.args.map(a => recurse(a, pathConditions))
       const resolved = resolveCallee(expr.callee, registry)
       if (resolved !== null) {
-        return translateModularCall(resolved, expr.args, vars, ctx, registry, obligations, callAssumptions, pathConditions)
+        const call = translateModularCall(resolved, args, vars, ctx, registry, obligations, callAssumptions, pathConditions)
+        if (call !== null) return { kind: 'ident', name: call.retName }
       }
-      return toZ3(expr, vars, ctx)
+      return { kind: 'call', callee: expr.callee, args }
     }
 
-    case 'binary': {
-      const l = translateBody(expr.left, vars, ctx, registry, obligations, callAssumptions, pathConditions)
-      const r = translateBody(expr.right, vars, ctx, registry, obligations, callAssumptions, pathConditions)
-      if (l === null || r === null) return null
-      // Reuse applyBinaryOp logic — import it indirectly via toZ3 on a synthetic expr
-      // Actually, just rebuild and use toZ3 (it handles the sub-expressions)
-      return toZ3(expr, vars, ctx)
-    }
+    case 'binary':
+      return {
+        kind: 'binary', op: expr.op,
+        left: recurse(expr.left, pathConditions),
+        right: recurse(expr.right, pathConditions),
+      }
+
+    case 'unary':
+      return { kind: 'unary', op: expr.op, operand: recurse(expr.operand, pathConditions) }
 
     case 'ternary': {
-      const cond = translateBody(expr.condition, vars, ctx, registry, obligations, callAssumptions, pathConditions)
-      // In the then-branch, the condition holds
-      const thenPathConditions = [...pathConditions, expr.condition]
-      const then = translateBody(expr.then, vars, ctx, registry, obligations, callAssumptions, thenPathConditions)
-      // In the else-branch, the condition is negated
-      const elsePathConditions = [...pathConditions, { kind: 'unary' as const, op: '!' as const, operand: expr.condition }]
-      const els  = translateBody(expr.else, vars, ctx, registry, obligations, callAssumptions, elsePathConditions)
-      if (cond === null || then === null || els === null) return null
-      return ctx.If(cond as Bool<'main'>, then, els)
+      const condition = recurse(expr.condition, pathConditions)
+      // In the then-branch, the condition holds; in the else-branch, it is negated
+      const then = recurse(expr.then, [...pathConditions, expr.condition])
+      const els = recurse(expr.else, [...pathConditions, { kind: 'unary' as const, op: '!' as const, operand: expr.condition }])
+      return { kind: 'ternary', condition, then, else: els }
     }
 
+    case 'member':
+      return { kind: 'member', object: recurse(expr.object, pathConditions), property: expr.property }
+
+    case 'element-access':
+      return {
+        kind: 'element-access',
+        object: recurse(expr.object, pathConditions),
+        index: recurse(expr.index, pathConditions),
+      }
+
+    case 'array':
+      return { kind: 'array', elements: expr.elements.map(e => recurse(e, pathConditions)) }
+
+    case 'object':
+      return { kind: 'object', properties: expr.properties.map(p => ({ key: p.key, value: recurse(p.value, pathConditions) })) }
+
     default:
-      return toZ3(expr, vars, ctx)
+      return expr
   }
 }
 
@@ -759,21 +824,65 @@ function collectIdents(expr: Expr, out: Set<string>): void {
 // Body safety obligations — catches division by zero that Z3 would hide
 // ---------------------------------------------------------------------------
 
+/**
+ * Creates free Real variables for plain identifiers that have no Z3
+ * representation yet. Members/element-accesses self-register in toZ3;
+ * plain idents (Zod parse results, destructured locals) do not.
+ */
+function ensureIdentVars(expr: Expr, vars: Map<string, AnyExpr<'main'>>, ctx: Z3Context): void {
+  switch (expr.kind) {
+    case 'ident':
+      if (!vars.has(expr.name)) vars.set(expr.name, makeConst(expr.name, 'real', ctx))
+      break
+    case 'binary':
+      ensureIdentVars(expr.left, vars, ctx)
+      ensureIdentVars(expr.right, vars, ctx)
+      break
+    case 'unary':
+      ensureIdentVars(expr.operand, vars, ctx)
+      break
+    case 'ternary':
+      ensureIdentVars(expr.condition, vars, ctx)
+      ensureIdentVars(expr.then, vars, ctx)
+      ensureIdentVars(expr.else, vars, ctx)
+      break
+    case 'call':
+      for (const a of expr.args) ensureIdentVars(a, vars, ctx)
+      break
+    case 'array':
+      for (const e of expr.elements) ensureIdentVars(e, vars, ctx)
+      break
+    case 'object':
+      for (const p of expr.properties) ensureIdentVars(p.value, vars, ctx)
+      break
+    default:
+      break
+  }
+}
+
 function collectBodySafetyObligations(
   body: Expr,
   vars: Map<string, AnyExpr<'main'>>,
   ctx: Z3Context,
   out: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }>,
+  unreachableFails?: Array<{ text: string; conditions: Expr[] }>,
 ): void {
-  walkBodyForRisks(body, vars, ctx, out, new Set())
+  walkBodyForRisks(body, vars, ctx, out, new Set(), [], unreachableFails)
+}
+
+/** Callee names treated as typed-error constructors (dead-branch analysis). */
+function isFailCallee(callee: string): boolean {
+  return callee === 'Effect.fail' || callee.endsWith('.fail') || callee === 'Effect.die' || callee.endsWith('.die')
 }
 
 function walkBodyForRisks(
   expr: Expr,
   vars: Map<string, AnyExpr<'main'>>,
   ctx: Z3Context,
-  out: Array<{ text: string; z3: Bool<'main'> }>,
+  out: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }>,
   seen: Set<string>,
+  pathConditions: Expr[] = [],
+  unreachableFails?: Array<{ text: string; conditions: Expr[] }>,
 ): void {
   switch (expr.kind) {
     case 'binary':
@@ -788,42 +897,77 @@ function walkBodyForRisks(
             out.push({
               text: `safe division: ${denomText} !== 0`,
               z3: ctx.Not((denomZ3 as Arith<'main'>).eq(ctx.Real.val(0)) as Bool<'main'>),
+              ...(pathConditions.length > 0 ? { pathConditions: [...pathConditions] } : {}),
             })
           }
         }
       }
-      walkBodyForRisks(expr.left, vars, ctx, out, seen)
-      walkBodyForRisks(expr.right, vars, ctx, out, seen)
+      walkBodyForRisks(expr.left, vars, ctx, out, seen, pathConditions, unreachableFails)
+      walkBodyForRisks(expr.right, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
-    case 'ternary':
-      walkBodyForRisks(expr.condition, vars, ctx, out, seen)
-      walkBodyForRisks(expr.then, vars, ctx, out, seen)
-      walkBodyForRisks(expr.else, vars, ctx, out, seen)
+    case 'ternary': {
+      walkBodyForRisks(expr.condition, vars, ctx, out, seen, pathConditions, unreachableFails)
+      const negated: Expr = { kind: 'unary', op: '!', operand: expr.condition }
+      walkBodyForRisks(expr.then, vars, ctx, out, seen, [...pathConditions, expr.condition], unreachableFails)
+      walkBodyForRisks(expr.else, vars, ctx, out, seen, [...pathConditions, negated], unreachableFails)
       break
+    }
     case 'unary':
-      walkBodyForRisks(expr.operand, vars, ctx, out, seen)
+      walkBodyForRisks(expr.operand, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
-    case 'call':
-      for (const arg of expr.args) walkBodyForRisks(arg, vars, ctx, out, seen)
+    case 'call': {
+      // Dead-branch analysis: a typed-error constructor under path conditions
+      // is unreachable when the conditions contradict the contracts.
+      if (unreachableFails !== undefined && isFailCallee(expr.callee) && pathConditions.length > 0) {
+        const text = `${expr.callee}(${expr.args.map(a => prettyExpr(a)).join(', ')})`
+        const key = `fail:${text}:${pathConditions.map(c => prettyExpr(c)).join('∧')}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          unreachableFails.push({ text, conditions: [...pathConditions] })
+        }
+      }
+
+      const isSqrt = expr.callee === 'Math.sqrt'
+      const isLog = expr.callee === 'Math.log' || expr.callee === 'Math.log2' || expr.callee === 'Math.log10'
+      if ((isSqrt || isLog) && expr.args.length > 0) {
+        const arg = expr.args[0]!
+        const argText = prettyExpr(arg)
+        const key = `${expr.callee}:${argText}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          const skipLiteral = arg.kind === 'literal' && typeof arg.value === 'number' &&
+            (isSqrt ? arg.value >= 0 : arg.value > 0)
+          if (!skipLiteral) {
+            const argZ3 = toZ3(arg, vars, ctx)
+            if (argZ3 !== null) {
+              out.push(isSqrt
+                ? { text: `safe sqrt: ${argText} >= 0`, z3: (argZ3 as Arith<'main'>).ge(ctx.Real.val(0)) as Bool<'main'>, ...(pathConditions.length > 0 ? { pathConditions: [...pathConditions] } : {}) }
+                : { text: `safe log: ${argText} > 0`, z3: (argZ3 as Arith<'main'>).gt(ctx.Real.val(0)) as Bool<'main'>, ...(pathConditions.length > 0 ? { pathConditions: [...pathConditions] } : {}) })
+            }
+          }
+        }
+      }
+      for (const arg of expr.args) walkBodyForRisks(arg, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
+    }
     case 'member':
-      walkBodyForRisks(expr.object, vars, ctx, out, seen)
+      walkBodyForRisks(expr.object, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
     case 'element-access':
-      walkBodyForRisks(expr.object, vars, ctx, out, seen)
-      walkBodyForRisks(expr.index, vars, ctx, out, seen)
+      walkBodyForRisks(expr.object, vars, ctx, out, seen, pathConditions, unreachableFails)
+      walkBodyForRisks(expr.index, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
     case 'array':
-      for (const el of expr.elements) walkBodyForRisks(el, vars, ctx, out, seen)
+      for (const el of expr.elements) walkBodyForRisks(el, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
     case 'object':
-      for (const p of expr.properties) walkBodyForRisks(p.value, vars, ctx, out, seen)
+      for (const p of expr.properties) walkBodyForRisks(p.value, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
     case 'spread':
-      walkBodyForRisks(expr.operand, vars, ctx, out, seen)
+      walkBodyForRisks(expr.operand, vars, ctx, out, seen, pathConditions, unreachableFails)
       break
     case 'template':
-      for (const p of expr.parts) { if (typeof p !== 'string') walkBodyForRisks(p, vars, ctx, out, seen) }
+      for (const p of expr.parts) { if (typeof p !== 'string') walkBodyForRisks(p, vars, ctx, out, seen, pathConditions, unreachableFails) }
       break
     default:
       break

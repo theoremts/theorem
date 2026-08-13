@@ -76,6 +76,31 @@ export function simplifyExpr(expr: Expr): Expr {
   }
 }
 
+/**
+ * Replaces `output()` calls in an ensures expression with the given replacement
+ * (e.g. the fresh variable standing for a callee's return value, or the
+ * variable an assignment binds the call result to).
+ */
+export function substituteOutput(expr: Expr, replacement: Expr): Expr {
+  switch (expr.kind) {
+    case 'call':
+      if (expr.callee === 'output' && expr.args.length === 0) return replacement
+      return { kind: 'call', callee: expr.callee, args: expr.args.map(a => substituteOutput(a, replacement)) }
+    case 'binary':
+      return { kind: 'binary', op: expr.op, left: substituteOutput(expr.left, replacement), right: substituteOutput(expr.right, replacement) }
+    case 'unary':
+      return { kind: 'unary', op: expr.op, operand: substituteOutput(expr.operand, replacement) }
+    case 'ternary':
+      return { kind: 'ternary', condition: substituteOutput(expr.condition, replacement), then: substituteOutput(expr.then, replacement), else: substituteOutput(expr.else, replacement) }
+    case 'member':
+      return { kind: 'member', object: substituteOutput(expr.object, replacement), property: expr.property }
+    case 'element-access':
+      return { kind: 'element-access', object: substituteOutput(expr.object, replacement), index: substituteOutput(expr.index, replacement) }
+    default:
+      return expr
+  }
+}
+
 function substituteRaw(expr: Expr, mapping: Map<string, Expr>): Expr {
   switch (expr.kind) {
     case 'ident': return mapping.get(expr.name) ?? expr
