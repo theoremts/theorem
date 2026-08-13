@@ -30,6 +30,8 @@ program
   .option('--strict', 'exit 1 if any proof fails (CI mode)')
   .option('--debug', 'show parser → translator → solver internals')
   .option('--watch', 'watch for file changes and re-verify')
+  .option('--gen-tests', 'turn counterexamples into executable regression tests')
+  .option('--tests-dir <dir>', 'output directory for generated tests (default: .theorem/regressions)')
   .option('--format <fmt>', 'output format: cli (default) or sarif')
   .option('--timeout <ms>', 'Z3 solver timeout in milliseconds')
   .action(async (paths: string[], opts: Record<string, unknown>) => {

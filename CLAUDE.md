@@ -19,6 +19,8 @@ theorem verify --strict src/     # exit 1 if any proof fails (CI mode)
 theorem verify --watch src/      # re-verify on file change
 theorem verify --debug file.ts   # show parser → translator → solver internals
 theorem verify --format sarif .  # SARIF JSON output (GitHub/VS Code)
+theorem verify --gen-tests src/  # counterexamples → executable regression tests
+                                 # (.theorem/regressions/, RED until the bug is fixed)
 
 # Infer contracts from existing code (zero annotations needed)
 theorem infer src/               # extracts guards, null checks, arithmetic safety

@@ -13,6 +13,7 @@ import {
   extractCallSiteObligations,
 } from '@theoremts/core'
 import type { FunctionReport, TaskResult, FunctionIR, VerificationTask, FileReport, ContractRegistry, ResolvedConfig } from '@theoremts/core'
+import { generateRegressionTests, type RegressionEntry } from '../gen-tests.js'
 import { resolveContractFiles } from '../contracts.js'
 
 interface VerifyOptions {
@@ -21,6 +22,8 @@ interface VerifyOptions {
   watch?: boolean
   format?: string
   timeout?: string
+  genTests?: boolean
+  testsDir?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +215,17 @@ async function verifyFile(
       // error branch is normal — only proved dead branches are worth showing.
       if (task.informational && result.status !== 'proved') continue
 
+      // Counterexample → regression test material
+      if (opts.genTests && result.status === 'disproved' && ir.name !== undefined) {
+        regressionEntries.push({
+          sourcePath: absPath,
+          functionName: ir.name,
+          params: ir.params.map(p => p.name),
+          contractText: task.contractText,
+          counterexample: result.counterexample ?? {},
+        })
+      }
+
       taskResults.push({ task, result, durationMs: ms })
     }
 
@@ -269,12 +283,16 @@ async function verifyFile(
 // Command
 // ---------------------------------------------------------------------------
 
+// Accumulated across files within one runVerify pass
+let regressionEntries: RegressionEntry[] = []
+
 async function runVerify(
   files: string[],
   cwd: string,
   opts: VerifyOptions,
   config: ResolvedConfig,
 ): Promise<{ totalFailed: number }> {
+  regressionEntries = []
   // Pass 1: collect all IR to build cross-function registry
   const allIRs: FunctionIR[] = []
   for (const absPath of files) {
@@ -334,6 +352,20 @@ async function runVerify(
       process.stdout.write(`${dim}No contract violations found in ${files.length === 1 ? files[0]! : `${files.length} files`} (${registry.size} contracts loaded).${reset}\n`)
     } else {
       process.stdout.write(`${dim}No contracts found. Run 'theorem infer' to generate contracts, or add requires()/ensures() to your code.${reset}\n`)
+    }
+  }
+
+  // Counterexample → executable regression tests
+  if (opts.genTests) {
+    const outDir = opts.testsDir ?? '.theorem/regressions'
+    const gen = generateRegressionTests(regressionEntries, outDir)
+    if (gen.tests > 0) {
+      process.stdout.write(`${bold}Generated ${gen.tests} regression test(s)${reset} in ${gen.files.length} file(s):\n`)
+      for (const f of gen.files) process.stdout.write(`${dim}  ${f}${reset}\n`)
+      process.stdout.write(`${dim}  These tests are RED until the bugs are fixed — run with:\n  node --experimental-strip-types --test <file>${reset}\n\n`)
+    }
+    if (gen.skipped > 0) {
+      process.stdout.write(`${dim}(${gen.skipped} counterexample(s) not test-generable: two-state/quantified contracts or unreconstructible inputs)${reset}\n\n`)
     }
   }
 
