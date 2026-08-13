@@ -136,6 +136,10 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
     const denominator = node.getRight()
     if (Node.isNumericLiteral(denominator) && Number(denominator.getLiteralValue()) !== 0) continue
 
+    // Constant divisor: `const BATCH = 50; x / BATCH` — resolve same-file
+    // const declarations initialized with a non-zero literal.
+    if (Node.isIdentifier(denominator) && isNonZeroConstIdent(denominator, file)) continue
+
     const { functionName, params } = enclosingFnInfo(node)
     out.push({
       functionName,
@@ -190,6 +194,14 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
     // an explicit statement that undefined is part of the deal.
     if (/\bas\s+keyof\b/.test(argNode.getText())) continue
 
+    // Enum/constant-keyed lookup: `Handlers[Event.StatusChange]` — the index
+    // is a dotted member, i.e. record semantics, not numeric bounds.
+    if (Node.isPropertyAccessExpression(argNode)) continue
+
+    // Out-of-bounds is a NUMERIC-index concept. String-keyed record lookups
+    // (`acc[taskId]`, `byRole[role]`) are absence-handling, not bounds risk.
+    if (!looksLikeNumericIndex(argNode)) continue
+
     // Access-then-check: `const x = arr[i]; if (!x) return` — indexing out of
     // bounds yields undefined in JS (no crash), and the code checks for it.
     if (isCheckedAfterAccess(node)) continue
@@ -232,7 +244,9 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
 
     const typeText = typeNode.getText()
     const hasQuestionToken = paramDecl.hasQuestionToken()
-    if (!hasQuestionToken && !typeText.includes('null') && !typeText.includes('undefined')) continue
+    // Only the TOP-LEVEL type being nullable matters — `{ x: T | null }`
+    // nests the null inside a member, the parameter itself is always present.
+    if (!hasQuestionToken && !isTopLevelNullable(typeText)) continue
 
     // Check if there's a guard before this access (early-exit on null/undefined)
     if (hasNullGuardBefore(node, paramName)) continue
@@ -505,6 +519,57 @@ function isCheckedAfterAccess(access: Node): boolean {
     if (guardPatterns.some(p => p.test(text))) return true
   }
   return false
+}
+
+/**
+ * Numeric-index heuristic: identifiers with index-ish names, arithmetic
+ * expressions, or unary numerics. Everything else is a record key.
+ */
+function looksLikeNumericIndex(argNode: Node): boolean {
+  if (Node.isBinaryExpression(argNode) || Node.isPrefixUnaryExpression(argNode)) return true
+  if (Node.isIdentifier(argNode)) {
+    return /^(?:i|j|k|n|idx|index|pos|position|offset|from|to|start|end|count|cursor)$|(?:Idx|Index|Position|Offset|Count)$/.test(argNode.getText())
+  }
+  return false
+}
+
+/** True when the identifier resolves to `const X = <non-zero numeric literal>` in this file. */
+function isNonZeroConstIdent(ident: Node, file: SourceFile): boolean {
+  const name = ident.getText()
+  const decl = file.getVariableDeclaration(name)
+  if (!decl) return false
+  const init = decl.getInitializer()
+  if (!init) return false
+  const text = init.getText().trim().replace(/_/g, '')
+  // Literal or pure arithmetic over literals (`24 * 60 * 60 * 1000`)
+  if (!/^[\d+\-*/().\s]+$/.test(text)) return false
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const value = Function(`"use strict"; return (${text})`)() as number
+    return Number.isFinite(value) && value !== 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * True when `null`/`undefined` appears at the TOP level of a type union —
+ * not nested inside object-literal members, generics, or parens.
+ */
+function isTopLevelNullable(typeText: string): boolean {
+  let depth = 0
+  let token = ''
+  const tokens: string[] = []
+  for (const ch of typeText) {
+    if (ch === '{' || ch === '<' || ch === '(' || ch === '[') { depth++; token = ''; continue }
+    if (ch === '}' || ch === '>' || ch === ')' || ch === ']') { depth--; token = ''; continue }
+    if (depth > 0) continue
+    if (/\w/.test(ch)) { token += ch; continue }
+    if (token) tokens.push(token)
+    token = ''
+  }
+  if (token) tokens.push(token)
+  return tokens.includes('null') || tokens.includes('undefined')
 }
 
 function nodeContains(ancestor: Node, descendant: Node): boolean {
