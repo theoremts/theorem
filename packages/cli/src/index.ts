@@ -6,6 +6,7 @@ import { verifyCommand } from './commands/verify.js'
 import { scanCommand } from './commands/scan.js'
 import { suggestCommand } from './commands/suggest.js'
 import { inferCommand } from './commands/infer.js'
+import { prismaCommand } from './commands/prisma.js'
 
 // Load config once at startup and make it available to commands
 let resolvedConfig: ResolvedConfig
@@ -65,6 +66,15 @@ program
   .action(async (paths: string[], opts: Record<string, unknown>) => {
     const config = await getConfig()
     return inferCommand(paths, opts, config)
+  })
+
+program
+  .command('prisma <schema>')
+  .description('Generate Theorem-consumable schemas from a schema.prisma (Int → integer facts, nullability, enums)')
+  .option('--output <path>', 'output file (default: theorem-schemas.ts next to the schema)')
+  .option('--dry-run', 'print to stdout without writing')
+  .action((schema: string, opts: Record<string, unknown>) => {
+    prismaCommand(schema, opts)
   })
 
 program.parseAsync().catch((err: unknown) => {
