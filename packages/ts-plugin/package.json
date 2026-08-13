@@ -1,6 +1,6 @@
 {
   "name": "theoremts-ts-plugin",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "TypeScript Language Service Plugin for Theorem — inline verification in VS Code",
   "license": "MIT",
   "main": "./dist/index.js",

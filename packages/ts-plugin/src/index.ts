@@ -1,18 +1,18 @@
 import type * as tslib from 'typescript/lib/tsserverlibrary'
+import { spawn, type ChildProcess } from 'child_process'
+import { join } from 'path'
+import { writeFileSync, mkdirSync } from 'fs'
 
 // ---------------------------------------------------------------------------
 // Diagnostic code range — custom codes for Theorem diagnostics
 // ---------------------------------------------------------------------------
 
-const DIAG_CODE_DISPROVED  = 100_001
-const DIAG_CODE_UNKNOWN    = 100_002
-const DIAG_CODE_CALLSITE   = 100_003
-const DIAG_CODE_ERROR      = 100_004
-
 const SOURCE = 'theorem'
+const PLUGIN_VERSION = '0.4.0'
+const CHILD_TIMEOUT_MS = 60_000
 
 // ---------------------------------------------------------------------------
-// Types for cached verification results
+// Types
 // ---------------------------------------------------------------------------
 
 interface CachedDiagnostics {
@@ -20,16 +20,21 @@ interface CachedDiagnostics {
   diagnostics: tslib.Diagnostic[]
 }
 
-interface VerificationFailure {
+interface ChildFailure {
   message: string
   start: number
   length: number
   code: number
-  category: tslib.DiagnosticCategory
+  severity: 'error' | 'warning'
 }
 
 // ---------------------------------------------------------------------------
 // Plugin entry point
+//
+// All verification (Z3 WASM included) runs in a short-lived child process —
+// never inside tsserver. Z3's worker threads and memory previously starved
+// the tsserver event loop and crash-looped the server, which also left the
+// editor rendering diagnostics computed against stale file versions.
 // ---------------------------------------------------------------------------
 
 function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule {
@@ -42,95 +47,7 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       logger.info(`[theorem-ts-plugin] ${msg}`)
     }
 
-    log('plugin created')
-
-    // -------------------------------------------------------------------
-    // Contract registry — loaded once from .theorem/contracts/ and config
-    // -------------------------------------------------------------------
-
-    let externalRegistry: import('@theoremts/core').ContractRegistry | null = null
-    let registryLoaded = false
-
-    async function loadExternalRegistry(): Promise<import('@theoremts/core').ContractRegistry> {
-      if (externalRegistry !== null) return externalRegistry
-
-      try {
-        const core = await import('@theoremts/core')
-        const { readFileSync, statSync, readdirSync } = await import('fs')
-        const { join, resolve } = await import('path')
-        const cwd = info.project.getCurrentDirectory()
-
-        const allIRs: import('@theoremts/core').FunctionIR[] = []
-
-        // Try to load .theorem/contracts/ directory
-        const contractsDir = join(cwd, '.theorem', 'contracts')
-        try {
-          const findContracts = (dir: string): void => {
-            for (const entry of readdirSync(dir)) {
-              const p = join(dir, entry)
-              try {
-                const stat = statSync(p)
-                if (stat.isFile() && p.endsWith('.contracts.ts')) {
-                  const source = readFileSync(p, 'utf-8')
-                  allIRs.push(...core.extractDeclareContracts(source, p))
-                } else if (stat.isDirectory()) {
-                  findContracts(p)
-                }
-              } catch {}
-            }
-          }
-          findContracts(contractsDir)
-        } catch {}
-
-        externalRegistry = core.buildRegistry(allIRs)
-        registryLoaded = true
-        log(`loaded ${externalRegistry.size} external contracts`)
-      } catch (err) {
-        log(`failed to load external contracts: ${err}`)
-        externalRegistry = new Map() as import('@theoremts/core').ContractRegistry
-      }
-
-      return externalRegistry
-    }
-
-    // -------------------------------------------------------------------
-    // Z3 context — lazily initialized once
-    // -------------------------------------------------------------------
-
-    let z3Ctx: import('@theoremts/core').Z3Context | null = null
-    let z3InitPromise: Promise<import('@theoremts/core').Z3Context> | null = null
-    let z3Failed = false
-
-    async function getZ3(): Promise<import('@theoremts/core').Z3Context | null> {
-      if (z3Failed) return null
-      if (z3Ctx !== null) return z3Ctx
-
-      if (z3InitPromise === null) {
-        z3InitPromise = (async () => {
-          try {
-            log('initializing Z3 WASM...')
-            const core = await import('@theoremts/core')
-            const ctx = await core.getContext()
-            log('Z3 WASM initialized')
-            return ctx
-          } catch (err) {
-            z3Failed = true
-            log(`Z3 initialization failed: ${err}`)
-            throw err
-          }
-        })()
-      }
-
-      try {
-        z3Ctx = await z3InitPromise
-        return z3Ctx
-      } catch {
-        return null
-      }
-    }
-
-    // Kick off Z3 initialization immediately
-    getZ3()
+    log(`plugin created (v${PLUGIN_VERSION} — subprocess verification)`)
 
     // -------------------------------------------------------------------
     // Diagnostics cache — keyed by fileName + source hash
@@ -139,6 +56,7 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     const cache = new Map<string, CachedDiagnostics>()
     const pendingVersions = new Map<string, string>()
     const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    const activeChildren = new Map<string, ChildProcess>()
 
     function hashSource(source: string): string {
       let h = 0
@@ -149,258 +67,153 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     }
 
     // -------------------------------------------------------------------
-    // Debounced background verification
+    // Debounced background verification (in a child process)
     // -------------------------------------------------------------------
 
-    function scheduleVerification(
-      fileName: string,
-      source: string,
-      sourceFile: tslib.SourceFile,
-      hash: string,
-    ): void {
+    function scheduleVerification(fileName: string, source: string, hash: string): void {
       const existing = debounceTimers.get(fileName)
       if (existing) clearTimeout(existing)
 
       const timer = setTimeout(() => {
         debounceTimers.delete(fileName)
         pendingVersions.set(fileName, hash)
-        runVerification(fileName, source, sourceFile, hash)
+        runVerification(fileName, source, hash)
       }, 500)
 
       debounceTimers.set(fileName, timer)
     }
 
-    async function runVerification(
-      fileName: string,
-      source: string,
-      sourceFile: tslib.SourceFile,
-      hash: string,
-    ): Promise<void> {
+    function runVerification(fileName: string, source: string, hash: string): void {
+      // A newer edit may already have superseded this run
+      if (pendingVersions.get(fileName) !== hash) return
+
+      // Kill any in-flight child for this file — it computed an older version
+      const previous = activeChildren.get(fileName)
+      if (previous) {
+        try { previous.kill('SIGKILL') } catch { /* already dead */ }
+        activeChildren.delete(fileName)
+      }
+
+      const childPath = join(__dirname, 'verifier-child.js')
+      let child: ChildProcess
       try {
-        const ctx = await getZ3()
-        if (ctx === null) return
-
-        if (pendingVersions.get(fileName) !== hash) return
-
-        const core = await import('@theoremts/core')
-        const failures: VerificationFailure[] = []
-
-        let irList: import('@theoremts/core').FunctionIR[]
-        try {
-          irList = core.extractFromSource(source, fileName)
-        } catch (err) {
-          log(`extraction failed for ${fileName}: ${err}`)
-          return
-        }
-
-        // Load external contracts registry
-        const extRegistry = await loadExternalRegistry()
-
-        if (irList.length === 0 && extRegistry.size === 0) {
-          cache.set(fileName, { sourceHash: hash, diagnostics: [] })
-          refreshDiags(fileName)
-          return
-        }
-
-        if (pendingVersions.get(fileName) !== hash) return
-
-        // Merge local IRs with external registry
-        const registry = core.buildRegistry(irList)
-        for (const [name, contract] of extRegistry) {
-          if (!registry.has(name)) registry.set(name, contract)
-        }
-
-        for (const ir of irList) {
-          let tasks: import('@theoremts/core').VerificationTask[]
-          try {
-            tasks = core.translate(ir, ctx, registry)
-          } catch (err) {
-            log(`translation failed for ${ir.name ?? '(anonymous)'}: ${err}`)
-            continue
-          }
-
-          for (const task of tasks) {
-            try {
-              const result = await core.check({ ...task, timeout: 5000 })
-              if (result.status === 'disproved') {
-                const ceText = formatCounterexample(result.counterexample)
-                const traceText = result.trace ? formatTrace(result.trace) : ''
-                failures.push({
-                  message: `Theorem: ${task.contractText} — counterexample: ${ceText}${traceText}`,
-                  start: findContractPosition(source, ir.name, task.contractText),
-                  length: estimateSpanLength(ir.name),
-                  code: DIAG_CODE_DISPROVED,
-                  category: ts.DiagnosticCategory.Error,
-                })
-              } else if (result.status === 'unknown') {
-                failures.push({
-                  message: `Theorem: ${task.contractText} — could not prove (${result.reason})`,
-                  start: findContractPosition(source, ir.name, task.contractText),
-                  length: estimateSpanLength(ir.name),
-                  code: DIAG_CODE_UNKNOWN,
-                  category: ts.DiagnosticCategory.Warning,
-                })
-              }
-            } catch (err) {
-              log(`check failed for task "${task.contractText}": ${err}`)
-            }
-          }
-        }
-
-        // Call-site obligations
-        try {
-          const callSiteTasks = core.extractCallSiteObligations(source, fileName, registry, ctx)
-          for (const task of callSiteTasks) {
-            try {
-              const result = await core.check({ ...task, timeout: 5000 })
-              if (result.status === 'disproved') {
-                const ceText = formatCounterexample(result.counterexample)
-                const callSitePos = findCallSitePosition(source, task.functionName ?? '', task.contractText)
-                failures.push({
-                  message: `Theorem: ${task.contractText}${ceText ? ` — ${ceText}` : ''}`,
-                  start: callSitePos,
-                  length: estimateCallSiteSpanLength(source, callSitePos),
-                  code: DIAG_CODE_CALLSITE,
-                  category: ts.DiagnosticCategory.Error,
-                })
-              }
-            } catch (err) {
-              log(`call-site check failed: ${err}`)
-            }
-          }
-        } catch (err) {
-          log(`call-site extraction failed for ${fileName}: ${err}`)
-        }
-
-        if (pendingVersions.get(fileName) === hash) {
-          const diagnostics = failures.map(f => toDiagnostic(f, sourceFile))
-          cache.set(fileName, { sourceHash: hash, diagnostics })
-          pendingVersions.delete(fileName)
-          refreshDiags(fileName)
-        }
-
+        child = spawn(process.execPath, [childPath], {
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
       } catch (err) {
-        log(`verification error for ${fileName}: ${err}`)
-      } finally {
+        log(`failed to spawn verifier child: ${err}`)
+        return
+      }
+
+      activeChildren.set(fileName, child)
+
+      const killTimer = setTimeout(() => {
+        log(`verifier child timed out for ${fileName}`)
+        try { child.kill('SIGKILL') } catch { /* already dead */ }
+      }, CHILD_TIMEOUT_MS)
+
+      const stdoutChunks: Buffer[] = []
+      const stderrChunks: Buffer[] = []
+      child.stdout?.on('data', (c: Buffer) => stdoutChunks.push(c))
+      child.stderr?.on('data', (c: Buffer) => stderrChunks.push(c))
+
+      child.on('error', err => {
+        clearTimeout(killTimer)
+        activeChildren.delete(fileName)
+        log(`verifier child error for ${fileName}: ${err}`)
+      })
+
+      child.on('close', exitCode => {
+        clearTimeout(killTimer)
+        if (activeChildren.get(fileName) === child) activeChildren.delete(fileName)
+
+        if (exitCode !== 0) {
+          const stderr = Buffer.concat(stderrChunks).toString('utf-8').slice(0, 500)
+          log(`verifier child exited ${exitCode} for ${fileName}: ${stderr}`)
+          return
+        }
+
+        // Discard if the file changed while the child was running
+        if (pendingVersions.get(fileName) !== hash) return
+
+        let failures: ChildFailure[]
+        try {
+          const parsed = JSON.parse(Buffer.concat(stdoutChunks).toString('utf-8')) as { failures: ChildFailure[] }
+          failures = parsed.failures
+        } catch (err) {
+          log(`failed to parse verifier output for ${fileName}: ${err}`)
+          return
+        }
+
+        const diagnostics = failures.map(f => toDiagnostic(f))
+        cache.set(fileName, { sourceHash: hash, diagnostics })
         pendingVersions.delete(fileName)
-      }
-    }
+        refreshDiags()
+        dumpDebug(fileName, source, hash, failures)
+        log(`verified ${fileName}: ${failures.length} finding(s)`)
+      })
 
-    // -------------------------------------------------------------------
-    // Trigger diagnostic refresh
-    // -------------------------------------------------------------------
-
-    function refreshDiags(_fileName: string): void {
+      const contractsDir = join(info.project.getCurrentDirectory(), '.theorem', 'contracts')
       try {
-        info.project.refreshDiagnostics()
-      } catch {
-        try { (info.project as any).markAsDirty?.() } catch {}
+        child.stdin?.write(JSON.stringify({ fileName, source, contractsDir }))
+        child.stdin?.end()
+      } catch (err) {
+        log(`failed to write to verifier child: ${err}`)
+        try { child.kill('SIGKILL') } catch { /* already dead */ }
       }
     }
 
     // -------------------------------------------------------------------
-    // Convert VerificationFailure to ts.Diagnostic
+    // Debug dump — written after every verification so diagnostics can be
+    // inspected without tsserver logging (.theorem/plugin-debug.json in the
+    // project directory)
     // -------------------------------------------------------------------
 
-    function toDiagnostic(
-      failure: VerificationFailure,
-      sourceFile: tslib.SourceFile,
-    ): tslib.Diagnostic {
+    function dumpDebug(fileName: string, source: string, hash: string, failures: ChildFailure[]): void {
+      try {
+        const dir = join(info.project.getCurrentDirectory(), '.theorem')
+        mkdirSync(dir, { recursive: true })
+        const lineOf = (offset: number) => source.slice(0, offset).split('\n').length
+        writeFileSync(join(dir, 'plugin-debug.json'), JSON.stringify({
+          pluginVersion: PLUGIN_VERSION,
+          fileName,
+          sourceHash: hash,
+          sourceLength: source.length,
+          timestamp: new Date().toISOString(),
+          failures: failures.map(f => ({
+            message: f.message,
+            start: f.start,
+            length: f.length,
+            line: lineOf(f.start),
+            anchoredText: source.slice(f.start, f.start + f.length),
+          })),
+        }, null, 2))
+      } catch { /* debug only — never break diagnostics */ }
+    }
+
+    // -------------------------------------------------------------------
+    // Diagnostic conversion / refresh
+    // -------------------------------------------------------------------
+
+    function toDiagnostic(failure: ChildFailure): tslib.Diagnostic {
       return {
-        file: sourceFile,
+        file: undefined,
         start: failure.start,
         length: failure.length,
         messageText: failure.message,
-        category: failure.category,
+        category: failure.severity === 'error' ? ts.DiagnosticCategory.Error : ts.DiagnosticCategory.Warning,
         code: failure.code,
         source: SOURCE,
+      } as tslib.Diagnostic
+    }
+
+    function refreshDiags(): void {
+      try {
+        info.project.refreshDiagnostics()
+      } catch {
+        try { (info.project as unknown as { markAsDirty?: () => void }).markAsDirty?.() } catch { /* best effort */ }
       }
-    }
-
-    // -------------------------------------------------------------------
-    // Source position helpers
-    // -------------------------------------------------------------------
-
-    function findContractPosition(
-      source: string,
-      fnName: string | undefined,
-      _contractText: string,
-    ): number {
-      if (fnName) {
-        const fnPattern = new RegExp(`function\\s+(${escapeRegex(fnName)})\\b`)
-        const fnMatch = fnPattern.exec(source)
-        if (fnMatch) return fnMatch.index + fnMatch[0].indexOf(fnName)
-
-        const constPattern = new RegExp(`(?:const|let|var)\\s+(${escapeRegex(fnName)})\\b`)
-        const constMatch = constPattern.exec(source)
-        if (constMatch) return constMatch.index + constMatch[0].indexOf(fnName)
-
-        const methodPattern = new RegExp(`\\b(${escapeRegex(fnName)})\\s*\\(`)
-        const methodMatch = methodPattern.exec(source)
-        if (methodMatch) return methodMatch.index
-      }
-      return 0
-    }
-
-    function estimateSpanLength(fnName: string | undefined): number {
-      return fnName?.length ?? 20
-    }
-
-    function findCallSitePosition(
-      source: string,
-      functionName: string,
-      contractText: string,
-    ): number {
-      const callee = functionName.replace(/^\(call-site\)\s*/, '')
-      if (callee) {
-        const callMatch = contractText.match(/^([^(]+)\(([^)]*)\)/)
-        if (callMatch) {
-          const argText = callMatch[2]!.trim()
-          const exact = `${callee}(${argText})`
-          const idx = source.indexOf(exact)
-          if (idx >= 0) return idx
-        }
-        const pattern = new RegExp(`\\b${escapeRegex(callee)}\\s*\\(`)
-        const match = pattern.exec(source)
-        if (match) return match.index
-      }
-      return 0
-    }
-
-    function estimateCallSiteSpanLength(source: string, start: number): number {
-      let depth = 0
-      let i = start
-      while (i < source.length) {
-        if (source[i] === '(') depth++
-        if (source[i] === ')') {
-          depth--
-          if (depth === 0) return i - start + 1
-        }
-        i++
-      }
-      return Math.min(30, source.length - start)
-    }
-
-    // -------------------------------------------------------------------
-    // Formatting helpers
-    // -------------------------------------------------------------------
-
-    function formatCounterexample(ce: Record<string, unknown>): string {
-      const entries = Object.entries(ce)
-        .filter(([k]) => !k.startsWith('__'))
-        .map(([k, v]) => `${k} = ${v}`)
-      return entries.length > 0 ? entries.join(', ') : ''
-    }
-
-    function formatTrace(trace: Record<string, unknown>): string {
-      const entries = Object.entries(trace)
-        .filter(([, v]) => v !== '?')
-        .map(([k, v]) => `${k} = ${v}`)
-      return entries.length > 0 ? ` (where ${entries.join(', ')})` : ''
-    }
-
-    function escapeRegex(s: string): string {
-      return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     }
 
     // -------------------------------------------------------------------
@@ -432,8 +245,19 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       const sourceFile = program?.getSourceFile(fileName)
       if (!sourceFile) return original
 
-      const source = sourceFile.getText()
+      // Read from the ScriptInfo snapshot — the live editor buffer — NOT from
+      // program.getSourceFile(): program snapshots can lag the buffer by many
+      // edits, which anchors diagnostics against text the user no longer sees.
+      const scriptInfo = info.project.getScriptInfo(fileName)
+      const snapshot = scriptInfo?.getSnapshot()
+      const source = snapshot !== undefined
+        ? snapshot.getText(0, snapshot.getLength())
+        : sourceFile.getText()
       const hash = hashSource(source)
+
+      if (snapshot !== undefined && sourceFile.text.length !== source.length) {
+        log(`stale program for ${fileName}: program=${sourceFile.text.length} chars, buffer=${source.length} chars — using buffer`)
+      }
 
       // Return cached if fresh — re-bind sourceFile to current version
       const cached = cache.get(fileName)
@@ -442,8 +266,8 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         return [...original, ...rebound]
       }
 
-      // Schedule verification (debounced)
-      scheduleVerification(fileName, source, sourceFile, hash)
+      // Schedule verification (debounced, in a child process)
+      scheduleVerification(fileName, source, hash)
 
       // Return original only — don't show stale diagnostics with wrong offsets
       return original
