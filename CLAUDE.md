@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Production-ready. 264 tests passing. Four operating modes: verify, scan, suggest, infer.
+Production-ready. 302 tests passing. Five CLI commands: verify, scan, suggest, infer, prisma. Zod AND Effect Schema work as out-of-the-box contracts in verify/scan/ts-plugin, including cross-field invariants (`.refine()` / `Schema.filter()`), `.brand()`/`.int()`, cross-file schema resolution, tRPC `.input()` boundaries, and dead-error-branch analysis (`Effect.fail` proved unreachable under contracts). Class `@invariant` decorators implement Design-by-Contract object invariants. `theorem prisma` generates schemas from schema.prisma (Int → integer facts).
 
 ## What This Is
 
@@ -33,6 +33,10 @@ theorem scan --strict src/       # CI mode
 
 # Auto-generate contract suggestions
 theorem suggest src/
+
+# Generate Theorem-consumable schemas from a Prisma schema
+theorem prisma prisma/schema.prisma          # → theorem-schemas.ts next to it
+theorem prisma schema.prisma --dry-run       # print without writing
 
 # Build
 npm run build                    # turbo build all packages
@@ -118,3 +122,13 @@ TypeScript source (.ts / .proof.ts)
 - `.length >= 0` domain constraints are auto-asserted for any member access ending in `.length`.
 - Infer without --prove never touches Z3 (safe on any codebase, no WASM crash risk).
 - External contract packages (@theoremts/contracts-*) are auto-discovered from node_modules and used in both verify and infer propagation.
+- Zod schemas are first-class contracts: `const x = Schema.parse(input)` injects the schema's refinements as assume contracts (extractor) — a function with only a Zod parse becomes verifiable with zero annotations, in verify, scan, and the ts-plugin. Parse results stay free Z3 variables (parser skips SSA-binding `.parse()` initializers); `safeParse` is deliberately ignored (doesn't throw).
+- Schema invariants: `.refine(arrow)` cross-field predicates are model invariants — assumed at parse sites AND proved for every function whose return type derives from the schema (`type T = z.output<typeof S>`). Schemas imported via relative paths are resolved cross-file (`inferrer/zod.ts`: `resolveImportedSchema`).
+- Effect Schema (`inferrer/effect-schema.ts`) has full parity with Zod: `Schema.decodeUnknownSync(S)(x)` / `decodeSync` are the parse sites (Effect-returning decode variants skipped — failures are values, not throws); Struct field refinements (positive/nonNegative/between/greaterThan[OrEqualTo]/lessThan[OrEqualTo]/int/minLength/maxLength/minItems/maxItems) become assumptions — `Schema.int()` emits a Number.isInteger constraint Z3 uses; `Schema.filter(arrow)` after the Struct is the cross-field invariant; `typeof S.Type` / `Schema.Schema.Type<typeof S>` aliases put producers under proof obligation. Works with `Schema.*` or aliased `import * as S`.
+- Class invariants: `@invariant((self) => ...)` on a class is assumed at each method entry and proved at each exit; the constructor must establish it. `this.x` is normalized to a flat `this.x` identifier in the parser, so field mutations flow through the same SSA machinery as local variables (including if-guarded clamps). Inline requires/ensures statements in method bodies are honored alongside decorators.
+- Modular calls in bodies: `rewriteRegisteredCalls` replaces registered calls with fresh `__ret_*` idents so the `result = <body>` equation survives nested calls; callee ensures instantiate `output()` to the call's `__ret`, never the caller's `result`.
+- Call-site checker propagates callee ensures through variable assignments (`var a = f(1) - 10` → `a = __ret - 10` with f's ensures on `__ret`), and assumes enclosing requires + decreases-integer constraints.
+- Body safety obligations are path-sensitive: ternary/early-return guards become path-condition assumptions (`if (b === 0) return 0; return a / b` proves).
+- Dead error branches: `Effect.fail`/`Effect.die` under path conditions produce informational tasks (goal = branch reachable; UNSAT ⇒ dead code, reported as ✓; reachable is normal and hidden). CLI drops informational non-proved results; ts-plugin skips them.
+- tRPC: `t.procedure.input(Schema).mutation/query/subscription(handler)` — the handler (named after its router key) assumes the input schema's constraints and invariants; `{ input }` destructuring with renames supported; Zod or Effect Schema.
+- `theorem prisma` (`prisma/index.ts`): parses schema.prisma → Zod-style row schemas; Int/BigInt → `.int()` (integer facts), optional → `.nullable()`, relations/lists skipped, enums documented.

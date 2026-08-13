@@ -2,6 +2,7 @@ import {
   requires, ensures, check, assume,
   positive, nonNegative, between, output,
   old, conserved, decreases,
+  invariant,
 } from 'theoremts'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -9,6 +10,33 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── assume(): trust external data ────────────────────────────────────────────
+
+function calculateShipping(weight: number, distance: number, memberYears: number): number {
+  requires(positive(weight))
+  requires(positive(distance))
+  requires(nonNegative(memberYears))
+  ensures(output() > 0)     // shipping must always be positive
+
+  let rate: number
+  if (weight > 30) rate = weight * 2.5
+  else if (weight > 10) rate = weight * 1.5
+  else rate = weight * 1.0
+
+  let surcharge = 0
+  if (distance < 1000) surcharge = distance * 0.01
+  else if (distance < 500) surcharge = distance * 1.005
+
+  let discount = 0
+  let years = memberYears
+  while (years > 0) {
+    invariant(() => discount >= 0)
+    decreases(() => years)
+    discount += 0.02     // 2% per year — no cap!
+    years--
+  }
+
+  return (rate + surcharge) * (1 - discount)
+}
 
 export function processExternal(amount: number): number {
   requires(positive(amount))
@@ -35,25 +63,38 @@ export function transfer(fromBalance: number, toBalance: number, amount: number)
 // ── Closures: factory functions ──────────────────────────────────────────────
 
 function createDiscount(rate: number) {
-  requires(between(rate, 0, 1))
+  //requires(between(rate, 0, 1))
+
+  rate = rate + 1000
 
   return (price: number) => {
     requires(positive(price))
     ensures(nonNegative(output()))
     ensures(output() <= price)
-    return price * (1 - rate)
+
+    return price * (rate)
   }
 }
+
+
+createDiscount(2)
 
 // ── Generics: works with any numeric type ────────────────────────────────────
 
 function safeAdd<T extends number>(a: T, b: T): number {
   requires(nonNegative(a))
   requires(nonNegative(b))
-  ensures(output() >= a)
-  ensures(output() >= b)
+
+  ensures(output() >= 0)
+
   return a + b
 }
+
+var a = safeAdd(1, 2);
+
+safeAdd(1, a);
+
+
 
 // ── Objects: ensures on return properties ─────────────────────────────────────
 

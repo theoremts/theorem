@@ -5,6 +5,9 @@ export default defineConfig({
   include: ['src/**/*.ts'],
   exclude: ['**/*.test.ts', '**/*.spec.ts'],
 
+  // Contracts for external/unannotated functions (theorem infer output)
+  contracts: ['.theorem/contracts/'],
+
   // Z3 solver settings
   solver: {
     timeout: 10000,        // ms per check (default 10000)

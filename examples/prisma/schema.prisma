@@ -1,0 +1,23 @@
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+}
+
+model Order {
+  id        String      @id @default(cuid())
+  total     Decimal
+  quantity  Int
+  discount  Float?
+  status    OrderStatus
+  createdAt DateTime    @default(now())
+  items     Item[]
+}
+
+model Item {
+  id      String @id
+  price   Decimal
+  count   Int
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id])
+}
