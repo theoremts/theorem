@@ -186,6 +186,14 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
     // Skip literal indices (numeric or string)
     if (Node.isNumericLiteral(argNode) || Node.isStringLiteral(argNode)) continue
 
+    // Intentional record lookup: `obj[key as keyof typeof obj]` — the cast is
+    // an explicit statement that undefined is part of the deal.
+    if (/\bas\s+keyof\b/.test(argNode.getText())) continue
+
+    // Access-then-check: `const x = arr[i]; if (!x) return` — indexing out of
+    // bounds yields undefined in JS (no crash), and the code checks for it.
+    if (isCheckedAfterAccess(node)) continue
+
     const { functionName, params } = enclosingFnInfo(node)
     out.push({
       functionName,
@@ -456,6 +464,47 @@ function collectPathConditions(startNode: Node): RawPathCondition[] {
   }
 
   return conditions
+}
+
+/**
+ * True when the element-access result is bound to a variable that a nearby
+ * subsequent statement checks for absence (`if (!x)`, `x === undefined`,
+ * `x == null`, optional chaining) — the idiomatic safe JS pattern where
+ * out-of-bounds indexing returns undefined and the code handles it.
+ */
+function isCheckedAfterAccess(access: Node): boolean {
+  const varDecl = access.getFirstAncestorByKind(SyntaxKind.VariableDeclaration)
+  if (!varDecl) {
+    // Direct use inside a condition (`if (arr[i]) ...` / `arr[i]?.x`) is
+    // itself a check
+    const cond = access.getFirstAncestorByKind(SyntaxKind.IfStatement)
+    if (cond && nodeContains(cond.getExpression(), access)) return true
+    return false
+  }
+  const name = varDecl.getName()
+  if (!name) return false
+
+  const stmt = varDecl.getFirstAncestorByKind(SyntaxKind.VariableStatement)
+  const block = stmt?.getParent()
+  if (!stmt || !block || (!Node.isBlock(block) && !Node.isSourceFile(block))) return false
+
+  const statements = (block as import('ts-morph').Block).getStatements()
+  const idx = statements.indexOf(stmt as import('ts-morph').Statement)
+  if (idx === -1) return false
+
+  // Look at the next few statements for a falsy/undefined guard on the name
+  const guardPatterns = [
+    new RegExp(String.raw`!\s*${name}\b`),
+    new RegExp(String.raw`\b${name}\s*===?\s*(?:undefined|null)\b`),
+    new RegExp(String.raw`\b(?:undefined|null)\s*===?\s*${name}\b`),
+    new RegExp(String.raw`\b${name}\s*\?\.`),
+    new RegExp(String.raw`\b${name}\s*\?\?`),
+  ]
+  for (let i = idx + 1; i < Math.min(idx + 4, statements.length); i++) {
+    const text = statements[i]!.getText()
+    if (guardPatterns.some(p => p.test(text))) return true
+  }
+  return false
 }
 
 function nodeContains(ancestor: Node, descendant: Node): boolean {
