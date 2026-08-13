@@ -7,6 +7,7 @@ import { createVariables, makeConst } from './variables.js'
 import { toZ3 } from './expr.js'
 import { translateStringContract } from './string-contracts.js'
 import { substituteExpr, substituteOutput } from './substitution.js'
+import { translateHeapMode } from './heap.js'
 
 export type { Z3Context }
 
@@ -42,6 +43,13 @@ export function translate(
   ctx: Z3Context,
   registry?: ContractRegistry,
 ): VerificationTask[] {
+  // Heap mode: the function mutates fields of object parameters — flat
+  // per-path variables are unsound under aliasing, so the heap is encoded
+  // as Z3 arrays instead (see translator/heap.ts).
+  if (ir.heapSteps !== undefined && ir.heapSteps.length > 0) {
+    return translateHeapMode(ir, ctx)
+  }
+
   const vars = createVariables(ir.params, ir.returnSort, ctx)
   const tasks: VerificationTask[] = []
 
@@ -58,6 +66,14 @@ export function translate(
   // 1. Translate requires → assumptions (with labels for unsat core)
   const assumptions: Bool<'main'>[] = []
   const assumptionLabels: string[] = []
+
+  // L1 visibility: field mutations the parser could not model are a
+  // stated assumption, not silence — they show up in every task's context.
+  if (ir.unmodeledWrites !== undefined) {
+    for (const w of ir.unmodeledWrites) {
+      assumptionLabels.push(`WARNING unmodeled field mutation: ${w} (body shape unsupported for heap mode)`)
+    }
+  }
 
   for (const contract of ir.contracts) {
     if (contract.kind !== 'requires') continue

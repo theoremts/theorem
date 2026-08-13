@@ -125,4 +125,21 @@ export interface FunctionIR {
   loops?: LoopInfo[] | undefined
   /** Ordered body steps — code operations + positional check/assume. */
   bodySteps?: BodyStep[] | undefined
+  /**
+   * Heap-mode body: sequence of field writes over object references.
+   * Present when the function mutates fields of object parameters — the
+   * translator then encodes the heap as Z3 arrays (select/store), making
+   * aliasing between references representable.
+   */
+  heapSteps?: HeapStep[] | undefined
+  /** Object roots (params/locals) treated as references in heap mode. */
+  heapRoots?: string[] | undefined
+  /** Field writes the parser could NOT model (unsupported body shape). */
+  unmodeledWrites?: string[] | undefined
 }
+
+/** One step of a heap-mode body. */
+export type HeapStep =
+  | { kind: 'field-write'; root: string; field: string; value: Expr }
+  | { kind: 'local'; name: string; value: Expr }
+  | { kind: 'alias'; name: string; of: string }

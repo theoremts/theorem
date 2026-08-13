@@ -135,8 +135,8 @@ export function decreases(_: unknown): Decreases {
 // modifies
 // ---------------------------------------------------------------------------
 
-export function modifies(...refs: string[]): Modification {
-  return { __type: 'modifies', refs }
+export function modifies(...refs: Array<string | object>): Modification {
+  return { __type: 'modifies', refs: refs.map(r => typeof r === 'string' ? r : '') }
 }
 
 // ---------------------------------------------------------------------------

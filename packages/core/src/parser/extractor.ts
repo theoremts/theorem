@@ -11,7 +11,7 @@ import {
   type MethodDeclaration,
   type SourceFile,
 } from 'ts-morph'
-import type { BodyStep, Contract, Expr, FunctionIR, LoopInfo, Param, Predicate, Sort } from './ir.js'
+import type { BodyStep, Contract, Expr, FunctionIR, HeapStep, LoopInfo, Param, Predicate, Sort } from './ir.js'
 import { parseExpr, parseBlockToExpr, parseBlockWithLoops, parseStmtListDirect, getResolvedPositionalContracts, getFinalSSABindings } from './expr.js'
 import { substituteExpr } from '../translator/substitution.js'
 import {
@@ -134,6 +134,14 @@ export function extractFromSource(source: string, fileName = 'input.ts', registr
   //     validates before invoking it).
   try {
     for (const ir of extractTrpcProcedures(file)) results.push(ir)
+  } catch { /* best-effort */ }
+
+  // 3d. Refinement types: a parameter typed with a schema-derived alias
+  //     (`type Rate = z.output<typeof RateSchema>`) carries the schema's
+  //     constraints as REQUIRES — assumed inside the function, and proved by
+  //     callers through the existing call-site checker.
+  try {
+    attachParamRefinements(file, source, fileName, results)
   } catch { /* best-effort */ }
 
   // 4. Declared contracts: if registry has contracts for functions in this file,
@@ -642,6 +650,90 @@ function attachSchemaInvariantObligations(
 }
 
 /**
+ * Refinement types via schema-derived parameter types.
+ *
+ * `type Rate = z.output<typeof RateSchema>` (or `typeof S.Type` for Effect)
+ * turns any parameter annotated `rate: Rate` into a refined value: the
+ * schema's field constraints and refine/filter invariants become REQUIRES
+ * contracts. Inside the function they are assumptions; at call sites the
+ * existing checker obliges callers to PROVE them.
+ */
+function attachParamRefinements(
+  file: SourceFile,
+  source: string,
+  fileName: string,
+  results: FunctionIR[],
+): void {
+  // alias name → schema name (both Zod and Effect idioms)
+  const aliases = new Map<string, string>()
+  for (const alias of file.getTypeAliases()) {
+    const typeText = alias.getTypeNode()?.getText() ?? ''
+    const m = /z\.(?:output|infer)<\s*typeof\s+(\w+)\s*>/.exec(typeText)
+      ?? /(?:\w+\.)?Schema\.Type<\s*typeof\s+(\w+)\s*>/.exec(typeText)
+      ?? /^typeof\s+(\w+)\.Type$/.exec(typeText.trim())
+    if (m) aliases.set(alias.getName(), m[1]!)
+  }
+  if (aliases.size === 0) return
+
+  const schemaTextOf = (schemaName: string): string | undefined =>
+    file.getVariableDeclaration(schemaName)?.getInitializer()?.getText().trim()
+      ?? resolveImportedSchema(file, schemaName)
+
+  const byName = new Map<string, FunctionIR>()
+  for (const r of results) if (r.name) byName.set(r.name, r)
+  let plainFunctions: FunctionIR[] | null = null
+
+  for (const fnDecl of file.getFunctions()) {
+    const name = fnDecl.getName()
+    if (!name) continue
+
+    const refinements: Contract[] = []
+    for (const param of fnDecl.getParameters()) {
+      const typeText = param.getTypeNode()?.getText()
+      if (!typeText) continue
+      const schemaName = aliases.get(typeText)
+      if (!schemaName) continue
+      const schemaText = schemaTextOf(schemaName)
+      if (!schemaText) continue
+
+      const paramName = param.getName()
+      // Zod first; Effect only when Zod finds nothing (avoids double-matching
+      // shared method names like .positive() on the same chain)
+      const zodConstraints = extractConstraintsFromSchemaText(schemaText, paramName)
+      const constraints = zodConstraints.length > 0
+        ? zodConstraints
+        : extractEffectConstraintsFromSchemaText(schemaText, paramName)
+      for (const c of constraints) {
+        refinements.push({ kind: 'requires', predicate: c.predicate })
+      }
+      const invariants = [
+        ...extractRefinePredicates(schemaText),
+        ...extractEffectFilterInvariants(schemaText),
+      ]
+      for (const inv of invariants) {
+        refinements.push({
+          kind: 'requires',
+          predicate: bindRefineInvariant(inv, { kind: 'ident', name: paramName }),
+        })
+      }
+    }
+    if (refinements.length === 0) continue
+
+    const existing = byName.get(name)
+    if (existing) {
+      existing.contracts.push(...refinements)
+      continue
+    }
+
+    // No other contracts — the refined parameter type alone makes the
+    // function verifiable (and registers it for call-site checking).
+    if (plainFunctions === null) plainFunctions = extractFunctionsFromSource(source, fileName)
+    const plain = plainFunctions.find(f => f.name === name)
+    if (plain) results.push({ ...plain, contracts: refinements })
+  }
+}
+
+/**
  * Extracts tRPC procedure handlers:
  *   key: t.procedure.input(Schema).mutation(({ input }) => ...)
  *
@@ -742,6 +834,114 @@ function trpcInputBindingName(handler: import('ts-morph').ArrowFunction): string
   return null
 }
 
+/**
+ * Detects and extracts a heap-mode body: a straight-line sequence of locals
+ * and field writes over object references (`from.value = from.value + x`).
+ * Returns null when there are no non-this field writes; returns
+ * { unsupported } when writes exist but the body shape can't be modeled
+ * (branches, loops, calls) — the caller surfaces that as a visible warning.
+ */
+function tryExtractHeapSteps(
+  stmts: Statement[],
+  contracts: Contract[],
+): { steps: HeapStep[]; roots: string[] } | { unsupported: string[] } | null {
+  // First: are there field writes ANYWHERE (including nested in loops/ifs)?
+  const allWrites: string[] = []
+  for (const s of stmts) {
+    for (const bin of [s, ...s.getDescendantsOfKind(SyntaxKind.BinaryExpression)]) {
+      if (!Node.isBinaryExpression(bin) || bin.getOperatorToken().getText() !== '=') continue
+      const left = bin.getLeft()
+      if (Node.isPropertyAccessExpression(left) && Node.isIdentifier(left.getExpression()) &&
+          left.getExpression().getText() !== 'this') {
+        allWrites.push(left.getText())
+      }
+    }
+  }
+  if (allWrites.length === 0) return null
+
+  const steps: HeapStep[] = []
+  const writes: string[] = []
+  const roots = new Set<string>()
+  let supported = true
+
+  for (const s of stmts) {
+    if (Node.isReturnStatement(s)) break  // trailing return: ensures use fields, not output()
+
+    if (Node.isExpressionStatement(s)) {
+      const expr = s.getExpression()
+      if (Node.isCallExpression(expr)) continue  // check/assume/etc — positional contracts
+      if (Node.isBinaryExpression(expr) && expr.getOperatorToken().getText() === '=') {
+        const left = expr.getLeft()
+        if (Node.isPropertyAccessExpression(left) && Node.isIdentifier(left.getExpression()) &&
+            left.getExpression().getText() !== 'this') {
+          const root = left.getExpression().getText()
+          const value = parseExpr(expr.getRight() as Expression)
+          writes.push(`${root}.${left.getName()}`)
+          if (value === null) { supported = false; continue }
+          roots.add(root)
+          steps.push({ kind: 'field-write', root, field: left.getName(), value })
+          continue
+        }
+      }
+      supported = false
+      continue
+    }
+
+    if (Node.isVariableStatement(s)) {
+      let ok = true
+      for (const decl of s.getDeclarations()) {
+        const init = decl.getInitializer()
+        if (!init) { ok = false; break }
+        if (Node.isIdentifier(init)) {
+          steps.push({ kind: 'alias', name: decl.getName(), of: init.getText() })
+          continue
+        }
+        const value = parseExpr(init as Expression)
+        if (value === null) { ok = false; break }
+        steps.push({ kind: 'local', name: decl.getName(), value })
+      }
+      if (!ok) supported = false
+      continue
+    }
+
+    supported = false
+  }
+
+  if (!supported || writes.length === 0) return { unsupported: allWrites }
+
+  // Roots also include objects read via members in contracts
+  for (const c of contracts) {
+    if (typeof c === 'object' && 'predicate' in c && typeof c.predicate !== 'string') {
+      collectMemberRoots(c.predicate, roots)
+    }
+  }
+  // And in step values
+  for (const st of steps) {
+    if (st.kind !== 'alias') collectMemberRoots(st.value, roots)
+  }
+
+  return { steps, roots: [...roots] }
+}
+
+function collectMemberRoots(expr: Expr, roots: Set<string>): void {
+  switch (expr.kind) {
+    case 'member':
+      if (expr.object.kind === 'ident' && expr.object.name !== 'this') roots.add(expr.object.name)
+      else collectMemberRoots(expr.object, roots)
+      break
+    case 'binary':
+      collectMemberRoots(expr.left, roots); collectMemberRoots(expr.right, roots); break
+    case 'unary':
+      collectMemberRoots(expr.operand, roots); break
+    case 'ternary':
+      collectMemberRoots(expr.condition, roots); collectMemberRoots(expr.then, roots); collectMemberRoots(expr.else, roots); break
+    case 'call':
+      for (const a of expr.args) collectMemberRoots(a, roots); break
+    default:
+      break
+  }
+}
+
 function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
   const fnBody = fn.getBody()
   if (!fnBody || !Node.isBlock(fnBody)) return null
@@ -825,6 +1025,20 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
     // If closure extraction fails, fall through to normal handling
   }
 
+  // Heap mode: field mutations over object parameters
+  let heapSteps: HeapStep[] | undefined
+  let heapRoots: string[] | undefined
+  let unmodeledWrites: string[] | undefined
+  const heap = tryExtractHeapSteps(codeStmts, contracts)
+  if (heap !== null) {
+    if ('unsupported' in heap) {
+      unmodeledWrites = heap.unsupported
+    } else {
+      heapSteps = heap.steps
+      heapRoots = heap.roots
+    }
+  }
+
   return {
     name: fn.getName() ?? undefined,
     params: extractFunctionDeclParams(fn),
@@ -833,6 +1047,9 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
     contracts,
     loops: loops.length > 0 ? loops : undefined,
     bodySteps: finalBodySteps.length > 0 ? finalBodySteps : undefined,
+    heapSteps,
+    heapRoots,
+    unmodeledWrites,
   }
 }
 
@@ -1135,8 +1352,9 @@ function tryExtractContract(node: Expression): Contract | null {
     case 'modifies':
       return {
         kind: 'modifies',
+        // Accept both identifiers (modifies(a, b)) and strings (modifies('a'))
         refs: args
-          .filter((a) => Node.isStringLiteral(a as Expression))
+          .filter((a) => Node.isStringLiteral(a as Expression) || Node.isIdentifier(a as Expression))
           .map((a) => (a as Expression).getText().replace(/['"]/g, '')),
       }
 
