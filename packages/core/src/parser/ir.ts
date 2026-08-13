@@ -140,6 +140,15 @@ export interface FunctionIR {
 
 /** One step of a heap-mode body. */
 export type HeapStep =
-  | { kind: 'field-write'; root: string; field: string; value: Expr }
+  | {
+      kind: 'field-write'
+      /** Base identifier of the write target (for modifies/roots). */
+      root: string
+      /** Object expression being written through — ident or member chain
+       *  (`a.next.prev = x` writes field `prev` of object `a.next`). */
+      object: Expr
+      field: string
+      value: Expr
+    }
   | { kind: 'local'; name: string; value: Expr }
   | { kind: 'alias'; name: string; of: string }

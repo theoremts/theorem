@@ -851,9 +851,9 @@ function tryExtractHeapSteps(
     for (const bin of [s, ...s.getDescendantsOfKind(SyntaxKind.BinaryExpression)]) {
       if (!Node.isBinaryExpression(bin) || bin.getOperatorToken().getText() !== '=') continue
       const left = bin.getLeft()
-      if (Node.isPropertyAccessExpression(left) && Node.isIdentifier(left.getExpression()) &&
-          left.getExpression().getText() !== 'this') {
-        allWrites.push(left.getText())
+      if (Node.isPropertyAccessExpression(left)) {
+        const base = memberChainBase(left)
+        if (base !== null && base !== 'this') allWrites.push(left.getText())
       }
     }
   }
@@ -872,15 +872,18 @@ function tryExtractHeapSteps(
       if (Node.isCallExpression(expr)) continue  // check/assume/etc — positional contracts
       if (Node.isBinaryExpression(expr) && expr.getOperatorToken().getText() === '=') {
         const left = expr.getLeft()
-        if (Node.isPropertyAccessExpression(left) && Node.isIdentifier(left.getExpression()) &&
-            left.getExpression().getText() !== 'this') {
-          const root = left.getExpression().getText()
-          const value = parseExpr(expr.getRight() as Expression)
-          writes.push(`${root}.${left.getName()}`)
-          if (value === null) { supported = false; continue }
-          roots.add(root)
-          steps.push({ kind: 'field-write', root, field: left.getName(), value })
-          continue
+        // `a.f = v` or a pointer-path write `a.next.prev = v`
+        if (Node.isPropertyAccessExpression(left)) {
+          const base = memberChainBase(left)
+          if (base !== null && base !== 'this') {
+            const objectExpr = parseExpr(left.getExpression() as Expression)
+            const value = parseExpr(expr.getRight() as Expression)
+            writes.push(left.getText())
+            if (objectExpr === null || value === null) { supported = false; continue }
+            roots.add(base)
+            steps.push({ kind: 'field-write', root: base, object: objectExpr, field: left.getName(), value })
+            continue
+          }
         }
       }
       supported = false
@@ -921,6 +924,15 @@ function tryExtractHeapSteps(
   }
 
   return { steps, roots: [...roots] }
+}
+
+/** Base identifier of a member chain (`a.next.prev` → 'a'), or null. */
+function memberChainBase(node: Expression): string | null {
+  let current: Node = node
+  while (Node.isPropertyAccessExpression(current)) {
+    current = current.getExpression()
+  }
+  return Node.isIdentifier(current) ? current.getText() : null
 }
 
 function collectMemberRoots(expr: Expr, roots: Set<string>): void {

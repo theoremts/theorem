@@ -126,6 +126,80 @@ describe('modifies framing (L3)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Pointer surgery (L4 spike): pointer fields, null, writes through pointers
+// ---------------------------------------------------------------------------
+
+describe('heap mode: pointer-valued fields', () => {
+  const linkSource = `
+    interface Node { value: number; next: Node | null; prev: Node | null }
+
+    export function linkFront(head: Node, node: Node): void {
+      requires(head !== node)
+      requires(node.next === null)
+      requires(node.prev === null)
+      ensures(node.next === head)
+      ensures(head.prev === node)
+      ensures(node.prev === null)
+      node.next = head
+      head.prev = node
+    }
+
+    export function buggyLink(head: Node, node: Node): void {
+      requires(head !== node)
+      requires(node.next === null)
+      ensures(head.prev === node)
+      node.next = head
+    }
+
+    export function aliasedLink(head: Node, node: Node): void {
+      requires(node.prev === null)
+      ensures(node.prev === null)
+      node.next = head
+      head.prev = node
+    }
+
+    export function unlinkSecond(head: Node): void {
+      requires(head.next !== null)
+      requires(head.next.prev === head)
+      requires(head.next.next === null)
+      ensures(head.next === null)
+      const second = head.next
+      head.next = second.next
+      second.prev = null
+    }
+  `
+
+  test('correct doubly-linked insertion is proved', async () => {
+    const results = await verifyAll(linkSource)
+    for (const r of results.filter(x => x.fn === 'linkFront')) {
+      assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.join(', ')}`)
+    }
+  })
+
+  test('forgotten back-pointer is refuted', async () => {
+    const results = await verifyAll(linkSource)
+    const bad = results.find(r => r.fn === 'buggyLink' && r.text.includes('head.prev'))
+    assert.ok(bad)
+    assert.strictEqual(bad.status, 'disproved')
+  })
+
+  test('aliased references clobber fields — counterexample has head === node', async () => {
+    const results = await verifyAll(linkSource)
+    const bad = results.find(r => r.fn === 'aliasedLink' && r.text.includes('node.prev === null'))
+    assert.ok(bad)
+    assert.strictEqual(bad.status, 'disproved')
+    assert.strictEqual(bad.ce?.['head'], bad.ce?.['node'], 'counterexample must alias head and node')
+  })
+
+  test('reads and writes through pointers are encoded (select of select)', async () => {
+    const results = await verifyAll(linkSource)
+    const r = results.find(x => x.fn === 'unlinkSecond')
+    assert.ok(r, 'Expected unlinkSecond obligation')
+    assert.strictEqual(r.status, 'proved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 

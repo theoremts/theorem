@@ -5,22 +5,21 @@ import type { VerificationTask } from './index.js'
 import { prettyExpr } from '../parser/pretty.js'
 
 /**
- * Heap-as-map encoding — mutation levels 2 and 3.
+ * Heap-as-map encoding — mutation levels 2 and 3, plus the L4 spike:
+ * pointer-valued fields and reads/writes THROUGH pointers.
  *
- * When a function mutates fields of object parameters, flat per-path
- * variables are UNSOUND under aliasing (`f(a, b)` with `a === b`). Here the
- * heap is encoded per field as a Z3 array Int → Real:
+ *   read  a.x         →  Select(heap_x, refA)
+ *   write a.x = v     →  heap_x' = Store(heap_x, refA, v)
+ *   read  a.next.prev →  Select(heap_prev, Select(heap_next, refA))
+ *   write a.next.prev →  heap_prev' = Store(heap_prev, Select(heap_next, refA), v)
  *
- *   read  a.x      →  Select(heap_x, refA)
- *   write a.x = v  →  heap_x' = Store(heap_x, refA, v)
+ * Object roots are Int constants ("references"); aliasing is refA === refB,
+ * explored by the solver. Fields are sorted by inference: a field is a
+ * POINTER field (Int→Int array) when it is dereferenced (`x.f.g`), assigned
+ * null/a reference, or compared against one; otherwise numeric (Int→Real).
+ * `null` is the reference 0; named roots are assumed non-null.
  *
- * Object roots become Int constants ("references"): aliasing is simply
- * refA === refB, which the solver explores like any other equality. Requires
- * are evaluated against the initial heap, ensures against the final one, and
- * old(a.x) reads the initial heap — the classic two-state encoding.
- *
- * Level 3: a `modifies(a, b)` contract restricts which roots may be written;
- * an undeclared write is reported as a violation.
+ * Level 3: a `modifies(a, b)` contract restricts writable base roots.
  */
 export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationTask[] {
   const steps = ir.heapSteps ?? []
@@ -37,20 +36,32 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   for (const step of steps) if (step.kind === 'field-write') rootNames.add(resolveAlias(step.root, aliasOf))
   for (const name of rootNames) refs.set(name, ctx.Int.const(name))
 
-  // ── Fields: collect every field mentioned in steps and contracts ─────────
+  const NULL_REF = ctx.Int.val(0)
+
+  // ── Collect fields and infer their sorts (pointer vs numeric) ────────────
   const fields = new Set<string>()
-  for (const step of steps) {
-    if (step.kind === 'field-write') fields.add(step.field)
-    if (step.kind !== 'alias') collectFields(step.value, fields, refs, aliasOf)
-  }
+  const contractPredicates: Expr[] = []
   for (const c of ir.contracts) {
-    if ('predicate' in c && typeof c.predicate === 'object') collectFields(c.predicate as Expr, fields, refs, aliasOf)
+    if ('predicate' in c && typeof c.predicate === 'object') contractPredicates.push(c.predicate as Expr)
   }
+  for (const step of steps) {
+    if (step.kind === 'field-write') {
+      fields.add(step.field)
+      collectFields(step.object, fields)
+      collectFields(step.value, fields)
+    } else if (step.kind === 'local') {
+      collectFields(step.value, fields)
+    }
+  }
+  for (const p of contractPredicates) collectFields(p, fields)
+
+  const refFields = inferRefFields(steps, contractPredicates, rootNames, aliasOf)
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const initialHeap = new Map<string, any>()
   for (const f of fields) {
-    initialHeap.set(f, ctx.Array.const(`__heap_${f}`, ctx.Int.sort(), ctx.Real.sort()))
+    const range = refFields.has(f) ? ctx.Int.sort() : ctx.Real.sort()
+    initialHeap.set(f, ctx.Array.const(`__heap_${f}`, ctx.Int.sort(), range))
   }
 
   // Numeric parameters (non-root) as Real constants
@@ -70,22 +81,19 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
       case 'literal':
         if (typeof expr.value === 'number') return ctx.Real.val(expr.value)
         if (typeof expr.value === 'boolean') return ctx.Bool.val(expr.value)
+        if (expr.value === null) return NULL_REF
         return null
       case 'ident': {
+        if (expr.name === 'null') return NULL_REF
         const resolved = resolveAlias(expr.name, aliasOf)
         return env.locals.get(expr.name) ?? refs.get(resolved) ?? numericVars.get(expr.name) ?? null
       }
       case 'member': {
-        if (expr.object.kind === 'ident') {
-          const root = resolveAlias(expr.object.name, aliasOf)
-          const ref = refs.get(root)
-          const heap = env.heap.get(expr.property)
-          if (ref !== undefined && heap !== undefined) {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
-            return heap.select(ref)
-          }
-        }
-        return null
+        const objRef = translate(expr.object, env, oldEnv)
+        const heap = env.heap.get(expr.property)
+        if (objRef === null || heap === undefined) return null
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+        return heap.select(objRef)
       }
       case 'unary': {
         const operand = translate(expr.operand, env, oldEnv)
@@ -100,21 +108,23 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         if (l === null || r === null) return null
         const a = l as Arith<'main'>
         const b = r as Arith<'main'>
-        switch (expr.op) {
-          case '+': return a.add(b)
-          case '-': return a.sub(b)
-          case '*': return a.mul(b)
-          case '/': return a.div(b)
-          case '===': return a.eq(b)
-          case '!==': return ctx.Not(a.eq(b))
-          case '<': return a.lt(b)
-          case '<=': return a.le(b)
-          case '>': return a.gt(b)
-          case '>=': return a.ge(b)
-          case '&&': return ctx.And(l as Bool<'main'>, r as Bool<'main'>)
-          case '||': return ctx.Or(l as Bool<'main'>, r as Bool<'main'>)
-          default: return null
-        }
+        try {
+          switch (expr.op) {
+            case '+': return a.add(b)
+            case '-': return a.sub(b)
+            case '*': return a.mul(b)
+            case '/': return a.div(b)
+            case '===': return a.eq(b)
+            case '!==': return ctx.Not(a.eq(b))
+            case '<': return a.lt(b)
+            case '<=': return a.le(b)
+            case '>': return a.gt(b)
+            case '>=': return a.ge(b)
+            case '&&': return ctx.And(l as Bool<'main'>, r as Bool<'main'>)
+            case '||': return ctx.Or(l as Bool<'main'>, r as Bool<'main'>)
+            default: return null
+          }
+        } catch { return null /* sort mismatch (Int ref vs Real) */ }
       }
       case 'ternary': {
         const c = translate(expr.condition, env, oldEnv)
@@ -148,9 +158,13 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
   const oldEnv: Env = { heap: initialHeap, locals: new Map() }
 
-  // ── Requires: hold in the initial state ──────────────────────────────────
+  // ── Requires: hold in the initial state; named roots are non-null ────────
   const assumptions: Bool<'main'>[] = []
   const assumptionLabels: string[] = []
+  for (const [name, ref] of refs) {
+    assumptions.push(ref.gt(NULL_REF))
+    assumptionLabels.push(`${name} is a live reference`)
+  }
   for (const c of ir.contracts) {
     if (c.kind !== 'requires' || typeof c.predicate === 'string') continue
     const z3 = translate(c.predicate, oldEnv, oldEnv)
@@ -174,28 +188,28 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
       if (v !== null) env.locals.set(step.name, v)
       continue
     }
-    // field-write
-    const root = resolveAlias(step.root, aliasOf)
-    const ref = refs.get(root)
+    // field-write (possibly through a pointer path)
+    const target = translate(step.object, env, oldEnv)
     const heap = env.heap.get(step.field)
     const value = translate(step.value, env, oldEnv)
-    if (ref === undefined || heap === undefined || value === null) continue
+    if (target === null || heap === undefined || value === null) continue
 
-    // Level 3: framing — undeclared writes are contract violations
+    // Level 3: framing — undeclared BASE roots are contract violations
+    const root = resolveAlias(step.root, aliasOf)
     if (allowedWrites !== null && !allowedWrites.has(root)) {
       tasks.push({
         functionName: ir.name,
-        contractText: `modifies violation: writes ${step.root}.${step.field}, not declared in modifies(${[...allowedWrites].join(', ')})`,
+        contractText: `modifies violation: writes through ${step.root} (${prettyExpr(step.object)}.${step.field}), not declared in modifies(${[...allowedWrites].join(', ')})`,
         variables: new Map(refs as unknown as Map<string, AnyExpr<'main'>>),
         assumptions: [],
         assumptionLabels: [],
-        goal: ctx.Bool.val(true),  // unconditionally violated
+        goal: ctx.Bool.val(true),
         domainConstraints: [],
       })
     }
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
-    env.heap.set(step.field, heap.store(ref, value))
+    env.heap.set(step.field, heap.store(target, value))
   }
 
   // ── Ensures: hold in the final state ─────────────────────────────────────
@@ -231,20 +245,80 @@ function resolveAlias(name: string, aliasOf: Map<string, string>): string {
   return current
 }
 
-function collectFields(expr: Expr, fields: Set<string>, refs: Map<string, unknown>, aliasOf: Map<string, string>): void {
+/**
+ * Field-sort inference to a fixpoint: a field is a POINTER field when it is
+ * dereferenced (appears as the object of another member access), assigned
+ * null or a reference expression, or equality-compared against one.
+ */
+function inferRefFields(
+  steps: FunctionIR['heapSteps'] & object,
+  predicates: Expr[],
+  roots: Set<string>,
+  aliasOf: Map<string, string>,
+): Set<string> {
+  const refFields = new Set<string>()
+
+  const isRefExpr = (e: Expr): boolean => {
+    if (e.kind === 'literal' && e.value === null) return true
+    if (e.kind === 'ident') {
+      return e.name === 'null' || roots.has(resolveAlias(e.name, aliasOf))
+    }
+    if (e.kind === 'member') return refFields.has(e.property)
+    return false
+  }
+
+  const walk = (e: Expr): void => {
+    switch (e.kind) {
+      case 'member':
+        // x.f.g — f is dereferenced, so f is a pointer field
+        if (e.object.kind === 'member') refFields.add(e.object.property)
+        walk(e.object)
+        break
+      case 'binary':
+        if ((e.op === '===' || e.op === '!==')) {
+          if (e.left.kind === 'member' && isRefExpr(e.right)) refFields.add(e.left.property)
+          if (e.right.kind === 'member' && isRefExpr(e.left)) refFields.add(e.right.property)
+        }
+        walk(e.left); walk(e.right)
+        break
+      case 'unary': walk(e.operand); break
+      case 'ternary': walk(e.condition); walk(e.then); walk(e.else); break
+      case 'call': for (const a of e.args) walk(a); break
+      default: break
+    }
+  }
+
+  // Two passes reach the fixpoint for practical chains
+  for (let pass = 0; pass < 2; pass++) {
+    for (const step of steps) {
+      if (step.kind === 'field-write') {
+        if (isRefExpr(step.value)) refFields.add(step.field)
+        if (step.object.kind === 'member') refFields.add(step.object.property)
+        walk(step.object); walk(step.value)
+      } else if (step.kind === 'local') {
+        walk(step.value)
+      }
+    }
+    for (const p of predicates) walk(p)
+  }
+
+  return refFields
+}
+
+function collectFields(expr: Expr, fields: Set<string>): void {
   switch (expr.kind) {
     case 'member':
-      if (expr.object.kind === 'ident') fields.add(expr.property)
-      else collectFields(expr.object, fields, refs, aliasOf)
+      fields.add(expr.property)
+      collectFields(expr.object, fields)
       break
     case 'binary':
-      collectFields(expr.left, fields, refs, aliasOf); collectFields(expr.right, fields, refs, aliasOf); break
+      collectFields(expr.left, fields); collectFields(expr.right, fields); break
     case 'unary':
-      collectFields(expr.operand, fields, refs, aliasOf); break
+      collectFields(expr.operand, fields); break
     case 'ternary':
-      collectFields(expr.condition, fields, refs, aliasOf); collectFields(expr.then, fields, refs, aliasOf); collectFields(expr.else, fields, refs, aliasOf); break
+      collectFields(expr.condition, fields); collectFields(expr.then, fields); collectFields(expr.else, fields); break
     case 'call':
-      for (const a of expr.args) collectFields(a, fields, refs, aliasOf); break
+      for (const a of expr.args) collectFields(a, fields); break
     default:
       break
   }
