@@ -170,3 +170,13 @@ export type HeapStep =
     }
   /** A `return` statement — executions reaching it stop (no further writes). */
   | { kind: 'exit' }
+  /** Assignment to a numeric variable (loop counters etc.). */
+  | { kind: 'num-assign'; name: string; value: Expr }
+  /** A while loop verified via havoc + invariant (entry/preservation/post). */
+  | {
+      kind: 'loop'
+      condition: Expr
+      invariants: Expr[]
+      decreases?: Expr | undefined
+      body: HeapStep[]
+    }

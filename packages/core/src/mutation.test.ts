@@ -481,6 +481,73 @@ describe('ownership footprints (F5)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F6: loops over the heap (havoc + invariant)
+// ---------------------------------------------------------------------------
+
+describe('heap loops (F6)', () => {
+  const source = `
+    interface Acc { value: number }
+    export function drainSlowly(acc: Acc, n: number): void {
+      requires(nonNegative(acc.value))
+      requires(nonNegative(n))
+      ensures(nonNegative(acc.value))
+      while (n > 0) {
+        invariant(() => acc.value >= 0)
+        decreases(() => n)
+        if (acc.value >= 1) {
+          acc.value = acc.value - 1
+        }
+        n = n - 1
+      }
+    }
+    export function drainBuggy(acc: Acc, n: number): void {
+      requires(nonNegative(acc.value))
+      requires(nonNegative(n))
+      ensures(nonNegative(acc.value))
+      while (n > 0) {
+        invariant(() => acc.value >= 0)
+        decreases(() => n)
+        acc.value = acc.value - 1
+        n = n - 1
+      }
+    }
+    export function spinForever(acc: Acc, n: number): void {
+      requires(nonNegative(acc.value))
+      requires(nonNegative(n))
+      ensures(nonNegative(acc.value))
+      while (n > 0) {
+        invariant(() => acc.value >= 0)
+        decreases(() => n)
+        acc.value = acc.value + 1
+      }
+    }
+  `
+
+  test('guarded heap loop: entry, preservation, termination, ensures all prove', async () => {
+    const results = await verifyAll(source)
+    const mine = results.filter(x => x.fn === 'drainSlowly')
+    assert.ok(mine.length >= 4, `Expected ≥4 obligations, got ${mine.length}`)
+    for (const r of mine) {
+      assert.strictEqual(r.status, 'proved', `${r.text}`)
+    }
+  })
+
+  test('unguarded decrement fails invariant preservation', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'drainBuggy' && x.text.includes('preserved'))
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+
+  test('non-decreasing measure fails termination', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'spinForever' && x.text.includes('decrease'))
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 

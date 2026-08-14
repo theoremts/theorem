@@ -922,6 +922,13 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
             continue
           }
         }
+        // Numeric assignment (loop counters): n = n - 1
+        if (Node.isIdentifier(left)) {
+          const value = parseExpr(expr.getRight() as Expression)
+          if (value === null) return null
+          steps.push({ kind: 'num-assign', name: left.getText(), value })
+          continue
+        }
       }
       return null
     }
@@ -961,6 +968,47 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
       continue
     }
 
+    // While loops (top-level only): invariant()/decreases() statements in the
+    // body are the loop's contracts; the rest is the heap-mutating body
+    if (Node.isWhileStatement(s) && topLevel) {
+      const condition = parseExpr(s.getExpression() as Expression)
+      if (condition === null) return null
+
+      const bodyStmts = blockStatements(s.getStatement())
+      const invariants: Expr[] = []
+      let decreasesExpr: Expr | undefined
+      const codeStmts: Statement[] = []
+      for (const bs of bodyStmts) {
+        if (Node.isExpressionStatement(bs)) {
+          const e = bs.getExpression()
+          if (Node.isCallExpression(e)) {
+            const callee = e.getExpression().getText()
+            if (callee === 'invariant' || callee === 'decreases') {
+              const arg = e.getArguments()[0]
+              let pred: Expr | null = null
+              if (arg !== undefined && Node.isArrowFunction(arg)) {
+                const body = arg.getBody()
+                if (Node.isExpression(body)) pred = parseExpr(body as Expression)
+              } else if (arg !== undefined) {
+                pred = parseExpr(arg as Expression)
+              }
+              if (pred !== null) {
+                if (callee === 'invariant') invariants.push(pred)
+                else decreasesExpr = pred
+              }
+              continue
+            }
+          }
+        }
+        codeStmts.push(bs)
+      }
+
+      const body = extractHeapStmtList(codeStmts, false)
+      if (body === null || invariants.length === 0) return null
+      steps.push({ kind: 'loop', condition, invariants, decreases: decreasesExpr, body })
+      continue
+    }
+
     return null
   }
 
@@ -975,7 +1023,8 @@ function blockStatements(node: Node): Statement[] {
 function hasFieldWrite(steps: HeapStep[]): boolean {
   return steps.some(s =>
     s.kind === 'field-write' ||
-    (s.kind === 'branch' && (hasFieldWrite(s.then) || hasFieldWrite(s.else))))
+    (s.kind === 'branch' && (hasFieldWrite(s.then) || hasFieldWrite(s.else))) ||
+    (s.kind === 'loop' && hasFieldWrite(s.body)))
 }
 
 function collectHeapRoots(steps: HeapStep[], roots: Set<string>): void {
@@ -990,6 +1039,12 @@ function collectHeapRoots(steps: HeapStep[], roots: Set<string>): void {
       collectMemberRoots(s.condition, roots)
       collectHeapRoots(s.then, roots)
       collectHeapRoots(s.else, roots)
+    } else if (s.kind === 'loop') {
+      collectMemberRoots(s.condition, roots)
+      for (const inv of s.invariants) collectMemberRoots(inv, roots)
+      collectHeapRoots(s.body, roots)
+    } else if (s.kind === 'num-assign') {
+      collectMemberRoots(s.value, roots)
     }
   }
 }
@@ -1003,6 +1058,12 @@ function walkHeapExprs(steps: HeapStep[], visit: (e: Expr) => void): void {
       walkHeapExprs(s.then, visit)
       walkHeapExprs(s.else, visit)
     }
+    else if (s.kind === 'loop') {
+      visit(s.condition)
+      for (const inv of s.invariants) visit(inv)
+      walkHeapExprs(s.body, visit)
+    }
+    else if (s.kind === 'num-assign') visit(s.value)
   }
 }
 

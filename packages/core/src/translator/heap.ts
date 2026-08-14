@@ -109,6 +109,13 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         collectFields(step.condition, fields)
         collectStepFields(step.then)
         collectStepFields(step.else)
+      } else if (step.kind === 'loop') {
+        collectFields(step.condition, fields)
+        for (const inv of step.invariants) collectFields(inv, fields)
+        if (step.decreases !== undefined) collectFields(step.decreases, fields)
+        collectStepFields(step.body)
+      } else if (step.kind === 'num-assign') {
+        collectFields(step.value, fields)
       }
     }
   }
@@ -135,6 +142,8 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     heap: Map<string, any>
     locals: Map<string, AnyExpr<'main'>>
+    /** Mutable numeric variables (loop counters) — override numericVars. */
+    nums: Map<string, AnyExpr<'main'>>
     /** Heap version tag — spec UFs are distinct per version (@pre/@post). */
     tag: 'pre' | 'post'
   }
@@ -148,6 +157,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     for (const s of list) {
       if (s.kind === 'field-write') writtenFields.add(s.field)
       else if (s.kind === 'branch') { collectWritten(s.then); collectWritten(s.else) }
+      else if (s.kind === 'loop') collectWritten(s.body)
     }
   }
   collectWritten(steps)
@@ -201,7 +211,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
       case 'ident': {
         if (expr.name === 'null') return NULL_REF
         const resolved = resolveAlias(expr.name, aliasOf)
-        return env.locals.get(expr.name) ?? refs.get(resolved) ?? numericVars.get(expr.name) ?? null
+        return env.locals.get(expr.name) ?? env.nums.get(expr.name) ?? refs.get(resolved) ?? numericVars.get(expr.name) ?? null
       }
       case 'member': {
         const objRef = translate(expr.object, env, oldEnv)
@@ -297,7 +307,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
 
-  const oldEnv: Env = { heap: initialHeap, locals: new Map(), tag: 'pre' }
+  const oldEnv: Env = { heap: initialHeap, locals: new Map(), nums: new Map(), tag: 'pre' }
 
   // ── Requires: hold in the initial state; named roots are non-null ────────
   const assumptions: Bool<'main'>[] = []
@@ -329,13 +339,59 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   // Sequential processing composes correctly — a then-branch mutation read
   // from the else-branch resolves to the original value because its ITE
   // guard is false there. Early returns clear `alive` for their paths.
-  const env: Env = { heap: new Map(initialHeap), locals: new Map(), tag: 'post' }
+  const env: Env = { heap: new Map(initialHeap), locals: new Map(), nums: new Map(), tag: 'post' }
   const modifiesContract = ir.contracts.find(c => c.kind === 'modifies')
   const allowedWrites = modifiesContract !== undefined
     ? new Set((modifiesContract as { refs: string[] }).refs.map(r => resolveAlias(r, aliasOf)))
     : null
 
   let alive: Bool<'main'> = ctx.Bool.val(true)
+  let loopCounter = 0
+
+  const taskVariables = (): Map<string, AnyExpr<'main'>> => {
+    const m = new Map<string, AnyExpr<'main'>>()
+    for (const [name, ref] of refs) m.set(name, ref as unknown as AnyExpr<'main'>)
+    for (const [name, v] of numericVars) m.set(name, v)
+    return m
+  }
+
+  /** Executes one loop-body iteration against the given (havoced) env. */
+  const runLoopBody = (list: typeof steps, bodyEnv: Env, pc: Bool<'main'> | null): void => {
+    for (const s of list) {
+      if (s.kind === 'local') {
+        const v = translate(s.value, bodyEnv, oldEnv)
+        if (v !== null) bodyEnv.locals.set(s.name, v)
+        continue
+      }
+      if (s.kind === 'num-assign') {
+        const v = translate(s.value, bodyEnv, oldEnv)
+        if (v !== null) {
+          const prev = bodyEnv.nums.get(s.name) ?? numericVars.get(s.name)
+          const guarded = pc === null || prev === undefined ? v : ctx.If(pc, v, prev)
+          bodyEnv.nums.set(s.name, guarded)
+        }
+        continue
+      }
+      if (s.kind === 'branch') {
+        const condZ3 = translate(s.condition, bodyEnv, oldEnv)
+        const cond = condZ3 !== null ? condZ3 as Bool<'main'> : ctx.Bool.const(`__lcond_${loopCounter}_${list.indexOf(s)}`)
+        runLoopBody(s.then, bodyEnv, pc === null ? cond : ctx.And(pc, cond))
+        runLoopBody(s.else, bodyEnv, pc === null ? ctx.Not(cond) : ctx.And(pc, ctx.Not(cond)))
+        continue
+      }
+      if (s.kind === 'field-write') {
+        const target = translate(s.object, bodyEnv, oldEnv)
+        const heap = bodyEnv.heap.get(s.field)
+        const value = translate(s.value, bodyEnv, oldEnv)
+        if (target === null || heap === undefined || value === null) continue
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+        const stored = heap.store(target, value)
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        bodyEnv.heap.set(s.field, pc === null ? stored : ctx.If(pc, stored, heap))
+        continue
+      }
+    }
+  }
 
   const processSteps = (list: import('../parser/ir.js').HeapStep[], pc: Bool<'main'> | null): void => {
     for (const step of list) {
@@ -349,6 +405,143 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
       if (step.kind === 'exit') {
         alive = pc === null ? ctx.Bool.val(false) : ctx.And(alive, ctx.Not(pc))
+        continue
+      }
+
+      if (step.kind === 'num-assign') {
+        const v = translate(step.value, env, oldEnv)
+        if (v !== null) env.nums.set(step.name, v)
+        continue
+      }
+
+      if (step.kind === 'loop') {
+        // ── F6: havoc + invariant ────────────────────────────────────────
+        // 1. ENTRY: invariants must hold on the state reaching the loop
+        for (const inv of step.invariants) {
+          const invZ3 = translate(inv, env, oldEnv)
+          if (invZ3 === null) continue
+          tasks.push({
+            functionName: ir.name,
+            contractText: `loop invariant (entry): ${prettyExpr(inv)}`,
+            variables: taskVariables(),
+            assumptions: [...assumptions],
+            assumptionLabels: [...assumptionLabels],
+            goal: ctx.Not(invZ3 as Bool<'main'>),
+            domainConstraints: [],
+          })
+        }
+
+        // State the loop may modify: fields written + numerics assigned
+        const loopFields = new Set<string>()
+        const loopNums = new Set<string>()
+        const scanBody = (list: typeof steps): void => {
+          for (const s of list) {
+            if (s.kind === 'field-write') loopFields.add(s.field)
+            else if (s.kind === 'num-assign') loopNums.add(s.name)
+            else if (s.kind === 'branch') { scanBody(s.then); scanBody(s.else) }
+          }
+        }
+        scanBody(step.body)
+
+        // 2. PRESERVATION: fresh (havoced) state, assume invariants +
+        //    condition, run the body, prove invariants again
+        const freshEnv: Env = {
+          heap: new Map(env.heap), locals: new Map(env.locals),
+          nums: new Map(env.nums), tag: env.tag,
+        }
+        for (const f of loopFields) {
+          const range = refFields.has(f) ? ctx.Int.sort() : ctx.Real.sort()
+          freshEnv.heap.set(f, ctx.Array.const(`__heap_${f}_iter${loopCounter}`, ctx.Int.sort(), range))
+        }
+        for (const n of loopNums) {
+          freshEnv.nums.set(n, ctx.Real.const(`${n}_iter${loopCounter}`))
+        }
+
+        const iterAssumptions: Bool<'main'>[] = [...assumptions]
+        const iterLabels: string[] = [...assumptionLabels]
+        for (const inv of step.invariants) {
+          const invZ3 = translate(inv, freshEnv, oldEnv)
+          if (invZ3 !== null) {
+            iterAssumptions.push(invZ3 as Bool<'main'>)
+            iterLabels.push(`loop invariant: ${prettyExpr(inv)}`)
+          }
+        }
+        const condFresh = translate(step.condition, freshEnv, oldEnv)
+        if (condFresh !== null) {
+          iterAssumptions.push(condFresh as Bool<'main'>)
+          iterLabels.push(`loop condition: ${prettyExpr(step.condition)}`)
+        }
+
+        const measureBefore = step.decreases !== undefined ? translate(step.decreases, freshEnv, oldEnv) : null
+
+        // Execute one iteration of the body against the fresh state
+        const bodyEnv: Env = {
+          heap: new Map(freshEnv.heap), locals: new Map(freshEnv.locals),
+          nums: new Map(freshEnv.nums), tag: freshEnv.tag,
+        }
+        runLoopBody(step.body, bodyEnv, null)
+
+        for (const inv of step.invariants) {
+          const invZ3 = translate(inv, bodyEnv, oldEnv)
+          if (invZ3 === null) continue
+          tasks.push({
+            functionName: ir.name,
+            contractText: `loop invariant (preserved): ${prettyExpr(inv)}`,
+            variables: taskVariables(),
+            assumptions: iterAssumptions,
+            assumptionLabels: iterLabels,
+            goal: ctx.Not(invZ3 as Bool<'main'>),
+            domainConstraints: [],
+          })
+        }
+
+        // Termination: measure bounded below and strictly decreasing
+        if (step.decreases !== undefined && measureBefore !== null) {
+          tasks.push({
+            functionName: ir.name,
+            contractText: `loop bound: ${prettyExpr(step.decreases)} >= 0`,
+            variables: taskVariables(),
+            assumptions: iterAssumptions,
+            assumptionLabels: iterLabels,
+            goal: ctx.Not((measureBefore as Arith<'main'>).ge(ctx.Real.val(0))),
+            domainConstraints: [],
+          })
+          const measureAfter = translate(step.decreases, bodyEnv, oldEnv)
+          if (measureAfter !== null) {
+            tasks.push({
+              functionName: ir.name,
+              contractText: `loop decrease: ${prettyExpr(step.decreases)} strictly decreases`,
+              variables: taskVariables(),
+              assumptions: iterAssumptions,
+              assumptionLabels: iterLabels,
+              goal: ctx.Not((measureAfter as Arith<'main'>).lt(measureBefore as Arith<'main'>)),
+              domainConstraints: [],
+            })
+          }
+        }
+
+        // 3. POST-LOOP: continue with fresh state where invariants hold and
+        //    the condition is false
+        for (const f of loopFields) {
+          const range = refFields.has(f) ? ctx.Int.sort() : ctx.Real.sort()
+          env.heap.set(f, ctx.Array.const(`__heap_${f}_post${loopCounter}`, ctx.Int.sort(), range))
+        }
+        for (const n of loopNums) {
+          env.nums.set(n, ctx.Real.const(`${n}_post${loopCounter}`))
+        }
+        for (const inv of step.invariants) {
+          const invZ3 = translate(inv, env, oldEnv)
+          if (invZ3 !== null) {
+            assumptions.push(invZ3 as Bool<'main'>)
+            assumptionLabels.push(`post-loop invariant: ${prettyExpr(inv)}`)
+          }
+        }
+        const condPost = translate(step.condition, env, oldEnv)
+        if (condPost !== null) {
+          assumptions.push(ctx.Not(condPost as Bool<'main'>))
+          assumptionLabels.push(`post-loop: !(${prettyExpr(step.condition)})`)
+        }
+        loopCounter++
         continue
       }
 
@@ -577,6 +770,12 @@ function inferRefFields(
         walk(step.condition)
         walkSteps(step.then)
         walkSteps(step.else)
+      } else if (step.kind === 'loop') {
+        walk(step.condition)
+        for (const inv of step.invariants) walk(inv)
+        walkSteps(step.body)
+      } else if (step.kind === 'num-assign') {
+        walk(step.value)
       }
     }
   }
