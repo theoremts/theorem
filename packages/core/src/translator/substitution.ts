@@ -146,7 +146,7 @@ function substituteRaw(expr: Expr, mapping: Map<string, Expr>): Expr {
       const inner = mapping.has(expr.param) ? new Map(mapping) : mapping
       if (inner !== mapping) inner.delete(expr.param)
       const body = substituteExpr(expr.body, inner)
-      return body === expr.body ? expr : { kind: 'quantifier', quantifier: expr.quantifier, param: expr.param, body }
+      return body === expr.body ? expr : { kind: 'quantifier', quantifier: expr.quantifier, param: expr.param, sort: expr.sort, body }
     }
 
     case 'array': {

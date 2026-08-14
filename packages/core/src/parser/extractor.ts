@@ -448,7 +448,7 @@ function extractDecoratedMethods(
         // its exit-state invariant obligation would be checked against the
         // ENTRY state, proving trivially even for bodies that break it.
         if (fnBody.getDescendantsOfKind(SyntaxKind.WhileStatement).length > 0) {
-          const steps = extractHeapStmtList(fnBody.getStatements(), true)
+          const steps = extractHeapStmtList(fnBody.getStatements(), 'top')
           if (steps !== null && steps.some(st => st.kind === 'loop')) {
             heapSteps = steps
             heapRoots = collectAllHeapRoots(steps, [
@@ -895,14 +895,25 @@ function tryExtractHeapSteps(
       if (!Node.isBinaryExpression(bin) || bin.getOperatorToken().getText() !== '=') continue
       const left = bin.getLeft()
       if (Node.isPropertyAccessExpression(left)) {
-        const base = memberChainBase(left)
+        const base = writeBase(left)
         if (base !== null && base !== 'this') allWrites.push(left.getText())
       }
     }
   }
-  if (allWrites.length === 0) return null
+  if (allWrites.length === 0) {
+    // No field writes — but a while loop (honest havoc machinery) or an
+    // array sort (havoc + sortedness assumption) still needs heap mode.
+    const hasWhile = stmts.some(s => Node.isWhileStatement(s))
+    const hasSort = stmts.some(s =>
+      Node.isExpressionStatement(s) && matchSortCall(s.getExpression()) !== null)
+    if (!hasWhile && !hasSort) return null
+    const extracted = extractHeapStmtList(stmts, 'top')
+    if (extracted === null) return null
+    if (!extracted.some(st => st.kind === 'loop' || st.kind === 'array-sort')) return null
+    return { steps: extracted, roots: collectAllHeapRoots(extracted, contracts) }
+  }
 
-  const extracted = extractHeapStmtList(stmts, true)
+  const extracted = extractHeapStmtList(stmts, 'top')
   if (extracted === null || !hasFieldWrite(extracted)) return { unsupported: allWrites }
   const steps = extracted
 
@@ -930,7 +941,8 @@ function collectAllHeapRoots(steps: HeapStep[], contracts: Contract[]): string[]
 }
 
 /** Recursively extracts heap steps from a statement list; null = unsupported. */
-function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] | null {
+function extractHeapStmtList(stmts: Statement[], context: 'top' | 'loop' | 'branch'): HeapStep[] | null {
+  const topLevel = context === 'top'
   const steps: HeapStep[] = []
 
   for (const s of stmts) {
@@ -949,7 +961,15 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
 
     if (Node.isExpressionStatement(s)) {
       const expr = s.getExpression()
-      if (Node.isCallExpression(expr)) continue  // check/assume — positional contracts
+      if (Node.isCallExpression(expr)) {
+        const sort = matchSortCall(expr)
+        if (sort !== null) {
+          // Sorting inside a branch/loop would need path-conditioned havoc
+          if (!topLevel) return null
+          steps.push({ kind: 'array-sort', name: sort.name, sorted: sort.sorted })
+        }
+        continue  // other calls: check/assume — positional contracts
+      }
       if (Node.isBinaryExpression(expr)) {
         const opText = expr.getOperatorToken().getText()
         const compound =
@@ -960,7 +980,7 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
           const rhs = parseExpr(expr.getRight() as Expression)
           if (rhs === null) return null
           if (Node.isPropertyAccessExpression(left)) {
-            const base = memberChainBase(left)
+            const base = writeBase(left)
             if (base !== null && base !== 'this') {
               const objectExpr = parseExpr(left.getExpression() as Expression)
               const current = parseExpr(left as Expression)
@@ -1018,13 +1038,17 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
     }
 
     if (Node.isVariableStatement(s)) {
-      if (!topLevel) return null  // branch-local consts: deferred
+      if (context === 'branch') return null  // branch-local consts: deferred
       const isConst = String(s.getDeclarationKind()) === 'const'
       for (const decl of s.getDeclarations()) {
         const init = decl.getInitializer()
         if (!init) return null
         if (Node.isIdentifier(init)) {
-          steps.push({ kind: 'alias', name: decl.getName(), of: init.getText() })
+          // Loop-body scope: alias resolution is static and scans only
+          // top-level steps — bind as a local value instead
+          steps.push(context === 'loop'
+            ? { kind: 'local', name: decl.getName(), value: { kind: 'ident', name: init.getText() } }
+            : { kind: 'alias', name: decl.getName(), of: init.getText() })
           continue
         }
         const value = parseExpr(init as Expression)
@@ -1042,14 +1066,14 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
     if (Node.isIfStatement(s)) {
       const condition = parseExpr(s.getExpression() as Expression)
       if (condition === null) return null
-      const thenSteps = extractHeapStmtList(blockStatements(s.getThenStatement()), false)
+      const thenSteps = extractHeapStmtList(blockStatements(s.getThenStatement()), 'branch')
       if (thenSteps === null) return null
       let elseSteps: HeapStep[] = []
       const elseNode = s.getElseStatement()
       if (elseNode !== undefined) {
         const extracted = extractHeapStmtList(
           Node.isIfStatement(elseNode) ? [elseNode] : blockStatements(elseNode),
-          false,
+          'branch',
         )
         if (extracted === null) return null
         elseSteps = extracted
@@ -1093,7 +1117,7 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
         codeStmts.push(bs)
       }
 
-      const body = extractHeapStmtList(codeStmts, false)
+      const body = extractHeapStmtList(codeStmts, 'loop')
       if (body === null || invariants.length === 0) return null
       steps.push({ kind: 'loop', condition, invariants, decreases: decreasesExpr, body })
       continue
@@ -1233,6 +1257,64 @@ function isBooleanBody(expr: Expr): boolean {
 }
 
 /** Base identifier of a member chain (`a.next.prev` → 'a'), or null. */
+/**
+ * Detects `X.sort()` / `X.sort((a, b) => a - b)` on a bare identifier.
+ * `sorted` is true ONLY for the ascending-numeric comparator — JS's bare
+ * .sort() is lexicographic ([10, 9].sort() is NOT numerically sorted).
+ */
+function matchSortCall(expr: Expression): { name: string; sorted: boolean } | null {
+  if (!Node.isCallExpression(expr)) return null
+  const callee = expr.getExpression()
+  if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== 'sort') return null
+  let base: Node = callee.getExpression()
+  while (Node.isNonNullExpression(base) || Node.isParenthesizedExpression(base) || Node.isAsExpression(base)) {
+    base = base.getExpression()
+  }
+  if (!Node.isIdentifier(base)) return null
+  const name = base.getText()
+  const args = expr.getArguments()
+  if (args.length === 0) return { name, sorted: false }
+  const cmp = args[0]
+  if (args.length === 1 && Node.isArrowFunction(cmp)) {
+    const params = cmp.getParameters()
+    const body = cmp.getBody()
+    if (params.length === 2 && Node.isExpression(body)) {
+      const [a, b] = [params[0]!.getName(), params[1]!.getName()]
+      const text = body.getText().replace(/[\s()]/g, '')
+      if (text === `${a}-${b}`) return { name, sorted: true }
+    }
+  }
+  return { name, sorted: false }
+}
+
+/**
+ * Root name of a field-write target: the base identifier of the member
+ * chain, `'this'`, or the ARRAY name when the chain starts from an element
+ * access (`users[k].balance = v` → 'users').
+ */
+function writeBase(left: Expression): string | null {
+  let current: Node = left
+  for (;;) {
+    if (Node.isPropertyAccessExpression(current)) { current = current.getExpression(); continue }
+    // users[0]!.balance / (users[0] as Account).balance — unwrap wrappers
+    if (Node.isNonNullExpression(current) || Node.isParenthesizedExpression(current) || Node.isAsExpression(current)) {
+      current = current.getExpression()
+      continue
+    }
+    break
+  }
+  if (Node.isIdentifier(current)) return current.getText()
+  if (current.getKind() === SyntaxKind.ThisKeyword) return 'this'
+  if (Node.isElementAccessExpression(current)) {
+    let base: Node = current.getExpression()
+    while (Node.isNonNullExpression(base) || Node.isParenthesizedExpression(base) || Node.isAsExpression(base)) {
+      base = base.getExpression()
+    }
+    return Node.isIdentifier(base) ? base.getText() : null
+  }
+  return null
+}
+
 function memberChainBase(node: Expression): string | null {
   let current: Node = node
   while (Node.isPropertyAccessExpression(current)) {
@@ -1614,6 +1696,12 @@ function tsTypeToSort(type: string): Sort {
 
   // Array types: number[], Array<number>, etc.
   if (trimmed === 'number[]' || trimmed === 'Array<number>') return 'array'
+
+  // Arrays of objects: Account[], Array<Node> — arrays of REFERENCES
+  const refArr = trimmed.match(/^([A-Za-z_]\w*)\[\]$/) ?? trimmed.match(/^Array<([A-Za-z_]\w*)>$/)
+  if (refArr && !['number', 'string', 'boolean', 'unknown', 'any', 'bigint'].includes(refArr[1]!)) {
+    return 'ref-array'
+  }
 
   // Set types: Set<number>
   if (trimmed === 'Set<number>') return 'set'

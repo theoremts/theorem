@@ -12,7 +12,7 @@ import type { VerificationTask } from '../translator/index.js'
 import { parseExpr } from '../parser/expr.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { substituteExpr, substituteOutput } from '../translator/substitution.js'
-import { makeConst } from '../translator/variables.js'
+import { makeConst, isArrayExpr } from '../translator/variables.js'
 import { toZ3 } from '../translator/expr.js'
 
 /**
@@ -59,7 +59,7 @@ export function extractCallSiteObligations(
     }
 
     // Collect variable assignments in scope before the call site (constant propagation)
-    const scopeAssignments = collectScopeAssignments(node)
+    const { assignments: scopeAssignments, sorts: scopeSorts } = collectScopeAssignments(node)
 
     // Collect path conditions — if-statement guards enclosing the call site
     const pathConditions = collectPathConditions(node)
@@ -84,6 +84,56 @@ export function extractCallSiteObligations(
       const assumptions: Bool<'main'>[] = []
       const assumptionLabels: string[] = []
       for (const [varName, valueExpr] of scopeAssignments) {
+        // Array literals can't be one Z3 equality, but they establish
+        // structural FACTS: exact length, element values, and — for object
+        // literals — pairwise-distinct fresh references. Without these,
+        // `users = [{...}, {...}]` right before the call would still be
+        // treated as an unknown array (a false positive on length/aliasing
+        // requires).
+        if (valueExpr.kind === 'array' && !valueExpr.elements.some(e => e.kind === 'spread')) {
+          const n = valueExpr.elements.length
+          const varIdent: Expr = { kind: 'ident', name: varName }
+          const at = (i: number): Expr => ({ kind: 'element-access', object: varIdent, index: { kind: 'literal', value: i } })
+          const facts: Expr[] = [{
+            kind: 'binary', op: '===',
+            left: { kind: 'member', object: varIdent, property: 'length' },
+            right: { kind: 'literal', value: n },
+          }]
+          valueExpr.elements.forEach((el, i) => {
+            if (el.kind === 'literal' && typeof el.value === 'number') {
+              facts.push({ kind: 'binary', op: '===', left: at(i), right: el })
+            }
+            if (el.kind === 'object') {
+              // Fresh object literals are distinct references
+              for (let j = i + 1; j < n; j++) {
+                if (valueExpr.elements[j]!.kind === 'object') {
+                  facts.push({ kind: 'binary', op: '!==', left: at(i), right: at(j) })
+                }
+              }
+              for (const prop of el.properties) {
+                if (prop.value.kind === 'literal' && typeof prop.value.value === 'number') {
+                  facts.push({
+                    kind: 'binary', op: '===',
+                    left: { kind: 'member', object: at(i), property: prop.key },
+                    right: prop.value,
+                  })
+                }
+              }
+            }
+          })
+          for (const fact of facts) {
+            collectAndCreateVars(fact, vars, ctx)
+            const factZ3 = toZ3(fact, vars, ctx)
+            if (factZ3) {
+              try {
+                assumptions.push(factZ3 as Bool<'main'>)
+                assumptionLabels.push(`scope: ${prettyExpr(fact)}`)
+              } catch { /* sort mismatch */ }
+            }
+          }
+          continue
+        }
+
         // Calls to contracted functions can't be encoded in Z3 directly.
         // Replace each one with a fresh variable constrained by the callee's
         // ensures (instantiated with the actual arguments), so that
@@ -110,6 +160,44 @@ export function extractCallSiteObligations(
             assumptions.push((varZ3 as any).eq(valZ3) as Bool<'main'>)
             assumptionLabels.push(`scope: ${varName} = ${prettyExpr(encodable)}`)
           } catch { /* sort mismatch */ }
+        }
+      }
+
+      // A preceding numeric sort establishes sortedness of that array —
+      // the trusted postcondition of Array.prototype.sort with (a, b) => a - b.
+      // Bare .sort() gets NOTHING: JS sorts lexicographically.
+      for (const srt of scopeSorts) {
+        if (!srt.numeric) continue
+        const qi = `__qs_${srt.name}_i`
+        const qj = `__qs_${srt.name}_j`
+        const arrIdent: Expr = { kind: 'ident', name: srt.name }
+        const at = (q: string): Expr => ({ kind: 'element-access', object: arrIdent, index: { kind: 'ident', name: q } })
+        const sortedFact: Expr = {
+          kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int',
+          body: {
+            kind: 'quantifier', quantifier: 'forall', param: qj, sort: 'int',
+            body: {
+              kind: 'binary', op: '==>',
+              left: {
+                kind: 'binary', op: '&&',
+                left: {
+                  kind: 'binary', op: '&&',
+                  left: { kind: 'binary', op: '>=', left: { kind: 'ident', name: qi }, right: { kind: 'literal', value: 0 } },
+                  right: { kind: 'binary', op: '<=', left: { kind: 'ident', name: qi }, right: { kind: 'ident', name: qj } },
+                },
+                right: { kind: 'binary', op: '<', left: { kind: 'ident', name: qj }, right: { kind: 'member', object: arrIdent, property: 'length' } },
+              },
+              right: { kind: 'binary', op: '<=', left: at(qi), right: at(qj) },
+            },
+          },
+        }
+        collectAndCreateVars(sortedFact, vars, ctx)
+        const sortedZ3 = toZ3(sortedFact, vars, ctx)
+        if (sortedZ3) {
+          try {
+            assumptions.push(sortedZ3 as Bool<'main'>)
+            assumptionLabels.push(`sort: ${srt.name} sorted ascending (numeric comparator)`)
+          } catch { /* skip */ }
         }
       }
 
@@ -169,6 +257,7 @@ export function extractCallSiteObligations(
         assumptionLabels,
         goal,
         domainConstraints: [],
+        sourcePos: { start: node.getStart(), length: node.getWidth() },
       })
     }
   }
@@ -295,8 +384,9 @@ function isInsideContractContext(node: Node): boolean {
  * Walks backwards through sibling statements and up through parent blocks.
  * Only collects simple literal or expression initializers — no complex patterns.
  */
-function collectScopeAssignments(callNode: Node): Map<string, Expr> {
+function collectScopeAssignments(callNode: Node): { assignments: Map<string, Expr>; sorts: Array<{ name: string; numeric: boolean }> } {
   const assignments = new Map<string, Expr>()
+  const sorts: Array<{ name: string; numeric: boolean }> = []
 
   // Walk up to find containing block/source file
   let current: Node | undefined = callNode
@@ -328,6 +418,13 @@ function collectScopeAssignments(callNode: Node): Map<string, Expr> {
         // Expression statement assignments: a = 5
         if (Node.isExpressionStatement(stmt)) {
           const expr = stmt.getExpression()
+          // X.sort(...): positions changed — prior content facts about X are
+          // stale (drop them); a numeric comparator establishes sortedness.
+          const sortCall = matchSortStatement(expr)
+          if (sortCall !== null) {
+            assignments.delete(sortCall.name)
+            sorts.push({ name: sortCall.name, numeric: sortCall.numeric })
+          }
           if (Node.isBinaryExpression(expr) && expr.getOperatorToken().getText() === '=') {
             const left = expr.getLeft()
             if (Node.isIdentifier(left)) {
@@ -344,7 +441,30 @@ function collectScopeAssignments(callNode: Node): Map<string, Expr> {
     current = parent
   }
 
-  return assignments
+  return { assignments, sorts }
+}
+
+/** Detects `X.sort()` / `X.sort((a, b) => a - b)` — see the extractor twin. */
+function matchSortStatement(expr: Node): { name: string; numeric: boolean } | null {
+  if (!Node.isCallExpression(expr)) return null
+  const callee = expr.getExpression()
+  if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== 'sort') return null
+  let base: Node = callee.getExpression()
+  while (Node.isNonNullExpression(base) || Node.isParenthesizedExpression(base) || Node.isAsExpression(base)) {
+    base = base.getExpression()
+  }
+  if (!Node.isIdentifier(base)) return null
+  const name = base.getText()
+  const args = expr.getArguments()
+  if (args.length === 1 && Node.isArrowFunction(args[0])) {
+    const params = args[0].getParameters()
+    const body = args[0].getBody()
+    if (params.length === 2 && Node.isExpression(body)) {
+      const text = body.getText().replace(/[\s()]/g, '')
+      if (text === `${params[0]!.getName()}-${params[1]!.getName()}`) return { name, numeric: true }
+    }
+  }
+  return { name, numeric: false }
 }
 
 /**
@@ -516,6 +636,9 @@ function collectAndCreateVars(expr: Expr, vars: Map<string, AnyExpr<'main'>>, ct
     case 'ident':
       if (!vars.has(expr.name)) vars.set(expr.name, makeConst(expr.name, 'real', ctx))
       break
+    case 'quantifier':
+      collectAndCreateVars(expr.body, vars, ctx)
+      break
     case 'binary':
       collectAndCreateVars(expr.left, vars, ctx)
       collectAndCreateVars(expr.right, vars, ctx)
@@ -534,10 +657,21 @@ function collectAndCreateVars(expr: Expr, vars: Map<string, AnyExpr<'main'>>, ct
     case 'member':
       collectAndCreateVars(expr.object, vars, ctx)
       break
-    case 'element-access':
-      collectAndCreateVars(expr.object, vars, ctx)
+    case 'element-access': {
+      // The object of an element access must be a Z3 Array for select —
+      // promote it even if an earlier walk (e.g. `x.length`) created it
+      // as a scalar; nothing has been translated against vars yet.
+      if (expr.object.kind === 'ident') {
+        const existing = vars.get(expr.object.name)
+        if (existing === undefined || !isArrayExpr(existing, ctx)) {
+          vars.set(expr.object.name, makeConst(expr.object.name, 'array', ctx))
+        }
+      } else {
+        collectAndCreateVars(expr.object, vars, ctx)
+      }
       collectAndCreateVars(expr.index, vars, ctx)
       break
+    }
     default:
       break
   }

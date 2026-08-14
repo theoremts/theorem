@@ -36,6 +36,11 @@ export function makeConst(name: string, sort: Sort, ctx: Z3Context): AnyExpr<'ma
     case 'bool':   return ctx.Bool.const(name)
     case 'string': return ctx.String.const(name) as unknown as AnyExpr<'main'>
     case 'array':  return makeArrayConst(name, ctx)
+    case 'ref-array':
+      // Array of object REFERENCES: Int indices → Int refs
+      try {
+        return ctx.Array.const(name, ctx.Int.sort(), ctx.Int.sort()) as unknown as AnyExpr<'main'>
+      } catch { return ctx.Real.const(name) }
     case 'set':    return makeSetConst(name, ctx)
     default:       return ctx.Real.const(name)
   }

@@ -28,6 +28,9 @@ export interface VerificationTask {
   traceExprs?: Map<string, AnyExpr<'main'>> | undefined
   /** Source locations of relevant expressions (body branches, assignments) for error highlighting. */
   traceLocs?: Map<string, import('../parser/ir.js').Loc> | undefined
+  /** Exact source span of the offending node (call sites) — beats text search,
+   *  which anchors to the FIRST occurrence when two calls read identically. */
+  sourcePos?: { start: number; length: number } | undefined
   /**
    * Informational task: proved is worth reporting (e.g. "error branch
    * unreachable"), but disproved is NORMAL and must not count as a failure.

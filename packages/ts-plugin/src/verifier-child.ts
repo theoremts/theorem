@@ -119,11 +119,12 @@ async function main(): Promise<void> {
         const result = await core.check({ ...task, timeout: 5000 })
         if (result.status === 'disproved') {
           const ceText = formatCounterexample(result.counterexample)
-          const start = findCallSitePosition(source, task.functionName ?? '', task.contractText)
+          const pos = (task as { sourcePos?: { start: number; length: number } }).sourcePos
+          const start = pos?.start ?? findCallSitePosition(source, task.functionName ?? '', task.contractText)
           failures.push({
             message: `Theorem: ${task.contractText}${ceText ? ` — ${ceText}` : ''}`,
             start,
-            length: estimateCallSiteSpanLength(source, start),
+            length: pos?.length ?? estimateCallSiteSpanLength(source, start),
             code: DIAG_CODE_CALLSITE,
             severity: 'error',
           })

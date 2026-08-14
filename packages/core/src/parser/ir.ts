@@ -7,7 +7,7 @@
  * A NumericUnionSort constrains a variable to a finite set of numeric literals
  * (e.g. TypeScript type `0 | 1 | 2` for enums or status codes).
  */
-export type Sort = 'int' | 'real' | 'bool' | 'string' | 'array' | 'set' | 'unknown' | NumericUnionSort
+export type Sort = 'int' | 'real' | 'bool' | 'string' | 'array' | 'ref-array' | 'set' | 'unknown' | NumericUnionSort
 
 export interface NumericUnionSort {
   kind: 'numeric-union'
@@ -29,6 +29,7 @@ export type BinaryOp =
   | '<' | '<=' | '>' | '>='
   | '===' | '!=='
   | '&&' | '||'
+  | '==>'
   | '??'
   | 'in'
 
@@ -43,7 +44,7 @@ export type Expr =
   | { kind: 'binary';         op: BinaryOp; left: Expr; right: Expr; loc?: Loc | undefined }
   | { kind: 'call';           callee: string; args: Expr[]; loc?: Loc | undefined }
   | { kind: 'ternary';        condition: Expr; then: Expr; else: Expr; loc?: Loc | undefined }
-  | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr; loc?: Loc | undefined }
+  | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr; sort?: 'int' | 'real' | undefined; loc?: Loc | undefined }
   | { kind: 'array';          elements: Expr[]; loc?: Loc | undefined }
   | { kind: 'object';         properties: Array<{ key: string; value: Expr }>; loc?: Loc | undefined }
   | { kind: 'spread';         operand: Expr; loc?: Loc | undefined }
@@ -172,6 +173,9 @@ export type HeapStep =
   | { kind: 'exit' }
   /** Assignment to a numeric variable (loop counters etc.). */
   | { kind: 'num-assign'; name: string; value: Expr }
+  /** `arr.sort(...)` — havocs the array; `sorted: true` only for a numeric
+   *  ascending comparator (bare .sort() is LEXICOGRAPHIC in JS). */
+  | { kind: 'array-sort'; name: string; sorted: boolean }
   /** A while loop verified via havoc + invariant (entry/preservation/post). */
   | {
       kind: 'loop'

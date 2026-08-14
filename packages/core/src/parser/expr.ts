@@ -242,7 +242,38 @@ function parseExprInner(node: Expression): Expr | null {
 
     // Quantifiers: forall(x => P(x)), exists(x => P(x))
     if (callee === 'forall' || callee === 'exists') {
-      const firstArg = node.getArguments()[0]
+      const callArgs = node.getArguments()
+      // Array-scoped form: forall(arr, (x, i) => P) — quantifies an INT index
+      // over [0, arr.length); x becomes arr[i]. This is the fragment where
+      // quantifiers are well-behaved (select-term triggers).
+      if (callArgs.length === 2 && Node.isArrowFunction(callArgs[1])) {
+        const arrExpr = parseExpr(callArgs[0] as Expression)
+        const arrow = callArgs[1]
+        const arrowBody = arrow.getBody()
+        if (arrExpr !== null && Node.isExpression(arrowBody)) {
+          const rawBody = parseExpr(arrowBody)
+          const params = arrow.getParameters()
+          if (rawBody !== null && params.length >= 1) {
+            const qi = nextQuantifierIndexName()
+            const bindings = new Map<string, Expr>()
+            bindings.set(params[0]!.getName(), { kind: 'element-access', object: arrExpr, index: { kind: 'ident', name: qi } })
+            if (params.length >= 2) bindings.set(params[1]!.getName(), { kind: 'ident', name: qi })
+            const body = substituteIdents(rawBody, bindings)
+            const inRange: Expr = {
+              kind: 'binary', op: '&&',
+              left: { kind: 'binary', op: '>=', left: { kind: 'ident', name: qi }, right: { kind: 'literal', value: 0 } },
+              right: { kind: 'binary', op: '<', left: { kind: 'ident', name: qi }, right: { kind: 'member', object: arrExpr, property: 'length' } },
+            }
+            return {
+              kind: 'quantifier', quantifier: callee, param: qi, sort: 'int',
+              body: callee === 'forall'
+                ? { kind: 'binary', op: '==>', left: inRange, right: body }
+                : { kind: 'binary', op: '&&', left: inRange, right: body },
+            }
+          }
+        }
+      }
+      const firstArg = callArgs[0]
       if (Node.isArrowFunction(firstArg)) {
         const boundParams = firstArg.getParameters()
         if (boundParams.length > 0) {
@@ -254,6 +285,37 @@ function parseExprInner(node: Expression): Expr | null {
               return { kind: 'quantifier', quantifier: callee, param, body: bodyExpr }
             }
           }
+        }
+      }
+    }
+
+    // sorted(arr) — ∀ i j: 0 ≤ i ≤ j < len ⟹ arr[i] <= arr[j]
+    // unique(arr) — ∀ i j: in-range ∧ i ≠ j ⟹ arr[i] !== arr[j]
+    if ((callee === 'sorted' || callee === 'unique') && node.getArguments().length === 1) {
+      const arrExpr = parseExpr(node.getArguments()[0] as Expression)
+      if (arrExpr !== null) {
+        const qi = nextQuantifierIndexName()
+        const qj = nextQuantifierIndexName()
+        const len: Expr = { kind: 'member', object: arrExpr, property: 'length' }
+        const at = (name: string): Expr => ({ kind: 'element-access', object: arrExpr, index: { kind: 'ident', name } })
+        const ge0 = (name: string): Expr => ({ kind: 'binary', op: '>=', left: { kind: 'ident', name }, right: { kind: 'literal', value: 0 } })
+        const ltLen = (name: string): Expr => ({ kind: 'binary', op: '<', left: { kind: 'ident', name }, right: len })
+        const hyp: Expr = callee === 'sorted'
+          ? { kind: 'binary', op: '&&',
+              left: { kind: 'binary', op: '&&', left: ge0(qi), right: { kind: 'binary', op: '<=', left: { kind: 'ident', name: qi }, right: { kind: 'ident', name: qj } } },
+              right: ltLen(qj) }
+          : { kind: 'binary', op: '&&',
+              left: { kind: 'binary', op: '&&', left: { kind: 'binary', op: '&&', left: ge0(qi), right: ltLen(qi) }, right: { kind: 'binary', op: '&&', left: ge0(qj), right: ltLen(qj) } },
+              right: { kind: 'binary', op: '!==', left: { kind: 'ident', name: qi }, right: { kind: 'ident', name: qj } } }
+        const concl: Expr = callee === 'sorted'
+          ? { kind: 'binary', op: '<=', left: at(qi), right: at(qj) }
+          : { kind: 'binary', op: '!==', left: at(qi), right: at(qj) }
+        return {
+          kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int',
+          body: {
+            kind: 'quantifier', quantifier: 'forall', param: qj, sort: 'int',
+            body: { kind: 'binary', op: '==>', left: hyp, right: concl },
+          },
         }
       }
     }
@@ -1127,5 +1189,48 @@ function extractLoopContracts(
         if (parsed !== null) setDecreases(parsed)
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Quantifier support: fresh bound-index names + ident substitution
+// ---------------------------------------------------------------------------
+
+let _quantifierIndexCounter = 0
+
+function nextQuantifierIndexName(): string {
+  return `__qi${_quantifierIndexCounter++}`
+}
+
+/** Replaces free identifiers by expressions (used to bind lambda params). */
+function substituteIdents(expr: Expr, bindings: Map<string, Expr>): Expr {
+  switch (expr.kind) {
+    case 'ident': {
+      const replacement = bindings.get(expr.name)
+      return replacement !== undefined ? replacement : expr
+    }
+    case 'binary':
+      return { ...expr, left: substituteIdents(expr.left, bindings), right: substituteIdents(expr.right, bindings) }
+    case 'unary':
+      return { ...expr, operand: substituteIdents(expr.operand, bindings) }
+    case 'ternary':
+      return { ...expr, condition: substituteIdents(expr.condition, bindings), then: substituteIdents(expr.then, bindings), else: substituteIdents(expr.else, bindings) }
+    case 'call':
+      return { ...expr, args: expr.args.map(a => substituteIdents(a, bindings)) }
+    case 'member':
+      return { ...expr, object: substituteIdents(expr.object, bindings) }
+    case 'element-access':
+      return { ...expr, object: substituteIdents(expr.object, bindings), index: substituteIdents(expr.index, bindings) }
+    case 'quantifier': {
+      const inner = new Map(bindings)
+      inner.delete(expr.param)
+      return { ...expr, body: substituteIdents(expr.body, inner) }
+    }
+    case 'array':
+      return { ...expr, elements: expr.elements.map(e => substituteIdents(e, bindings)) }
+    case 'spread':
+      return { ...expr, operand: substituteIdents(expr.operand, bindings) }
+    default:
+      return expr
   }
 }

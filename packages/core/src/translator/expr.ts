@@ -65,6 +65,22 @@ export function toZ3(
         } catch { /* fall through to flat variable */ }
       }
 
+      // Element field access: users[i].balance → Select(__field_balance, Select(users, i))
+      // (read-only view of the heap encoding — field maps as uninterpreted arrays)
+      if (expr.object.kind === 'element-access') {
+        const elem = toZ3(expr.object, vars, ctx)
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+        if (elem !== null && String((elem as any).sort) === 'Int') {
+          const fieldArrName = `__field_${expr.property}`
+          if (!vars.has(fieldArrName)) {
+            vars.set(fieldArrName, ctx.Array.const(fieldArrName, ctx.Int.sort(), ctx.Real.sort()) as unknown as Z3Expr)
+          }
+          try {
+            return ctx.Select(vars.get(fieldArrName)! as Z3Array, elem as Z3Arith) as unknown as Z3Expr
+          } catch { /* fall through */ }
+        }
+      }
+
       // Special case: array.length → free Int variable (Z3 arrays don't have length)
       if (objZ3 !== null && expr.property === 'length' && isArrayExpr(objZ3, ctx)) {
         const flatName = flattenMember(expr)
@@ -304,9 +320,11 @@ export function toZ3(
     // ── Quantifiers: forall/exists ─────────────────────────────────
     case 'quantifier': {
       try {
-        const boundVar = ctx.Real.const(expr.param)
+        // Array-index quantifiers are INT-sorted — indices instantiate
+        // select terms directly, the well-behaved e-matching fragment
+        const boundVar = expr.sort === 'int' ? ctx.Int.const(expr.param) : ctx.Real.const(expr.param)
         const innerVars = new Map(vars)
-        innerVars.set(expr.param, boundVar)
+        innerVars.set(expr.param, boundVar as unknown as Z3Expr)
         const body = toZ3(expr.body, innerVars, ctx)
         if (body === null) return null
         return expr.quantifier === 'forall'
@@ -415,6 +433,7 @@ function applyBinaryOp(
     // Logical
     case '&&':  return ctx.And(l as Z3Bool, r as Z3Bool)
     case '||':  return ctx.Or(l as Z3Bool, r as Z3Bool)
+    case '==>': return ctx.Implies(l as Z3Bool, r as Z3Bool)
     // Nullish coalesce handled above in toZ3
     case '??':  return null
     // 'in' handled above in toZ3

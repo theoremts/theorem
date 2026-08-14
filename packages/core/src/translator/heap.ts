@@ -94,12 +94,17 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     else if (e.kind === 'unary') memberRootsOf(e.operand)
     else if (e.kind === 'ternary') { memberRootsOf(e.condition); memberRootsOf(e.then); memberRootsOf(e.else) }
     else if (e.kind === 'call') for (const a of e.args) memberRootsOf(a)
+    else if (e.kind === 'quantifier') memberRootsOf(e.body)
+    else if (e.kind === 'element-access') { memberRootsOf(e.object); memberRootsOf(e.index) }
   }
   for (const c of ir.contracts) {
     if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) memberRootsOf(c.predicate as Expr)
   }
   for (const ax of specAxioms) memberRootsOf(ax)
-  for (const name of rootNames) refs.set(name, ctx.Int.const(name))
+  for (const name of rootNames) {
+    if (ir.params.some(p => p.name === name && (p.sort === 'array' || p.sort === 'ref-array'))) continue
+    refs.set(name, ctx.Int.const(name))
+  }
 
   const NULL_REF = ctx.Int.val(0)
 
@@ -144,10 +149,28 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     initialHeap.set(f, ctx.Array.const(`__heap_${f}`, ctx.Int.sort(), range))
   }
 
+  // Array parameters: Z3 Array(Int → range) + a paired Int length constant.
+  // number[] ranges over Real; Account[] ranges over Int — an array of
+  // REFERENCES, composing with the field heaps: users[i].balance is
+  // Select(heap_balance, Select(users, i)). Two slots holding the same
+  // reference (in-array aliasing) is a case the solver explores.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const arrayVars = new Map<string, { arr: any; len: Arith<'main'>; ref: boolean }>()
+  for (const p of ir.params) {
+    if (p.sort === 'array' || p.sort === 'ref-array') {
+      const isRef = p.sort === 'ref-array'
+      arrayVars.set(p.name, {
+        arr: ctx.Array.const(p.name, ctx.Int.sort(), isRef ? ctx.Int.sort() : ctx.Real.sort()),
+        len: ctx.Int.const(`${p.name}.length`),
+        ref: isRef,
+      })
+    }
+  }
+
   // Numeric parameters (non-root) as Real constants
   const numericVars = new Map<string, AnyExpr<'main'>>()
   for (const p of ir.params) {
-    if (!rootNames.has(p.name)) numericVars.set(p.name, ctx.Real.const(p.name))
+    if (!rootNames.has(p.name) && !arrayVars.has(p.name)) numericVars.set(p.name, ctx.Real.const(p.name))
   }
 
   // Mutable numeric state (`this.x` fields, let-locals): the entry-state
@@ -176,9 +199,57 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
   for (const p of contractPredicates) collectThisIdents(p)
+
+  // Int classification: a mutable numeric is Int-sorted iff EVERY expression
+  // assigned to it is integer-shaped (int literals, other Int vars, +/-/* of
+  // those, Math.floor, array .length). Int-sorted state is what lets array
+  // indices instantiate quantified facts — and keeps `lo := mid + 1` inside
+  // pure integer arithmetic, away from the solver's fragile to_int mixing.
+  const assignedNums = new Set<string>()
+  const localNames = new Set<string>()
+  const collectAssigned = (list: typeof steps): void => {
+    for (const s of list) {
+      if (s.kind === 'num-assign') assignedNums.add(s.name)
+      else if (s.kind === 'local') localNames.add(s.name)
+      else if (s.kind === 'branch') { collectAssigned(s.then); collectAssigned(s.else) }
+      else if (s.kind === 'loop') collectAssigned(s.body)
+    }
+  }
+  collectAssigned(steps)
+  // Locals participate too: `const mid = Math.floor(...)` must classify Int
+  // for `lo = mid + 1` to stay integer-sorted.
+  const intVars = new Set<string>([...assignedNums, ...localNames])
+  intVars.delete('__result')
+  const isIntShaped = (e: Expr): boolean => {
+    switch (e.kind) {
+      case 'literal': return typeof e.value === 'number' && Number.isInteger(e.value)
+      case 'ident': return intVars.has(e.name)
+      case 'binary': return (e.op === '+' || e.op === '-' || e.op === '*') && isIntShaped(e.left) && isIntShaped(e.right)
+      case 'ternary': return isIntShaped(e.then) && isIntShaped(e.else)
+      case 'member': return e.property === 'length' && e.object.kind === 'ident' && arrayVars.has(e.object.name)
+      case 'call': return e.callee === 'Math.floor' && e.args.length === 1
+      default: return false
+    }
+  }
+  const eachAssignment = (list: typeof steps, visit: (name: string, value: Expr) => void): void => {
+    for (const s of list) {
+      if (s.kind === 'num-assign') visit(s.name, s.value)
+      else if (s.kind === 'local') visit(s.name, s.value)
+      else if (s.kind === 'alias') visit(s.name, { kind: 'ident', name: s.of })
+      else if (s.kind === 'branch') { eachAssignment(s.then, visit); eachAssignment(s.else, visit) }
+      else if (s.kind === 'loop') eachAssignment(s.body, visit)
+    }
+  }
+  for (let changed = true; changed;) {
+    changed = false
+    eachAssignment(steps, (name, value) => {
+      if (intVars.has(name) && !isIntShaped(value)) { intVars.delete(name); changed = true }
+    })
+  }
+
   for (const n of numTargets) {
     if (n !== '__result' && !rootNames.has(n) && !numericVars.has(n)) {
-      numericVars.set(n, ctx.Real.const(n))
+      numericVars.set(n, intVars.has(n) ? (ctx.Int.const(n) as unknown as AnyExpr<'main'>) : ctx.Real.const(n))
     }
   }
 
@@ -188,9 +259,14 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     locals: Map<string, AnyExpr<'main'>>
     /** Mutable numeric variables (loop counters) — override numericVars. */
     nums: Map<string, AnyExpr<'main'>>
+    /** Array state — versioned by array-sort havoc (length is preserved). */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    arrays: Map<string, any>
     /** Heap version tag — spec UFs are distinct per version (@pre/@post). */
     tag: 'pre' | 'post'
   }
+
+  const initialArrays = new Map<string, unknown>([...arrayVars].map(([n, v]) => [n, v.arr as unknown]))
 
   // Frame bridge (ground, sound): a spec predicate whose READ-SET is
   // disjoint from the WRITTEN fields cannot change value across the body —
@@ -258,24 +334,73 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }).join('.')
   }
 
+  const isIntSorted = (t: AnyExpr<'main'>): boolean => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+    try { return String((t as any).sort) === 'Int' } catch { return false }
+  }
+  /** Int/Real coercion for mixed arithmetic (TS numbers are one type; Z3's aren't). */
+  const coerce2 = (l: AnyExpr<'main'>, r: AnyExpr<'main'>): [AnyExpr<'main'>, AnyExpr<'main'>] => {
+    const li = isIntSorted(l), ri = isIntSorted(r)
+    if (li && !ri) return [ctx.ToReal(l as Arith<'main'>) as unknown as AnyExpr<'main'>, r]
+    if (!li && ri) return [l, ctx.ToReal(r as Arith<'main'>) as unknown as AnyExpr<'main'>]
+    return [l, r]
+  }
+
   const translate = (expr: Expr, env: Env, oldEnv: Env): AnyExpr<'main'> | null => {
     switch (expr.kind) {
       case 'literal':
-        if (typeof expr.value === 'number') return ctx.Real.val(expr.value)
+        // Integral literals are Int-sorted so integer state (`lo = 0`,
+        // `mid + 1`) stays in pure Int arithmetic; coerce2 lifts to Real
+        // whenever the other operand demands it.
+        if (typeof expr.value === 'number') {
+          return Number.isInteger(expr.value)
+            ? (ctx.Int.val(expr.value) as unknown as AnyExpr<'main'>)
+            : ctx.Real.val(expr.value)
+        }
         if (typeof expr.value === 'boolean') return ctx.Bool.val(expr.value)
         if (expr.value === null) return NULL_REF
         return null
       case 'ident': {
         if (expr.name === 'null') return NULL_REF
         const resolved = resolveAlias(expr.name, aliasOf)
-        return env.locals.get(expr.name) ?? env.nums.get(expr.name) ?? refs.get(resolved) ?? numericVars.get(expr.name) ?? null
+        return env.locals.get(expr.name) ?? env.nums.get(expr.name) ?? refs.get(resolved)
+          ?? numericVars.get(expr.name)
+          ?? (env.arrays.get(expr.name) as AnyExpr<'main'> | undefined)
+          ?? (arrayVars.get(expr.name)?.arr as AnyExpr<'main'> | undefined) ?? null
       }
       case 'member': {
+        // arr.length → the paired Int length constant, not a heap field
+        if (expr.object.kind === 'ident' && expr.property === 'length') {
+          const av = arrayVars.get(expr.object.name)
+          if (av !== undefined) return av.len as unknown as AnyExpr<'main'>
+        }
         const objRef = translate(expr.object, env, oldEnv)
         const heap = env.heap.get(expr.property)
         if (objRef === null || heap === undefined) return null
         // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
         return heap.select(objRef)
+      }
+      case 'element-access': {
+        if (expr.object.kind !== 'ident') return null
+        const av = arrayVars.get(expr.object.name)
+        if (av === undefined) return null
+        const arrState = env.arrays.get(expr.object.name) ?? av.arr
+        const idx = translate(expr.index, env, oldEnv)
+        if (idx === null || !isIntSorted(idx)) return null
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+        try { return arrState.select(idx) } catch { return null }
+      }
+      case 'quantifier': {
+        try {
+          const boundVar = expr.sort === 'int' ? ctx.Int.const(expr.param) : ctx.Real.const(expr.param)
+          const innerEnv: Env = { ...env, locals: new Map(env.locals) }
+          innerEnv.locals.set(expr.param, boundVar as unknown as AnyExpr<'main'>)
+          const body = translate(expr.body, innerEnv, oldEnv)
+          if (body === null) return null
+          return expr.quantifier === 'forall'
+            ? ctx.ForAll([boundVar], body as Bool<'main'>) as unknown as AnyExpr<'main'>
+            : ctx.Exists([boundVar], body as Bool<'main'>) as unknown as AnyExpr<'main'>
+        } catch { return null }
       }
       case 'unary': {
         const operand = translate(expr.operand, env, oldEnv)
@@ -285,9 +410,16 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         return null
       }
       case 'binary': {
-        const l = translate(expr.left, env, oldEnv)
-        const r = translate(expr.right, env, oldEnv)
-        if (l === null || r === null) return null
+        const lRaw = translate(expr.left, env, oldEnv)
+        const rRaw = translate(expr.right, env, oldEnv)
+        if (lRaw === null || rRaw === null) return null
+        // TS `/` is real division even on integers
+        const [l, r] = expr.op === '/'
+          ? [
+              isIntSorted(lRaw) ? ctx.ToReal(lRaw as Arith<'main'>) as unknown as AnyExpr<'main'> : lRaw,
+              isIntSorted(rRaw) ? ctx.ToReal(rRaw as Arith<'main'>) as unknown as AnyExpr<'main'> : rRaw,
+            ]
+          : coerce2(lRaw, rRaw)
         const a = l as Arith<'main'>
         const b = r as Arith<'main'>
         try {
@@ -304,15 +436,17 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
             case '>=': return a.ge(b)
             case '&&': return ctx.And(l as Bool<'main'>, r as Bool<'main'>)
             case '||': return ctx.Or(l as Bool<'main'>, r as Bool<'main'>)
+            case '==>': return ctx.Implies(l as Bool<'main'>, r as Bool<'main'>)
             default: return null
           }
         } catch { return null /* sort mismatch (Int ref vs Real) */ }
       }
       case 'ternary': {
         const c = translate(expr.condition, env, oldEnv)
-        const t = translate(expr.then, env, oldEnv)
-        const e = translate(expr.else, env, oldEnv)
-        if (c === null || t === null || e === null) return null
+        const tRaw = translate(expr.then, env, oldEnv)
+        const eRaw = translate(expr.else, env, oldEnv)
+        if (c === null || tRaw === null || eRaw === null) return null
+        const [t, e] = coerce2(tRaw, eRaw)
         return ctx.If(c as Bool<'main'>, t, e)
       }
       case 'call': {
@@ -350,14 +484,30 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         if (expr.callee === 'output' && expr.args.length === 0) {
           return env.locals.get('__result') ?? env.nums.get('__result') ?? null
         }
+        // Math.floor over Int state: floor(a / b) with Int operands is Z3's
+        // integer division; floor of an Int term is the term itself. The
+        // general Real case is deliberately unsupported — to_int mixing is
+        // where this solver build diverges.
+        if (expr.callee === 'Math.floor' && expr.args.length === 1) {
+          const argE = expr.args[0]!
+          if (argE.kind === 'binary' && argE.op === '/') {
+            const n = translate(argE.left, env, oldEnv)
+            const d = translate(argE.right, env, oldEnv)
+            if (n !== null && d !== null && isIntSorted(n) && isIntSorted(d)) {
+              try { return (n as Arith<'main'>).div(d as Arith<'main'>) } catch { return null }
+            }
+          }
+          const x = translate(argE, env, oldEnv)
+          return x !== null && isIntSorted(x) ? x : null
+        }
         const arg0 = expr.args[0] !== undefined ? translate(expr.args[0]!, env, oldEnv) : null
         if (expr.callee === 'Number.isInteger' && arg0 !== null) {
           const x = arg0 as Arith<'main'>
           return x.eq(ctx.ToInt(x) as Arith<'main'>)
         }
-        if (expr.callee === 'positive' && arg0 !== null) return (arg0 as Arith<'main'>).gt(ctx.Real.val(0))
-        if (expr.callee === 'nonNegative' && arg0 !== null) return (arg0 as Arith<'main'>).ge(ctx.Real.val(0))
-        if (expr.callee === 'negative' && arg0 !== null) return (arg0 as Arith<'main'>).lt(ctx.Real.val(0))
+        if (expr.callee === 'positive' && arg0 !== null) return (arg0 as Arith<'main'>).gt(isIntSorted(arg0) ? (ctx.Int.val(0) as unknown as Arith<'main'>) : ctx.Real.val(0))
+        if (expr.callee === 'nonNegative' && arg0 !== null) return (arg0 as Arith<'main'>).ge(isIntSorted(arg0) ? (ctx.Int.val(0) as unknown as Arith<'main'>) : ctx.Real.val(0))
+        if (expr.callee === 'negative' && arg0 !== null) return (arg0 as Arith<'main'>).lt(isIntSorted(arg0) ? (ctx.Int.val(0) as unknown as Arith<'main'>) : ctx.Real.val(0))
         if (expr.callee === 'between' && expr.args.length === 3 && arg0 !== null) {
           const lo = translate(expr.args[1]!, env, oldEnv)
           const hi = translate(expr.args[2]!, env, oldEnv)
@@ -372,7 +522,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
 
-  const oldEnv: Env = { heap: initialHeap, locals: new Map(), nums: new Map(), tag: 'pre' }
+  const oldEnv: Env = { heap: initialHeap, locals: new Map(), nums: new Map(), arrays: new Map(initialArrays), tag: 'pre' }
 
   /** Instantiates the definitional-axiom pool at the given heap state. */
   const pushSpecAxioms = (
@@ -459,6 +609,10 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     assumptions.push(ref.gt(NULL_REF))
     assumptionLabels.push(`${name} is a live reference`)
   }
+  for (const [name, av] of arrayVars) {
+    assumptions.push(av.len.ge(0) as Bool<'main'>)
+    assumptionLabels.push(`${name}.length >= 0`)
+  }
   for (const c of ir.contracts) {
     if (c.kind !== 'requires' || typeof c.predicate === 'string') continue
     const z3 = translate(c.predicate, oldEnv, oldEnv)
@@ -476,7 +630,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   // Sequential processing composes correctly — a then-branch mutation read
   // from the else-branch resolves to the original value because its ITE
   // guard is false there. Early returns clear `alive` for their paths.
-  const env: Env = { heap: new Map(initialHeap), locals: new Map(), nums: new Map(), tag: 'post' }
+  const env: Env = { heap: new Map(initialHeap), locals: new Map(), nums: new Map(), arrays: new Map(initialArrays), tag: 'post' }
   const modifiesContract = ir.contracts.find(c => c.kind === 'modifies')
   const allowedWrites = modifiesContract !== undefined
     ? new Set((modifiesContract as { refs: string[] }).refs.map(r => resolveAlias(r, aliasOf)))
@@ -484,11 +638,16 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
   let alive: Bool<'main'> = ctx.Bool.val(true)
   let loopCounter = 0
+  let sortCounter = 0
 
   const taskVariables = (): Map<string, AnyExpr<'main'>> => {
     const m = new Map<string, AnyExpr<'main'>>()
     for (const [name, ref] of refs) m.set(name, ref as unknown as AnyExpr<'main'>)
     for (const [name, v] of numericVars) m.set(name, v)
+    for (const [name, av] of arrayVars) {
+      m.set(name, av.arr as AnyExpr<'main'>)
+      m.set(`${name}.length`, av.len as unknown as AnyExpr<'main'>)
+    }
     return m
   }
 
@@ -504,8 +663,12 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         const v = translate(s.value, bodyEnv, oldEnv)
         if (v !== null) {
           const prev = bodyEnv.nums.get(s.name) ?? numericVars.get(s.name)
-          const guarded = pc === null || prev === undefined ? v : ctx.If(pc, v, prev)
-          bodyEnv.nums.set(s.name, guarded)
+          if (pc === null || prev === undefined) {
+            bodyEnv.nums.set(s.name, v)
+          } else {
+            const [cv, cp] = coerce2(v, prev)
+            bodyEnv.nums.set(s.name, ctx.If(pc, cv, cp))
+          }
         }
         continue
       }
@@ -559,8 +722,41 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         if (v !== null) {
           const prev = env.nums.get(step.name) ?? numericVars.get(step.name)
           const guard = pc === null ? alive : ctx.And(alive, pc)
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          env.nums.set(step.name, prev === undefined ? v : ctx.If(guard, v as any, prev as any))
+          if (prev === undefined) {
+            env.nums.set(step.name, v)
+          } else {
+            const [cv, cp] = coerce2(v, prev)
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            env.nums.set(step.name, ctx.If(guard, cv as any, cp as any))
+          }
+        }
+        continue
+      }
+
+      if (step.kind === 'array-sort') {
+        const av = arrayVars.get(step.name)
+        if (av === undefined) continue
+        // Havoc: element positions changed — every prior content fact dies.
+        // Length is a separate constant and is preserved.
+        const fresh = ctx.Array.const(
+          `${step.name}__sorted${sortCounter++}`,
+          ctx.Int.sort(),
+          av.ref ? ctx.Int.sort() : ctx.Real.sort(),
+        )
+        env.arrays.set(step.name, fresh)
+        // The trusted contract of Array.prototype.sort — granted ONLY for
+        // the numeric ascending comparator, and only for number[] content.
+        if (step.sorted && !av.ref) {
+          try {
+            const qi = ctx.Int.const(`__qs${sortCounter}a`)
+            const qj = ctx.Int.const(`__qs${sortCounter}b`)
+            assumptions.push(ctx.ForAll([qi, qj], ctx.Implies(
+              ctx.And(qi.ge(0), qi.le(qj), qj.lt(av.len)),
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument
+              (fresh.select(qi) as Arith<'main'>).le(fresh.select(qj) as Arith<'main'>),
+            )))
+            assumptionLabels.push(`sort: ${step.name} sorted ascending (numeric comparator)`)
+          } catch { /* never block on the assumption */ }
         }
         continue
       }
@@ -598,14 +794,16 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         //    condition, run the body, prove invariants again
         const freshEnv: Env = {
           heap: new Map(env.heap), locals: new Map(env.locals),
-          nums: new Map(env.nums), tag: env.tag,
+          nums: new Map(env.nums), arrays: new Map(env.arrays), tag: env.tag,
         }
         for (const f of loopFields) {
           const range = refFields.has(f) ? ctx.Int.sort() : ctx.Real.sort()
           freshEnv.heap.set(f, ctx.Array.const(`__heap_${f}_iter${loopCounter}`, ctx.Int.sort(), range))
         }
         for (const n of loopNums) {
-          freshEnv.nums.set(n, ctx.Real.const(`${n}_iter${loopCounter}`))
+          freshEnv.nums.set(n, intVars.has(n)
+            ? (ctx.Int.const(`${n}_iter${loopCounter}`) as unknown as AnyExpr<'main'>)
+            : ctx.Real.const(`${n}_iter${loopCounter}`))
         }
 
         const iterAssumptions: Bool<'main'>[] = [...assumptions]
@@ -630,7 +828,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         // Execute one iteration of the body against the fresh state
         const bodyEnv: Env = {
           heap: new Map(freshEnv.heap), locals: new Map(freshEnv.locals),
-          nums: new Map(freshEnv.nums), tag: freshEnv.tag,
+          nums: new Map(freshEnv.nums), arrays: new Map(freshEnv.arrays), tag: freshEnv.tag,
         }
         runLoopBody(step.body, bodyEnv, null)
 
@@ -678,7 +876,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
             variables: taskVariables(),
             assumptions: iterAssumptions,
             assumptionLabels: iterLabels,
-            goal: ctx.Not((measureBefore as Arith<'main'>).ge(ctx.Real.val(0))),
+            goal: ctx.Not((measureBefore as Arith<'main'>).ge(isIntSorted(measureBefore) ? (ctx.Int.val(0) as unknown as Arith<'main'>) : ctx.Real.val(0))),
             domainConstraints: [],
           })
           const measureAfter = translate(step.decreases, bodyEnv, oldEnv)
@@ -702,7 +900,9 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           env.heap.set(f, ctx.Array.const(`__heap_${f}_post${loopCounter}`, ctx.Int.sort(), range))
         }
         for (const n of loopNums) {
-          env.nums.set(n, ctx.Real.const(`${n}_post${loopCounter}`))
+          env.nums.set(n, intVars.has(n)
+            ? (ctx.Int.const(`${n}_post${loopCounter}`) as unknown as AnyExpr<'main'>)
+            : ctx.Real.const(`${n}_post${loopCounter}`))
         }
         for (const inv of step.invariants) {
           const invZ3 = translate(inv, env, oldEnv)
@@ -802,6 +1002,10 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   const variables = new Map<string, AnyExpr<'main'>>()
   for (const [name, ref] of refs) variables.set(name, ref as unknown as AnyExpr<'main'>)
   for (const [name, v] of numericVars) variables.set(name, v)
+  for (const [name, av] of arrayVars) {
+    variables.set(name, av.arr as AnyExpr<'main'>)
+    variables.set(`${name}.length`, av.len as unknown as AnyExpr<'main'>)
+  }
 
   for (const c of ir.contracts) {
     if (c.kind !== 'ensures' || typeof c.predicate === 'string') continue
@@ -908,9 +1112,13 @@ function inferRefFields(
 function collectFields(expr: Expr, fields: Set<string>): void {
   switch (expr.kind) {
     case 'member':
-      fields.add(expr.property)
+      if (expr.property !== 'length') fields.add(expr.property)
       collectFields(expr.object, fields)
       break
+    case 'element-access':
+      collectFields(expr.object, fields); collectFields(expr.index, fields); break
+    case 'quantifier':
+      collectFields(expr.body, fields); break
     case 'binary':
       collectFields(expr.left, fields); collectFields(expr.right, fields); break
     case 'unary':
