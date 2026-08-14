@@ -116,6 +116,40 @@ export function translate(
   }
 
   const vars = createVariables(ir.params, ir.returnSort, ctx)
+
+  // Pre-create String variables for __reTest targets: regex membership
+  // implies string-ness, and the body may read `x.length` BEFORE the
+  // assume that would otherwise create x — a late String would leave the
+  // body's length variable untied to the sequence.
+  const preCreateRegexTargets = (e: Expr): void => {
+    if (e.kind === 'call') {
+      if (e.callee === '__reTest' && e.args.length >= 1) {
+        const t = e.args[0]!
+        const name = t.kind === 'ident' ? t.name : t.kind === 'member' ? flattenMemberName(t) : null
+        if (name !== null && !vars.has(name)) vars.set(name, makeConst(name, 'string', ctx))
+      }
+      for (const a of e.args) preCreateRegexTargets(a)
+    }
+    else if (e.kind === 'binary') { preCreateRegexTargets(e.left); preCreateRegexTargets(e.right) }
+    else if (e.kind === 'unary') preCreateRegexTargets(e.operand)
+    else if (e.kind === 'ternary') { preCreateRegexTargets(e.condition); preCreateRegexTargets(e.then); preCreateRegexTargets(e.else) }
+    else if (e.kind === 'quantifier') preCreateRegexTargets(e.body)
+  }
+  for (const c of ir.contracts) {
+    if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) {
+      preCreateRegexTargets(c.predicate as Expr)
+    }
+  }
+
+  // Discriminated unions: p.kind is a STRING over a finite set of literals.
+  // Pre-create it as a String variable so comparisons against 'pix' etc.
+  // translate as sequence equalities instead of sort-mismatching.
+  for (const param of ir.params) {
+    if (param.discriminant !== undefined) {
+      const flatName = `${param.name}.${param.discriminant.property}`
+      if (!vars.has(flatName)) vars.set(flatName, makeConst(flatName, 'string', ctx))
+    }
+  }
   const tasks: VerificationTask[] = []
 
   // Register free variables for identifiers that are not params — e.g. Zod
@@ -1204,6 +1238,15 @@ function getOrCreateBool(name: string, vars: Map<string, AnyExpr<'main'>>, ctx: 
 // Domain constraints
 // ---------------------------------------------------------------------------
 
+function flattenMemberName(e: Expr): string | null {
+  if (e.kind === 'ident') return e.name
+  if (e.kind === 'member') {
+    const base = flattenMemberName(e.object)
+    return base === null ? null : `${base}.${e.property}`
+  }
+  return null
+}
+
 function collectDomainConstraints(
   vars: Map<string, AnyExpr<'main'>>,
   params: Param[],
@@ -1214,6 +1257,22 @@ function collectDomainConstraints(
     if (name.endsWith('.length')) {
       try { constraints.push((expr as Arith<'main'>).ge(ctx.Real.val(0))) } catch {}
     }
+  }
+
+  // Discriminated unions: the discriminant is one of the declared literals —
+  // this is what makes EXHAUSTIVENESS provable (the after-all-cases branch
+  // becomes unreachable).
+  for (const param of params) {
+    if (param.discriminant === undefined) continue
+    const flatName = `${param.name}.${param.discriminant.property}`
+    const v = vars.get(flatName)
+    if (v === undefined) continue
+    try {
+      const eqs = param.discriminant.values.map(val =>
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (v as any).eq(ctx.String.val(val)) as Bool<'main'>)
+      constraints.push(eqs.length === 1 ? eqs[0]! : ctx.Or(...eqs))
+    } catch { /* skip */ }
   }
 
   // Numeric union domain constraints: variable must be one of the allowed values

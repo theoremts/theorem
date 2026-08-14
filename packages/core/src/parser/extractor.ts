@@ -1118,7 +1118,10 @@ function extractHeapStmtList(stmts: Statement[], context: 'top' | 'loop' | 'bran
       }
 
       const body = extractHeapStmtList(codeStmts, 'loop')
-      if (body === null || invariants.length === 0) return null
+      if (body === null) return null
+      // Zero invariants is allowed: the havoc machinery then knows nothing
+      // after the loop except ¬condition — honest, and it lets Spacer-based
+      // invariant INFERENCE see the loop's transition system.
       steps.push({ kind: 'loop', condition, invariants, decreases: decreasesExpr, body })
       continue
     }
@@ -1384,12 +1387,18 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
   // Inject them as assume contracts — this alone makes the function verifiable
   // (division safety etc.) with zero annotations.
   try {
+    // PREPEND: schema facts are entry-level assumptions, and the translator's
+    // sequential pass snapshots each ensures' assumptions in contract order —
+    // appended assumes would arrive after the ensures already closed over
+    // them (the F2 axioms lesson).
+    const schemaAssumes: Contract[] = []
     for (const zc of extractZodContracts(fnBody)) {
-      contracts.push({ kind: 'assume', predicate: zc.predicate })
+      schemaAssumes.push({ kind: 'assume', predicate: zc.predicate })
     }
     for (const ec of extractEffectContracts(fnBody)) {
-      contracts.push({ kind: 'assume', predicate: ec.predicate })
+      schemaAssumes.push({ kind: 'assume', predicate: ec.predicate })
     }
+    contracts.unshift(...schemaAssumes)
   } catch { /* schema extraction is best-effort */ }
 
   if (contracts.length === 0) return null
@@ -1481,12 +1490,18 @@ function tryExtractInlineArrow(fn: ArrowFunction, name: string): FunctionIR | nu
   // Inject them as assume contracts — this alone makes the function verifiable
   // (division safety etc.) with zero annotations.
   try {
+    // PREPEND: schema facts are entry-level assumptions, and the translator's
+    // sequential pass snapshots each ensures' assumptions in contract order —
+    // appended assumes would arrive after the ensures already closed over
+    // them (the F2 axioms lesson).
+    const schemaAssumes: Contract[] = []
     for (const zc of extractZodContracts(fnBody)) {
-      contracts.push({ kind: 'assume', predicate: zc.predicate })
+      schemaAssumes.push({ kind: 'assume', predicate: zc.predicate })
     }
     for (const ec of extractEffectContracts(fnBody)) {
-      contracts.push({ kind: 'assume', predicate: ec.predicate })
+      schemaAssumes.push({ kind: 'assume', predicate: ec.predicate })
     }
+    contracts.unshift(...schemaAssumes)
   } catch { /* schema extraction is best-effort */ }
 
   if (contracts.length === 0) return null
@@ -1674,8 +1689,44 @@ function extractFunctionDeclParams(fn: FunctionDeclaration | MethodDeclaration):
     const name = p.getName()
     const typeNode = p.getTypeNode()
     const sort = typeNode ? tsTypeToSort(typeNode.getText()) : 'real'
-    return { name, sort }
+    const discriminant = sort === 'unknown' ? detectDiscriminatedUnion(p) : undefined
+    return { name, sort, discriminant }
   })
+}
+
+/**
+ * Detects a discriminated union parameter: every union member is an object
+ * type sharing one property whose type is a distinct string literal.
+ * `type Payment = { kind: 'pix'; ... } | { kind: 'boleto'; ... }` yields
+ * { property: 'kind', values: ['pix', 'boleto'] }.
+ */
+function detectDiscriminatedUnion(param: import('ts-morph').ParameterDeclaration): Param['discriminant'] {
+  try {
+    const t = param.getType()
+    if (!t.isUnion()) return undefined
+    const variants = t.getUnionTypes()
+    if (variants.length < 2 || !variants.every(v => v.isObject())) return undefined
+
+    const firstProps = variants[0]!.getProperties()
+    for (const prop of firstProps) {
+      const propName = prop.getName()
+      const values: string[] = []
+      let ok = true
+      for (const v of variants) {
+        const sym = v.getProperty(propName)
+        if (sym === undefined) { ok = false; break }
+        const pt = sym.getTypeAtLocation(param)
+        if (!pt.isStringLiteral()) { ok = false; break }
+        values.push(String(pt.getLiteralValue()))
+      }
+      if (ok && new Set(values).size === values.length) {
+        return { property: propName, values }
+      }
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 function tsTypeToSort(type: string): Sort {

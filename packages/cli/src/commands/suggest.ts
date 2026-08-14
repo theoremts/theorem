@@ -1,6 +1,6 @@
 import { readFileSync, statSync, readdirSync } from 'node:fs'
 import { resolve, join, relative } from 'node:path'
-import { extractFunctionsFromSource, getContext } from '@theoremts/core'
+import { extractFunctionsFromSource, extractFromSource, inferLoopInvariants, getContext } from '@theoremts/core'
 import { suggestContracts } from '@theoremts/core/suggester'
 import type { SuggestFunctionResult, ConditionalSuggestion, GuardSuggestion } from '@theoremts/core/suggester'
 import type { ResolvedConfig } from '@theoremts/core'
@@ -79,7 +79,7 @@ function matchesSimple(name: string, pattern: string): boolean {
 const blue = isTTY ? '\x1b[34m' : ''
 
 function printSuggestions(filePath: string, results: SuggestFunctionResult[]): void {
-  const withContent = results.filter(r => r.suggestions.length > 0 || r.conditionals.length > 0 || r.guards.length > 0)
+  const withContent = results.filter(r => r.suggestions.length > 0 || r.conditionals.length > 0 || r.guards.length > 0 || r.loopInvariants)
   if (withContent.length === 0) return
 
   process.stdout.write(`\n${bold}${filePath}${reset}\n`)
@@ -116,6 +116,14 @@ function printSuggestions(filePath: string, results: SuggestFunctionResult[]): v
       process.stdout.write(`    ${blue}i${reset}  ${dim}existing guard detected:${reset} \`if (${g.condition}) ${g.action}\` ${dim}→ equivalent to${reset} ${cyan}requires${reset}(${g.equivalent})\n`)
     }
 
+    // Spacer-inferred loop invariants
+    if (fn.loopInvariants) {
+      for (const inv of fn.loopInvariants.invariants) {
+        process.stdout.write(`    ${cyan}→${reset}  add ${cyan}invariant(() => ${inv})${reset}\n`)
+      }
+      process.stdout.write(`       ${dim}inferred by Spacer — makes ensures(${fn.loopInvariants.protects}) provable${reset}\n`)
+    }
+
     // Conditional suggestions: "if you add X, then Y becomes provable"
     for (const c of fn.conditionals) {
       process.stdout.write(`    ${yellow}→${reset}  ${dim}if you add${reset} ${cyan}requires${reset}(${c.requires})${dim}, then${reset} ${cyan}ensures${reset}(${c.enables}) ${green}becomes provable${reset}\n`)
@@ -145,13 +153,27 @@ export async function suggestCommand(paths: string[], config: ResolvedConfig): P
     try { source = readFileSync(absPath, 'utf-8') } catch { continue }
 
     const irs = extractFunctionsFromSource(source, absPath)
-    if (irs.length === 0) continue
 
     const results: SuggestFunctionResult[] = []
     for (const ir of irs) {
       const result = await suggestContracts(ir, ctx)
       if (result.suggestions.length > 0 || result.conditionals.length > 0) results.push(result)
     }
+
+    // Second pass, contract-aware: functions with an ensures and an
+    // uninvarianted loop get Spacer-inferred invariant candidates.
+    try {
+      for (const ir of extractFromSource(source, absPath)) {
+        if (!ir.heapSteps?.some(st => st.kind === 'loop' && st.invariants.length === 0)) continue
+        const inferred = await inferLoopInvariants(ir, ctx)
+        if (inferred === null) continue
+        const existing = results.find(r => r.name === ir.name)
+        if (existing) existing.loopInvariants = inferred
+        else results.push({ name: ir.name, params: ir.params.map(p => p.name), suggestions: [], conditionals: [], guards: [], loopInvariants: inferred })
+      }
+    } catch { /* inference is best-effort */ }
+
+    if (results.length === 0) continue
 
     printSuggestions(displayPath, results)
     totalSuggestions += results.reduce((n, r) => n + r.suggestions.length + r.conditionals.length + r.guards.length, 0)

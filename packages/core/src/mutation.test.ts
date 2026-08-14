@@ -70,6 +70,26 @@ describe('heap mode: mutation with aliasing (L2)', () => {
   })
 
   test('unmodeled mutation shapes surface a visible warning (L1 fallback)', async () => {
+    // for-loops are not modeled yet — the write must surface as a warning
+    const results = await verifyAll(`
+      interface Acc { value: number }
+      export function loopy(a: Acc, n: number): void {
+        requires(positive(n))
+        ensures(nonNegative(a.value))
+        for (let i = 0; i < n; i++) {
+          a.value = a.value + 1
+        }
+      }
+    `)
+    const anyTask = results.find(r => r.fn === 'loopy')
+    assert.ok(anyTask, 'Expected at least one task for loopy')
+    assert.ok(
+      anyTask.labels.some(l => l.includes('unmodeled field mutation: a.value')),
+      `Expected unmodeled-mutation warning, labels: ${anyTask.labels.join(', ')}`,
+    )
+  })
+
+  test('while-loops WITHOUT invariants are now modeled honestly: havoc refutes', async () => {
     const results = await verifyAll(`
       interface Acc { value: number }
       export function loopy(a: Acc, n: number): void {
@@ -81,12 +101,10 @@ describe('heap mode: mutation with aliasing (L2)', () => {
         }
       }
     `)
-    const anyTask = results.find(r => r.fn === 'loopy')
-    assert.ok(anyTask, 'Expected at least one task for loopy')
-    assert.ok(
-      anyTask.labels.some(l => l.includes('unmodeled field mutation: a.value')),
-      `Expected unmodeled-mutation warning, labels: ${anyTask.labels.join(', ')}`,
-    )
+    const ens = results.find(r => r.fn === 'loopy' && r.text.includes('nonNegative'))
+    assert.ok(ens, 'Expected the ensures task')
+    assert.strictEqual(ens.status, 'disproved',
+      'no invariant constrains the havoced heap — must refute, not warn')
   })
 })
 

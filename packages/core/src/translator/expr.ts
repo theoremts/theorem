@@ -2,6 +2,7 @@ import type { AnyExpr, Bool, Arith, Seq, SMTArray, SMTSet } from 'z3-solver'
 import type { Z3Context } from '../solver/context.js'
 import type { BinaryOp, Expr } from '../parser/ir.js'
 import { makeConst, makeArrayConst, isArrayExpr, isStringExpr, isSetVariable, registerSetVariable } from './variables.js'
+import { jsRegexToRe } from './regex.js'
 
 type Z3Expr = AnyExpr<'main'>
 type Z3Bool = Bool<'main'>
@@ -455,6 +456,43 @@ function translateCall(
   const args = argExprs.map(a => toZ3(a, vars, ctx))
 
   // seqEq(a, b): structural sequence equality — both sides in seq mode
+  // __reTest(str, pattern, flags): Z3 regular-expression membership.
+  // JS re.test is substring search — jsRegexToRe wraps unanchored sides in
+  // Full. The target is forced to String sort (the test implies it).
+  if (callee === '__reTest' && argExprs.length === 3) {
+    const patternArg = argExprs[1]
+    const flagsArg = argExprs[2]
+    if (patternArg?.kind !== 'literal' || typeof patternArg.value !== 'string') return null
+    if (flagsArg?.kind !== 'literal' || typeof flagsArg.value !== 'string') return null
+    const strExpr = argExprs[0]!
+    // Resolve/create the target as a String variable
+    let strName: string | null = null
+    if (strExpr.kind === 'ident') strName = strExpr.name
+    else if (strExpr.kind === 'member') strName = flattenMember(strExpr)
+    if (strName === null) return null
+    const existing = vars.get(strName)
+    if (existing === undefined || !isStringExpr(existing, ctx)) {
+      vars.set(strName, makeConst(strName, 'string', ctx))
+    }
+    const strZ3 = vars.get(strName)!
+    if (!isStringExpr(strZ3, ctx)) return null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const anyCtx = ctx as any
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+    const cache: Map<string, unknown> = anyCtx.__reCache ?? (anyCtx.__reCache = new Map())
+    const key = `${patternArg.value}\u0000${flagsArg.value}`
+    let re = cache.get(key)
+    if (re === undefined) {
+      re = jsRegexToRe(patternArg.value, flagsArg.value, ctx)
+      cache.set(key, re)
+    }
+    if (re === null || re === undefined) return null
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+      return ctx.InRe(strZ3 as unknown as Z3Seq, re as any) as unknown as Z3Expr
+    } catch { return null }
+  }
+
   if (callee === 'seqEq' && argExprs.length === 2) {
     const l = toSeqZ3(argExprs[0]!, vars, ctx)
     const r = toSeqZ3(argExprs[1]!, vars, ctx)

@@ -224,7 +224,12 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     switch (e.kind) {
       case 'literal': return typeof e.value === 'number' && Number.isInteger(e.value)
       case 'ident': return intVars.has(e.name)
-      case 'binary': return (e.op === '+' || e.op === '-' || e.op === '*') && isIntShaped(e.left) && isIntShaped(e.right)
+      case 'binary':
+        // Bitwise results are int32 by construction
+        if (e.op === '|' || e.op === '&' || e.op === '^' || e.op === '<<' || e.op === '>>' || e.op === '>>>') {
+          return isIntShaped(e.left) && isIntShaped(e.right)
+        }
+        return (e.op === '+' || e.op === '-' || e.op === '*') && isIntShaped(e.left) && isIntShaped(e.right)
       case 'ternary': return isIntShaped(e.then) && isIntShaped(e.else)
       case 'member': return e.property === 'length' && e.object.kind === 'ident' && arrayVars.has(e.object.name)
       case 'call': return e.callee === 'Math.floor' && e.args.length === 1
@@ -422,6 +427,31 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           : coerce2(lRaw, rRaw)
         const a = l as Arith<'main'>
         const b = r as Arith<'main'>
+        // Bitwise: JS coerces via ToInt32 — modeled as Int→BV32→op→Int.
+        // Only INT-sorted operands are supported (mixing to_int over Reals
+        // is where this solver build diverges). Shift counts mask & 31,
+        // matching JS; >>> reads the result back unsigned.
+        if (expr.op === '|' || expr.op === '&' || expr.op === '^' || expr.op === '<<' || expr.op === '>>' || expr.op === '>>>') {
+          if (!isIntSorted(l) || !isIntSorted(r)) return null
+          try {
+            const bvA = ctx.Int2BV(a, 32)
+            const bvB = ctx.Int2BV(b, 32)
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const count = (bvB as any).and(31)
+            /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
+            let bvR
+            switch (expr.op) {
+              case '|': bvR = (bvA as any).or(bvB); break
+              case '&': bvR = (bvA as any).and(bvB); break
+              case '^': bvR = (bvA as any).xor(bvB); break
+              case '<<': bvR = (bvA as any).shl(count); break
+              case '>>': bvR = (bvA as any).ashr(count); break
+              default: bvR = (bvA as any).lshr(count); break
+            }
+            return ctx.BV2Int(bvR, expr.op !== '>>>') as unknown as AnyExpr<'main'>
+            /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
+          } catch { return null }
+        }
         try {
           switch (expr.op) {
             case '+': return a.add(b)
@@ -502,8 +532,9 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         }
         const arg0 = expr.args[0] !== undefined ? translate(expr.args[0]!, env, oldEnv) : null
         if (expr.callee === 'Number.isInteger' && arg0 !== null) {
+          if (isIntSorted(arg0)) return ctx.Bool.val(true)  // Int-sorted IS integral
           const x = arg0 as Arith<'main'>
-          return x.eq(ctx.ToInt(x) as Arith<'main'>)
+          try { return x.eq(ctx.ToInt(x) as Arith<'main'>) } catch { return null }
         }
         if (expr.callee === 'positive' && arg0 !== null) return (arg0 as Arith<'main'>).gt(isIntSorted(arg0) ? (ctx.Int.val(0) as unknown as Arith<'main'>) : ctx.Real.val(0))
         if (expr.callee === 'nonNegative' && arg0 !== null) return (arg0 as Arith<'main'>).ge(isIntSorted(arg0) ? (ctx.Int.val(0) as unknown as Arith<'main'>) : ctx.Real.val(0))
@@ -729,6 +760,13 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             env.nums.set(step.name, ctx.If(guard, cv as any, cp as any))
           }
+        } else {
+          // Untranslatable RHS: the variable DID change to something we can't
+          // model — havoc it. Keeping the stale value would prove facts about
+          // a world where the assignment never happened.
+          env.nums.set(step.name, intVars.has(step.name)
+            ? (ctx.Int.const(`${step.name}__havoc${sortCounter++}`) as unknown as AnyExpr<'main'>)
+            : ctx.Real.const(`${step.name}__havoc${sortCounter++}`))
         }
         continue
       }

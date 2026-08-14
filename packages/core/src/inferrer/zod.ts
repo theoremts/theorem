@@ -173,6 +173,8 @@ interface FieldConstraint {
   source: string
   /** For .int(): emit Number.isInteger instead of a comparison. */
   isInt?: boolean
+  /** For .regex(/.../flags): emit __reTest instead of a comparison. */
+  regex?: { pattern: string; flags: string }
 }
 
 /**
@@ -231,6 +233,21 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
 
   // Convert field constraints to InferredContracts
   return constraints.map(c => {
+    if (c.regex !== undefined) {
+      const strExpr = buildFieldExpr(varName, c.field, false)
+      const target = c.field ? `${varName}.${c.field}` : varName
+      return {
+        kind: 'requires' as const,
+        text: `/${c.regex.pattern}/${c.regex.flags}.test(${target})`,
+        predicate: {
+          kind: 'call' as const,
+          callee: '__reTest',
+          args: [strExpr, { kind: 'literal' as const, value: c.regex.pattern }, { kind: 'literal' as const, value: c.regex.flags }],
+        },
+        confidence: 'guard' as const,
+        source: `from Zod schema: ${c.source}`,
+      }
+    }
     if (c.isInt) {
       const intExpr = buildFieldExpr(varName, c.field, false)
       return {
@@ -322,6 +339,15 @@ function extractChainConstraints(
     }
     if (/\.nonempty\(\)/.test(chainText)) {
       out.push({ field, op: '>', value: 0, isLength: true, source: 'z.string().nonempty()' })
+    }
+    // .regex(/pattern/flags) — becomes a Z3 regular-expression membership fact
+    const regexMatch = /\.regex\(\s*\/((?:[^/\\\n]|\\.)*)\/([a-z]*)\s*\)/.exec(chainText)
+    if (regexMatch) {
+      out.push({
+        field, op: '>=', value: 0, isLength: false,
+        regex: { pattern: regexMatch[1]!, flags: regexMatch[2] ?? '' },
+        source: `z.string().regex(/${regexMatch[1]!}/${regexMatch[2] ?? ''})`,
+      })
     }
   }
 

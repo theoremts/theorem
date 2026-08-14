@@ -1,6 +1,7 @@
 import type { Bool, AnyExpr, Arith } from 'z3-solver'
 import type { Z3Context } from '../solver/context.js'
 import type { Expr, FunctionIR, Param, Sort } from '../parser/ir.js'
+import { inferLoopInvariants } from '../verifier/invariant-inference.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { createVariables } from '../translator/variables.js'
 import { toZ3 } from '../translator/expr.js'
@@ -37,6 +38,9 @@ export interface SuggestFunctionResult {
   suggestions: Suggestion[]
   conditionals: ConditionalSuggestion[]
   guards: GuardSuggestion[]
+  /** Spacer-inferred loop invariants (CHC), when the function has an
+   *  uninvarianted numeric loop and an ensures to protect. */
+  loopInvariants?: import('../verifier/invariant-inference.js').LoopInvariantSuggestion | null | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -48,6 +52,16 @@ export async function suggestContracts(
   ctx: Z3Context,
 ): Promise<SuggestFunctionResult> {
   const empty: SuggestFunctionResult = { name: ir.name, params: ir.params.map(p => p.name), suggestions: [], conditionals: [], guards: [] }
+
+  // Loops without invariants: ask Spacer to infer them (CHC encoding).
+  // Runs first — a function that needs invariants usually can't prove
+  // anything else until it has them.
+  if (ir.heapSteps?.some(st => st.kind === 'loop' && st.invariants.length === 0)) {
+    try {
+      const inferred = await inferLoopInvariants(ir, ctx)
+      if (inferred !== null) empty.loopInvariants = inferred
+    } catch { /* inference is best-effort */ }
+  }
 
   // Detect guards and null-safety even for non-number returns
   const guards: GuardSuggestion[] = ir.body ? detectGuards(ir.body) : []

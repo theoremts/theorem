@@ -240,6 +240,33 @@ function parseExprInner(node: Expression): Expr | null {
     }
     if (callee === null) return null
 
+    // Regex test: /pattern/.test(x) or RE.test(x) with `const RE = /pattern/`
+    if (Node.isPropertyAccessExpression(calleeExpr) && calleeExpr.getName() === 'test') {
+      let target: Node = calleeExpr.getExpression()
+      if (Node.isIdentifier(target)) {
+        const decl = target.getSourceFile().getVariableDeclaration(target.getText())
+        const init = decl?.getInitializer()
+        if (init !== undefined && Node.isRegularExpressionLiteral(init)) target = init
+      }
+      if (Node.isRegularExpressionLiteral(target)) {
+        const literalText = target.getText()
+        const lastSlash = literalText.lastIndexOf('/')
+        const patternText = literalText.slice(1, lastSlash)
+        const flagsText = literalText.slice(lastSlash + 1)
+        const strArg = node.getArguments()[0]
+        if (strArg !== undefined) {
+          const parsed = parseExpr(strArg as Expression)
+          if (parsed !== null) {
+            return {
+              kind: 'call',
+              callee: '__reTest',
+              args: [parsed, { kind: 'literal', value: patternText }, { kind: 'literal', value: flagsText }],
+            }
+          }
+        }
+      }
+    }
+
     // Quantifiers: forall(x => P(x)), exists(x => P(x))
     if (callee === 'forall' || callee === 'exists') {
       const callArgs = node.getArguments()
@@ -931,6 +958,7 @@ const OPS: Record<string, BinaryOp> = {
   '<': '<', '<=': '<=', '>': '>', '>=': '>=',
   '===': '===', '!==': '!==',
   '&&': '&&', '||': '||',
+  '|': '|', '&': '&', '^': '^', '<<': '<<', '>>': '>>', '>>>': '>>>',
   '??': '??',
   'in': 'in',
   // Also accept loose equality for convenience

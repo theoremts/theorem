@@ -30,6 +30,7 @@ export type BinaryOp =
   | '===' | '!=='
   | '&&' | '||'
   | '==>'
+  | '|' | '&' | '^' | '<<' | '>>' | '>>>'
   | '??'
   | 'in'
 
@@ -99,6 +100,9 @@ export interface LoopInfo {
 export interface Param {
   name: string
   sort: Sort
+  /** Discriminated-union metadata: `p.kind` ranges over these string
+   *  literals — exhaustiveness becomes a provable fact. */
+  discriminant?: { property: string; values: string[] } | undefined
 }
 
 /**
