@@ -267,6 +267,58 @@ describe('heap mode: branches and early returns', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F2: spec functions with fuel-bounded definitional axioms
+// ---------------------------------------------------------------------------
+
+describe('spec functions (F2)', () => {
+  const source = `
+    interface Node { value: number; next: Node | null }
+    function allPositive(n: Node | null): boolean {
+      return n === null ? true : n.value > 0 && allPositive(n.next)
+    }
+    export function consPositive(x: number, tail: Node | null): Node {
+      requires(positive(x))
+      requires(tail === null || allPositive(tail))
+      ensures(allPositive(output()))
+      return { value: x, next: tail }
+    }
+    export function buggyCons(x: number, tail: Node | null): Node {
+      requires(tail === null || allPositive(tail))
+      ensures(allPositive(output()))
+      return { value: x, next: tail }
+    }
+    function isSorted(p: { lo: number; hi: number }): boolean {
+      return p.lo <= p.hi
+    }
+    export function makeSorted(a: number, b: number): { lo: number; hi: number } {
+      ensures(isSorted(output()))
+      return a <= b ? { lo: a, hi: b } : { lo: b, hi: a }
+    }
+  `
+
+  test('recursive spec function: cons preserves the inductive invariant', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'consPositive')
+    assert.ok(r, 'Expected consPositive obligation')
+    assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.join(', ')}`)
+  })
+
+  test('missing hypothesis is refuted, not vacuously proved', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'buggyCons')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+
+  test('ternary-of-objects body + non-recursive spec predicate', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'makeSorted')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 

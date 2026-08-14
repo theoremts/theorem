@@ -136,6 +136,11 @@ export interface FunctionIR {
   heapRoots?: string[] | undefined
   /** Field writes the parser could NOT model (unsupported body shape). */
   unmodeledWrites?: string[] | undefined
+  /**
+   * Spec-function definitions visible to this function's contracts —
+   * pure (possibly recursive) same-file functions, unfolded with fuel.
+   */
+  specDefs?: Map<string, { params: string[]; body: Expr; isBool: boolean }> | undefined
 }
 
 /** One step of a heap-mode body. */

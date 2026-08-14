@@ -8,6 +8,7 @@ import { toZ3 } from './expr.js'
 import { translateStringContract } from './string-contracts.js'
 import { substituteExpr, substituteOutput } from './substitution.js'
 import { translateHeapMode } from './heap.js'
+import { unfoldSpecCalls } from './spec-unfold.js'
 
 export type { Z3Context }
 
@@ -43,6 +44,40 @@ export function translate(
   ctx: Z3Context,
   registry?: ContractRegistry,
 ): VerificationTask[] {
+  // Spec functions: calls in contract predicates become uninterpreted
+  // applications (congruence!), with ground definitional axioms emitted per
+  // call instance up to the fuel bound (see translator/spec-unfold.ts)
+  if (ir.specDefs !== undefined && ir.specDefs.size > 0) {
+    const defs = ir.specDefs
+    const axioms: Array<{ text: string; predicate: Expr }> = []
+    const contracts = ir.contracts.map(c => {
+      if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) {
+        const unfolded = unfoldSpecCalls(c.predicate as Expr, defs)
+        axioms.push(...unfolded.axioms)
+        return { ...c, predicate: unfolded.expr } as typeof c
+      }
+      return c
+    })
+    if (axioms.length > 0 || contracts.some((c, i) => c !== ir.contracts[i])) {
+      const seenAxioms = new Set<string>()
+      const uniqueAxioms = axioms.filter(a => {
+        const key = prettyExpr(a.predicate)
+        if (seenAxioms.has(key)) return false
+        seenAxioms.add(key)
+        return true
+      })
+      // Axioms PREPENDED: assume/ensures share one sequential pass, and the
+      // ensures task snapshots the assumptions gathered so far
+      ir = {
+        ...ir,
+        contracts: [
+          ...uniqueAxioms.map(a => ({ kind: 'assume' as const, predicate: a.predicate })),
+          ...contracts,
+        ],
+      }
+    }
+  }
+
   // Heap mode: the function mutates fields of object parameters — flat
   // per-path variables are unsound under aliasing, so the heap is encoded
   // as Z3 arrays instead (see translator/heap.ts).
@@ -109,6 +144,32 @@ export function translate(
             assumptions.push((propVar as any).eq(propZ3))
             assumptionLabels.push(`body: ${propName} = ${prettyExpr(prop.value)}`)
           } catch { /* sort mismatch */ }
+        }
+      }
+    }
+
+    // Ternary of object literals: `cond ? { lo: a, hi: b } : { lo: b, hi: a }`
+    // expands into per-property ITEs on result.prop
+    if (ir.body.kind === 'ternary' && ir.body.then.kind === 'object' && ir.body.else.kind === 'object') {
+      const condZ3 = toZ3(ir.body.condition, vars, ctx)
+      if (condZ3 !== null) {
+        const thenProps = new Map(ir.body.then.properties.map(p => [p.key, p.value]))
+        const elseProps = new Map(ir.body.else.properties.map(p => [p.key, p.value]))
+        for (const [key, thenVal] of thenProps) {
+          const elseVal = elseProps.get(key)
+          if (elseVal === undefined || key === '...') continue
+          const propName = `result.${key}`
+          if (!vars.has(propName)) vars.set(propName, makeConst(propName, 'real', ctx))
+          const thenZ3 = toZ3(thenVal, vars, ctx)
+          const elseZ3 = toZ3(elseVal, vars, ctx)
+          const propVar = vars.get(propName)
+          if (thenZ3 !== null && elseZ3 !== null && propVar !== undefined) {
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              assumptions.push((propVar as any).eq(ctx.If(condZ3 as Bool<'main'>, thenZ3, elseZ3)))
+              assumptionLabels.push(`body: ${propName} = ${prettyExpr(ir.body.condition)} ? ... : ...`)
+            } catch { /* sort mismatch */ }
+          }
         }
       }
     }

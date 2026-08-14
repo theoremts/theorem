@@ -422,6 +422,32 @@ function translateCall(
 ): Z3Expr | null {
   const args = argExprs.map(a => toZ3(a, vars, ctx))
 
+  // Fuel-exhausted spec-function calls → Z3 uninterpreted functions.
+  // Congruence closure makes equal arguments yield equal results, which
+  // connects `f(result.next)` to `f(tail)` through body equations.
+  if (callee.startsWith('__ufb_') || callee.startsWith('__ufr_')) {
+    if (args.some(a => a === null)) return null
+    const isBool = callee.startsWith('__ufb_')
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const anyCtx = ctx as any
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+      const cache: Map<string, unknown> = anyCtx.__ufCache ?? (anyCtx.__ufCache = new Map())
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      const argSorts = args.map(a => (a as any).sort)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      const key = `${callee}(${argSorts.map((s: any) => String(s)).join(',')})`
+      let decl = cache.get(key)
+      if (decl === undefined) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+        decl = ctx.Function.declare(key.replace(/[^\w]/g, '_'), ...argSorts, isBool ? ctx.Bool.sort() : ctx.Real.sort())
+        cache.set(key, decl)
+      }
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+      return (decl as any).call(...args)
+    } catch { return null }
+  }
+
   // ── String method calls: s.includes(x), s.startsWith(x), etc. ──
   const dotIdx = callee.lastIndexOf('.')
   // Object.hasOwn(obj, 'prop') → __has_<prop>_<obj>

@@ -144,6 +144,16 @@ export function extractFromSource(source: string, fileName = 'input.ts', registr
     attachParamRefinements(file, source, fileName, results)
   } catch { /* best-effort */ }
 
+  // 3e. Spec-function definitions: every pure same-file function whose body
+  //     folds to an expression is available for unfolding inside contract
+  //     predicates (translator/spec-unfold.ts). Attached to every IR.
+  try {
+    const specDefs = collectSpecDefs(source, fileName)
+    if (specDefs.size > 0) {
+      for (const ir of results) ir.specDefs = specDefs
+    }
+  } catch { /* best-effort */ }
+
   // 4. Declared contracts: if registry has contracts for functions in this file,
   //    extract the function body and attach the declared contracts.
   //    This allows `declare(fn, ...)` in a .contracts.ts file to be verified
@@ -1011,6 +1021,36 @@ function collectRefComparisonRoots(expr: Expr, roots: Set<string>): void {
     collectRefComparisonRoots(expr.condition, roots)
     collectRefComparisonRoots(expr.then, roots)
     collectRefComparisonRoots(expr.else, roots)
+  }
+}
+
+/**
+ * Collects spec-function definitions: named functions whose bodies fold to a
+ * single expression. Recursion is fine — the unfolder bounds it with fuel.
+ */
+function collectSpecDefs(
+  source: string,
+  fileName: string,
+): Map<string, { params: string[]; body: Expr; isBool: boolean }> {
+  const defs = new Map<string, { params: string[]; body: Expr; isBool: boolean }>()
+  for (const fn of extractFunctionsFromSource(source, fileName)) {
+    if (!fn.name || fn.body === undefined) continue
+    defs.set(fn.name, {
+      params: fn.params.map(p => p.name),
+      body: fn.body,
+      isBool: isBooleanBody(fn.body),
+    })
+  }
+  return defs
+}
+
+function isBooleanBody(expr: Expr): boolean {
+  switch (expr.kind) {
+    case 'literal': return typeof expr.value === 'boolean'
+    case 'binary': return ['===', '!==', '<', '<=', '>', '>=', '&&', '||'].includes(expr.op)
+    case 'unary': return expr.op === '!'
+    case 'ternary': return isBooleanBody(expr.then) || isBooleanBody(expr.else)
+    default: return false
   }
 }
 
