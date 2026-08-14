@@ -150,6 +150,38 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     if (!rootNames.has(p.name)) numericVars.set(p.name, ctx.Real.const(p.name))
   }
 
+  // Mutable numeric state (`this.x` fields, let-locals): the entry-state
+  // constant doubles as the old() value — num-assigns update env.nums, so
+  // reads fall back here only before the first write.
+  const numTargets = new Set<string>()
+  const collectNumTargets = (list: typeof steps): void => {
+    for (const s of list) {
+      if (s.kind === 'num-assign') numTargets.add(s.name)
+      else if (s.kind === 'branch') { collectNumTargets(s.then); collectNumTargets(s.else) }
+      else if (s.kind === 'loop') collectNumTargets(s.body)
+    }
+  }
+  collectNumTargets(steps)
+  // `this.*` idents read by contracts but never assigned (e.g. a field the
+  // invariant relates others to) also need entry constants.
+  const collectThisIdents = (e: Expr): void => {
+    switch (e.kind) {
+      case 'ident': if (e.name.startsWith('this.')) numTargets.add(e.name); break
+      case 'binary': collectThisIdents(e.left); collectThisIdents(e.right); break
+      case 'unary': collectThisIdents(e.operand); break
+      case 'ternary': collectThisIdents(e.condition); collectThisIdents(e.then); collectThisIdents(e.else); break
+      case 'call': for (const a of e.args) collectThisIdents(a); break
+      case 'member': collectThisIdents(e.object); break
+      default: break
+    }
+  }
+  for (const p of contractPredicates) collectThisIdents(p)
+  for (const n of numTargets) {
+    if (n !== '__result' && !rootNames.has(n) && !numericVars.has(n)) {
+      numericVars.set(n, ctx.Real.const(n))
+    }
+  }
+
   interface Env {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     heap: Map<string, any>
@@ -314,7 +346,15 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         if (expr.callee === 'old' && expr.args.length === 1) {
           return translate(expr.args[0]!, oldEnv, oldEnv)
         }
+        // output(): the returned value — bound by the trailing return step
+        if (expr.callee === 'output' && expr.args.length === 0) {
+          return env.locals.get('__result') ?? env.nums.get('__result') ?? null
+        }
         const arg0 = expr.args[0] !== undefined ? translate(expr.args[0]!, env, oldEnv) : null
+        if (expr.callee === 'Number.isInteger' && arg0 !== null) {
+          const x = arg0 as Arith<'main'>
+          return x.eq(ctx.ToInt(x) as Arith<'main'>)
+        }
         if (expr.callee === 'positive' && arg0 !== null) return (arg0 as Arith<'main'>).gt(ctx.Real.val(0))
         if (expr.callee === 'nonNegative' && arg0 !== null) return (arg0 as Arith<'main'>).ge(ctx.Real.val(0))
         if (expr.callee === 'negative' && arg0 !== null) return (arg0 as Arith<'main'>).lt(ctx.Real.val(0))
@@ -492,7 +532,16 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
   const processSteps = (list: import('../parser/ir.js').HeapStep[], pc: Bool<'main'> | null): void => {
     for (const step of list) {
-      if (step.kind === 'alias') continue
+      if (step.kind === 'alias') {
+        // Numeric aliases (`let remaining = txCount`) seed mutable state;
+        // object-root aliases are resolved statically through aliasOf.
+        const src = resolveAlias(step.of, aliasOf)
+        if (!rootNames.has(src)) {
+          const v = env.nums.get(step.of) ?? numericVars.get(step.of) ?? numericVars.get(src)
+          if (v !== undefined) env.nums.set(step.name, v)
+        }
+        continue
+      }
 
       if (step.kind === 'local') {
         const v = translate(step.value, env, oldEnv)
@@ -507,7 +556,12 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
       if (step.kind === 'num-assign') {
         const v = translate(step.value, env, oldEnv)
-        if (v !== null) env.nums.set(step.name, v)
+        if (v !== null) {
+          const prev = env.nums.get(step.name) ?? numericVars.get(step.name)
+          const guard = pc === null ? alive : ctx.And(alive, pc)
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          env.nums.set(step.name, prev === undefined ? v : ctx.If(guard, v as any, prev as any))
+        }
         continue
       }
 

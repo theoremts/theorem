@@ -696,3 +696,119 @@ describe('refinement types', () => {
     assert.strictEqual(violated.status, 'disproved', 'as-cast satisfies tsc, not Z3')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Class methods with loops route through heap mode (this.x as mutable state)
+//
+// Regression: the SSA path cannot see through while loops — the class
+// invariant's exit obligation was checked against the ENTRY state (trivially
+// proved), and __old_x = x equations contradicted the post-loop invariants,
+// making every ensures vacuously provable. Heap mode havocs loop-written
+// state and re-executes the body for preservation, so both bugs are gone.
+// ---------------------------------------------------------------------------
+
+describe('class-method loops: heap-mode routing', () => {
+  const vault = (loopBody: string, extraInvariant: string) => `
+    @invariant((self: Vault) =>
+      self.balance >= 0 &&
+      self.totalDistributed === self.initialDeposit - self.balance
+    )
+    class Vault {
+      balance: number
+      initialDeposit: number
+      totalDistributed: number
+
+      constructor(deposit: number) {
+        requires(positive(deposit))
+        this.balance = deposit
+        this.initialDeposit = deposit
+        this.totalDistributed = 0
+      }
+
+      processBatch(txCount: number, amountPerTx: number): number {
+        requires(Number.isInteger(txCount))
+        requires(positive(txCount))
+        requires(positive(amountPerTx))
+        requires(txCount * amountPerTx <= this.balance)
+        ensures(this.balance === old(this.balance) - (txCount * amountPerTx))
+        ensures(output() === txCount * amountPerTx)
+
+        let remaining = txCount
+        let totalSent = 0
+
+        while (remaining > 0) {
+          invariant(() => Number.isInteger(remaining))
+          invariant(() => remaining >= 0)
+          invariant(() => totalSent === (txCount - remaining) * amountPerTx)
+          invariant(() => this.balance === old(this.balance) - totalSent)
+          ${extraInvariant}
+          decreases(() => remaining)
+          ${loopBody}
+          totalSent += amountPerTx
+          remaining--
+        }
+
+        return totalSent
+      }
+    }
+  `
+
+  const correctBody = `
+    this.balance -= amountPerTx
+    this.totalDistributed += amountPerTx
+  `
+  const distributedInvariant =
+    'invariant(() => this.totalDistributed === old(this.totalDistributed) + totalSent)'
+
+  test('complete invariants: everything proves, including the class invariant at exit', async () => {
+    const results = await verifyAll(vault(correctBody, distributedInvariant))
+    const method = results.filter(r => r.fn === 'processBatch')
+    assert.ok(method.length >= 10, `Expected heap-mode task set, got ${method.length}`)
+    for (const r of method) {
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
+    }
+    const exitInv = method.find(r => r.text.includes('this.totalDistributed === this.initialDeposit'))
+    assert.ok(exitInv, 'Expected class-invariant exit obligation')
+    // The exit obligation must NOT prove from the entry assumption alone —
+    // it needs the post-loop invariants (the old SSA path's trivial proof).
+    assert.ok(
+      exitInv.labels.some(l => l.includes('post-loop')),
+      'Class-invariant exit task must see the post-loop state',
+    )
+  })
+
+  test('missing loop invariant for a mutated field: class invariant at exit is DISPROVED', async () => {
+    const results = await verifyAll(vault(correctBody, ''))
+    const exitInv = results.find(
+      r => r.fn === 'processBatch' && r.text.includes('this.totalDistributed === this.initialDeposit'),
+    )
+    assert.ok(exitInv, 'Expected class-invariant exit obligation')
+    assert.strictEqual(exitInv.status, 'disproved',
+      'totalDistributed is havoced by the loop and unconstrained — must not prove')
+  })
+
+  test('vacuity regression: a blatantly false ensures is DISPROVED, not proved', async () => {
+    const source = vault(correctBody, distributedInvariant)
+      .replace('ensures(output() === txCount * amountPerTx)',
+               'ensures(output() === txCount * amountPerTx + 999)')
+    const results = await verifyAll(source)
+    const bogus = results.find(r => r.fn === 'processBatch' && r.text.includes('999'))
+    assert.ok(bogus, 'Expected the false ensures task')
+    assert.strictEqual(bogus.status, 'disproved', 'post-loop assumptions must be satisfiable')
+  })
+
+  test('buggy loop body: invariant preservation catches the drift', async () => {
+    const buggyBody = `
+      this.balance -= amountPerTx
+      this.totalDistributed += amountPerTx + 1
+    `
+    const results = await verifyAll(vault(buggyBody, distributedInvariant))
+    const preserved = results.find(
+      r => r.fn === 'processBatch'
+        && r.text.includes('preserved')
+        && r.text.includes('this.totalDistributed'),
+    )
+    assert.ok(preserved, 'Expected preservation task for the totalDistributed invariant')
+    assert.strictEqual(preserved.status, 'disproved', 'the +1 drift breaks the invariant')
+  })
+})

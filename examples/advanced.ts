@@ -148,3 +148,61 @@ export function addThenHas(s: Set<number>, x: number): boolean {
 }
 
 export { createDiscount, safeAdd }
+
+
+@invariant((self: TokenVault) =>
+  self.balance >= 0 &&
+  self.totalDistributed === self.initialDeposit - self.balance
+)
+class TokenVault {
+  balance: number;
+  initialDeposit: number;
+  totalDistributed: number;
+
+  constructor(deposit: number) {
+    requires(positive(deposit));
+
+    this.balance = deposit;
+    this.initialDeposit = deposit;
+    this.totalDistributed = 0;
+  }
+
+  // Processa saques em lote de tamanho uniforme de forma segura.
+  // O laço muta this.* — verificado via havoc + invariantes (heap mode):
+  // cada invariante precisa valer na entrada E ser preservada por uma
+  // iteração arbitrária; o estado pós-laço é APENAS o que elas garantem.
+  processUniformBatch(txCount: number, amountPerTx: number): number {
+    requires(Number.isInteger(txCount)); // contagem fracionária quebraria o argumento
+    requires(positive(txCount));
+    requires(positive(amountPerTx));
+    requires(txCount * amountPerTx <= this.balance); // Impede quebra do cofre
+
+    ensures(this.balance === old(this.balance) - (txCount * amountPerTx));
+    ensures(output() === txCount * amountPerTx);
+
+    let remaining = txCount;
+    let totalSent = 0;
+
+    while (remaining > 0) {
+      // remaining inteiro ⟹ remaining > 0 implica remaining >= 1, e a saída
+      // do laço dá remaining === 0 exato (>= 0 ∧ ¬(> 0))
+      invariant(() => Number.isInteger(remaining));
+      invariant(() => remaining >= 0);
+      invariant(() => totalSent === (txCount - remaining) * amountPerTx);
+      invariant(() => this.balance === old(this.balance) - totalSent);
+      // Sem esta, this.totalDistributed fica livre após o havoc e a
+      // invariante DE CLASSE não fecha na saída do método:
+      invariant(() => this.totalDistributed === old(this.totalDistributed) + totalSent);
+
+      // Garante matematicamente que o laço vai terminar
+      decreases(() => remaining);
+
+      this.balance -= amountPerTx;
+      this.totalDistributed += amountPerTx;
+      totalSent += amountPerTx;
+      remaining--;
+    }
+
+    return totalSent;
+  }
+}

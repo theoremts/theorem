@@ -430,6 +430,9 @@ function extractDecoratedMethods(
       let body: FunctionIR['body']
       let loops: LoopInfo[] | undefined
       let finalBindings = new Map<string, Expr>()
+      let heapSteps: HeapStep[] | undefined
+      let heapRoots: string[] | undefined
+      let unmodeledWrites: string[] | undefined
 
       if (fnBody && Node.isBlock(fnBody)) {
         // Inline contracts in the method body (requires/ensures as statements)
@@ -439,21 +442,44 @@ function extractDecoratedMethods(
           if (contract !== null) contracts.push(contract)
         }
 
-        const result = parseBlockWithLoops(fnBody)
-        body = result.body ?? undefined
-        loops = result.loops.length > 0 ? result.loops : undefined
-        finalBindings = getFinalSSABindings()
+        // Methods with loops route through the heap-mode machinery: `this.x`
+        // becomes mutable numeric state (num-assign), so loop havoc + real
+        // preservation checks apply. The SSA path cannot see through loops —
+        // its exit-state invariant obligation would be checked against the
+        // ENTRY state, proving trivially even for bodies that break it.
+        if (fnBody.getDescendantsOfKind(SyntaxKind.WhileStatement).length > 0) {
+          const steps = extractHeapStmtList(fnBody.getStatements(), true)
+          if (steps !== null && steps.some(st => st.kind === 'loop')) {
+            heapSteps = steps
+            heapRoots = collectAllHeapRoots(steps, [
+              ...contracts,
+              ...classInvariants.map(inv => ({ kind: 'requires' as const, predicate: inv })),
+            ])
+          } else {
+            unmodeledWrites = ['loop body could not be modeled — verification incomplete']
+          }
+        }
+
+        if (heapSteps === undefined) {
+          const result = parseBlockWithLoops(fnBody)
+          body = result.body ?? undefined
+          loops = result.loops.length > 0 ? result.loops : undefined
+          finalBindings = getFinalSSABindings()
+        }
       }
 
       if (contracts.length === 0 && classInvariants.length === 0) continue
 
       // Class invariants: assumed at entry, must hold over the final state
-      // of `this.*` fields at exit.
+      // of `this.*` fields at exit. In heap mode the predicate is translated
+      // against the final environment directly — no substitution needed.
       for (const inv of classInvariants) {
         contracts.push({ kind: 'requires', predicate: inv })
         contracts.push({
           kind: 'ensures',
-          predicate: finalBindings.size > 0 ? substituteExpr(inv, finalBindings) : inv,
+          predicate: heapSteps === undefined && finalBindings.size > 0
+            ? substituteExpr(inv, finalBindings)
+            : inv,
         })
       }
 
@@ -464,6 +490,9 @@ function extractDecoratedMethods(
         body,
         contracts,
         loops,
+        heapSteps,
+        heapRoots,
+        unmodeledWrites,
       })
     }
 
@@ -877,7 +906,11 @@ function tryExtractHeapSteps(
   if (extracted === null || !hasFieldWrite(extracted)) return { unsupported: allWrites }
   const steps = extracted
 
-  // Roots: write bases + member objects + idents ref-compared against them
+  return { steps, roots: collectAllHeapRoots(steps, contracts) }
+}
+
+/** Roots: write bases + member objects + idents ref-compared against them. */
+function collectAllHeapRoots(steps: HeapStep[], contracts: Contract[]): string[] {
   const roots = new Set<string>()
   collectHeapRoots(steps, roots)
   const predicates: Expr[] = []
@@ -893,8 +926,7 @@ function tryExtractHeapSteps(
     for (const p of predicates) collectRefComparisonRoots(p, roots)
     walkHeapExprs(steps, e => collectRefComparisonRoots(e, roots))
   }
-
-  return { steps, roots: [...roots] }
+  return [...roots]
 }
 
 /** Recursively extracts heap steps from a statement list; null = unsupported. */
@@ -903,6 +935,14 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
 
   for (const s of stmts) {
     if (Node.isReturnStatement(s)) {
+      const returned = s.getExpression()
+      if (returned !== undefined) {
+        // A guarded value-return would need a path-conditioned result — bail
+        if (!topLevel) return null
+        const value = parseExpr(returned as Expression)
+        if (value === null) return null
+        steps.push({ kind: 'num-assign', name: '__result', value })
+      }
       steps.push({ kind: 'exit' })
       break  // statements after return are dead code
     }
@@ -910,24 +950,68 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
     if (Node.isExpressionStatement(s)) {
       const expr = s.getExpression()
       if (Node.isCallExpression(expr)) continue  // check/assume — positional contracts
-      if (Node.isBinaryExpression(expr) && expr.getOperatorToken().getText() === '=') {
-        const left = expr.getLeft()
-        if (Node.isPropertyAccessExpression(left)) {
-          const base = memberChainBase(left)
-          if (base !== null && base !== 'this') {
-            const objectExpr = parseExpr(left.getExpression() as Expression)
-            const value = parseExpr(expr.getRight() as Expression)
-            if (objectExpr === null || value === null) return null
-            steps.push({ kind: 'field-write', root: base, object: objectExpr, field: left.getName(), value })
+      if (Node.isBinaryExpression(expr)) {
+        const opText = expr.getOperatorToken().getText()
+        const compound =
+          opText === '+=' ? '+' : opText === '-=' ? '-' :
+          opText === '*=' ? '*' : opText === '/=' ? '/' : null
+        if (opText === '=' || compound !== null) {
+          const left = expr.getLeft()
+          const rhs = parseExpr(expr.getRight() as Expression)
+          if (rhs === null) return null
+          if (Node.isPropertyAccessExpression(left)) {
+            const base = memberChainBase(left)
+            if (base !== null && base !== 'this') {
+              const objectExpr = parseExpr(left.getExpression() as Expression)
+              const current = parseExpr(left as Expression)
+              if (objectExpr === null || current === null) return null
+              const value: Expr = compound === null
+                ? rhs
+                : { kind: 'binary', op: compound, left: current, right: rhs }
+              steps.push({ kind: 'field-write', root: base, object: objectExpr, field: left.getName(), value })
+              continue
+            }
+            // this.x — normalized to a flat ident, mutable numeric state
+            if (base === 'this') {
+              const name = left.getText()
+              const value: Expr = compound === null
+                ? rhs
+                : { kind: 'binary', op: compound, left: { kind: 'ident', name }, right: rhs }
+              steps.push({ kind: 'num-assign', name, value })
+              continue
+            }
+          }
+          // Numeric assignment (loop counters): n = n - 1, n += 1
+          if (Node.isIdentifier(left)) {
+            const name = left.getText()
+            const value: Expr = compound === null
+              ? rhs
+              : { kind: 'binary', op: compound, left: { kind: 'ident', name }, right: rhs }
+            steps.push({ kind: 'num-assign', name, value })
             continue
           }
         }
-        // Numeric assignment (loop counters): n = n - 1
-        if (Node.isIdentifier(left)) {
-          const value = parseExpr(expr.getRight() as Expression)
-          if (value === null) return null
-          steps.push({ kind: 'num-assign', name: left.getText(), value })
-          continue
+        return null
+      }
+      // n++ / n-- / ++n / --n (identifiers and this.x)
+      if (Node.isPostfixUnaryExpression(expr) || Node.isPrefixUnaryExpression(expr)) {
+        const op = expr.getOperatorToken()
+        const delta = op === SyntaxKind.PlusPlusToken ? '+' : op === SyntaxKind.MinusMinusToken ? '-' : null
+        if (delta !== null) {
+          const operand = expr.getOperand()
+          let name: string | null = null
+          if (Node.isIdentifier(operand)) name = operand.getText()
+          else if (Node.isPropertyAccessExpression(operand) && memberChainBase(operand) === 'this') {
+            name = operand.getText()
+          }
+          if (name !== null) {
+            steps.push({
+              kind: 'num-assign',
+              name,
+              value: { kind: 'binary', op: delta, left: { kind: 'ident', name }, right: { kind: 'literal', value: 1 } },
+            })
+            continue
+          }
         }
       }
       return null
@@ -935,6 +1019,7 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
 
     if (Node.isVariableStatement(s)) {
       if (!topLevel) return null  // branch-local consts: deferred
+      const isConst = String(s.getDeclarationKind()) === 'const'
       for (const decl of s.getDeclarations()) {
         const init = decl.getInitializer()
         if (!init) return null
@@ -944,7 +1029,12 @@ function extractHeapStmtList(stmts: Statement[], topLevel: boolean): HeapStep[] 
         }
         const value = parseExpr(init as Expression)
         if (value === null) return null
-        steps.push({ kind: 'local', name: decl.getName(), value })
+        // `let` locals may be reassigned (loop accumulators) — model them as
+        // mutable numeric state so loop havoc reaches them; `const` locals
+        // are immutable bindings.
+        steps.push(isConst
+          ? { kind: 'local', name: decl.getName(), value }
+          : { kind: 'num-assign', name: decl.getName(), value })
       }
       continue
     }
@@ -1148,7 +1238,8 @@ function memberChainBase(node: Expression): string | null {
   while (Node.isPropertyAccessExpression(current)) {
     current = current.getExpression()
   }
-  return Node.isIdentifier(current) ? current.getText() : null
+  if (Node.isIdentifier(current)) return current.getText()
+  return current.getKind() === SyntaxKind.ThisKeyword ? 'this' : null
 }
 
 function collectMemberRoots(expr: Expr, roots: Set<string>): void {
