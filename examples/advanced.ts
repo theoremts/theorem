@@ -167,15 +167,15 @@ class TokenVault {
     this.totalDistributed = 0;
   }
 
-  // Processa saques em lote de tamanho uniforme de forma segura.
-  // O laço muta this.* — verificado via havoc + invariantes (heap mode):
-  // cada invariante precisa valer na entrada E ser preservada por uma
-  // iteração arbitrária; o estado pós-laço é APENAS o que elas garantem.
+  // Processes a uniform batch of withdrawals safely.
+  // The loop mutates this.* — verified via havoc + invariants (heap mode):
+  // each invariant must hold at entry AND be preserved by an arbitrary
+  // iteration; the post-loop state is ONLY what the invariants guarantee.
   processUniformBatch(txCount: number, amountPerTx: number): number {
-    requires(Number.isInteger(txCount)); // contagem fracionária quebraria o argumento
+    requires(Number.isInteger(txCount)); // a fractional count would break the argument
     requires(positive(txCount));
     requires(positive(amountPerTx));
-    requires(txCount * amountPerTx <= this.balance); // Impede quebra do cofre
+    requires(txCount * amountPerTx <= this.balance); // prevents draining the vault
 
     ensures(this.balance === old(this.balance) - (txCount * amountPerTx));
     ensures(output() === txCount * amountPerTx);
@@ -184,17 +184,17 @@ class TokenVault {
     let totalSent = 0;
 
     while (remaining > 0) {
-      // remaining inteiro ⟹ remaining > 0 implica remaining >= 1, e a saída
-      // do laço dá remaining === 0 exato (>= 0 ∧ ¬(> 0))
+      // remaining integral ⟹ remaining > 0 implies remaining >= 1, and the
+      // loop exit gives remaining === 0 exactly (>= 0 ∧ ¬(> 0))
       invariant(() => Number.isInteger(remaining));
       invariant(() => remaining >= 0);
       invariant(() => totalSent === (txCount - remaining) * amountPerTx);
       invariant(() => this.balance === old(this.balance) - totalSent);
-      // Sem esta, this.totalDistributed fica livre após o havoc e a
-      // invariante DE CLASSE não fecha na saída do método:
+      // Without this one, this.totalDistributed is free after the havoc and
+      // the CLASS invariant cannot close at method exit:
       invariant(() => this.totalDistributed === old(this.totalDistributed) + totalSent);
 
-      // Garante matematicamente que o laço vai terminar
+      // Proves the loop terminates
       decreases(() => remaining);
 
       this.balance -= amountPerTx;

@@ -1,6 +1,6 @@
 # Theorem
 
-**Formal verification for TypeScript.** Prove your code is correct for *all* possible inputs — not by testing samples, but by mathematical proof using the Z3 SMT solver.
+**Formal verification for TypeScript.** Prove your code is correct for *all* possible inputs — not by testing samples, but by mathematical proof with the [Z3](https://github.com/Z3Prover/z3) SMT solver.
 
 ```typescript
 import { requires, ensures, positive, nonNegative, output } from 'theoremts'
@@ -21,27 +21,41 @@ $ theorem verify src/
        using: requires: positive(b)
 ```
 
-## Why Theorem?
+Every contract is a **no-op at runtime**. Theorem is pure static analysis: your bundles ship exactly the code you wrote.
+
+---
+
+## Table of contents
+
+- [Why Theorem](#why-theorem)
+- [Quick start](#quick-start)
+- [The five commands](#the-five-commands)
+- [Writing contracts](#writing-contracts)
+- [Cross-function verification](#cross-function-verification)
+- [Loops](#loops)
+- [Schemas as contracts](#schemas-as-contracts)
+- [Class invariants](#class-invariants)
+- [Verified mutation](#verified-mutation)
+- [Counterexamples as regression tests](#counterexamples-as-regression-tests)
+- [Zero-annotation analysis: scan, suggest, infer](#zero-annotation-analysis-scan-suggest-infer)
+- [Editor integration](#editor-integration)
+- [External library contracts](#external-library-contracts)
+- [Configuration, CI, bundlers](#configuration-ci-bundlers)
+- [How it works](#how-it-works)
+
+---
+
+## Why Theorem
 
 **Tests check examples. Theorem checks all inputs.**
 
 ```
-Unit test:   tests safeDivide(10, 2) → 5           (1 case)
-fast-check:  tests 1000 random combinations          (1000 cases)
-Theorem/Z3:  proves NO input can violate the contract (all cases)
+Unit test:   checks safeDivide(10, 2) → 5             (1 case)
+fast-check:  checks 1000 random combinations           (1000 cases)
+Theorem:     proves NO input can violate the contract  (all cases)
 ```
 
-If there's a bug, Z3 finds the exact input:
-
-```
-  buggyDiscount
-    ✗  nonNegative(output())
-       counterexample: price = 0.25, discount = 0.5, result = -0.25
-```
-
-### The Bug Tests Won't Catch
-
-A shipping calculator with tiers, surcharges, and a loyalty discount:
+The difference matters for the bugs nobody writes a test for. A shipping calculator with tiers, surcharges, and a loyalty discount:
 
 ```typescript
 function calculateShipping(weight: number, distance: number, memberYears: number): number {
@@ -72,44 +86,48 @@ function calculateShipping(weight: number, distance: number, memberYears: number
 }
 ```
 
-5 unit tests pass. Then:
+Five unit tests pass. Then:
 
 ```
 $ theorem verify shipping.ts
-
   calculateShipping
     ✗  output() > 0
        counterexample: weight = 1, distance = 1, memberYears = 51, result = -0.02
 ```
 
-A 60-year member gets 120% discount → negative shipping cost. Z3 finds it in 0.01s. No developer writes a test for a 60-year member — but the code allows it.
+A 51-year member gets a 102% discount → negative shipping cost. Z3 finds the exact input in milliseconds. No developer writes a test for a 51-year member — but the code allows it.
 
-## Installation
+Everything in this README passes `tsc --strict`. The bugs live in the arithmetic, not the types — only the solver separates safe from broken.
+
+## Quick start
 
 ```bash
 npm install -D theoremts theoremts-cli
 ```
 
-## Usage
-
 ```bash
-theorem verify src/     # prove contracts with Z3
+theorem verify src/            # prove annotated contracts
+theorem scan src/              # find risks with zero annotations
 ```
 
-```
-  applyDiscount
-    ✓  nonNegative(output())
-       using: requires: positive(price), requires: between(percent, 0, 100)
+For inline squiggles in VS Code / Cursor, see [Editor integration](#editor-integration).
 
-  transfer
-    ✓  nonNegative(output())
-       using: requires: amount <= fromBalance
-```
+## The five commands
 
-## Writing Contracts
+| Command | Annotations needed | What it does |
+|---|---|---|
+| `theorem verify` | contracts | Proves `requires`/`ensures`/`invariant` with Z3; counterexamples on failure |
+| `theorem scan` | none | Detects division by zero, negative sqrt, null access, contract violations at call sites |
+| `theorem suggest` | none | Proposes contracts: "if you add `requires(X)`, then `ensures(Y)` becomes provable" |
+| `theorem infer` | none | Extracts contracts from existing guards, throws, and schemas into `.theorem/contracts/` |
+| `theorem prisma` | none | Generates schemas from `schema.prisma` — DB column facts flow into proofs |
 
-**`requires`** = what the function demands (precondition)
-**`ensures`** = what the function guarantees (postcondition)
+Useful flags: `--strict` (exit 1 on failure, for CI), `--watch`, `--format sarif`, `--gen-tests`, `--debug`.
+
+## Writing contracts
+
+**`requires`** — what the function demands (precondition).
+**`ensures`** — what the function guarantees (postcondition).
 
 ```typescript
 function applyDiscount(price: number, percent: number): number {
@@ -121,54 +139,8 @@ function applyDiscount(price: number, percent: number): number {
 }
 ```
 
-If `requires` is not satisfied → **caller's fault**. If `ensures` is not satisfied → **implementation bug**.
+If `requires` is violated → **caller's fault**. If `ensures` doesn't hold → **implementation bug**. A missing precondition is itself a finding:
 
-### Caller Verification
-
-Theorem automatically verifies that callers satisfy the callee's `requires`:
-
-```typescript
-function safeDivide(a: number, b: number): number {
-  requires(positive(b))
-  return a / b
-}
-
-// Inside verified code — cross-function check
-function unitPrice(total: number, quantity: number): number {
-  requires(positive(quantity))
-  return safeDivide(total, quantity)  // ✓ quantity satisfies positive(b)
-}
-
-// Outside verified code — call-site check
-safeDivide(100, 0)   // ✗ violates requires: positive(b)
-safeDivide(100, -5)  // ✗ violates requires: positive(b)
-```
-
-```
-$ theorem verify src/
-  unitPrice
-    ✓  call safeDivide(total, quantity): positive(b)
-       using: requires: positive(quantity)
-
-  (call-site checks)
-    ✗  safeDivide(100, 0): positive(b)
-       violation confirmed (literal values)
-```
-
-Works with any call pattern — `service.calculate(x)`, `this.payments.process(x)`:
-
-```typescript
-class OrderProcessor {
-  @requires(positive(total))
-  processFee(total: number): number {
-    return this.payments.calculateFee(total, 5)  // ✓ verified against calculateFee's requires
-  }
-}
-```
-
-### Bugs Theorem Catches
-
-**Uncapped discount — result goes negative:**
 ```typescript
 function applyBonus(salary: number, bonusPercent: number): number {
   requires(positive(salary))
@@ -179,106 +151,43 @@ function applyBonus(salary: number, bonusPercent: number): number {
 // ✗ counterexample: salary = 1, bonusPercent = -200, result = -1
 ```
 
-**Commission exceeds sales — missing rate cap:**
-```typescript
-function commission(sales: number, years: number): number {
-  requires(positive(sales))
-  requires(nonNegative(years))
-  ensures(output() <= sales)  // commission shouldn't exceed sales
-  
-  let rate: number
-  if (sales > 100000) rate = 0.10
-  else rate = 0.05
-  
-  const bonus = years * 0.01  // 1% per year, no cap!
-  return sales * (rate + bonus)
-}
-// ✗ counterexample: sales = 1, years = 96, result = 1.01
-```
+### Reference
 
-**Rebalancing without weight check — allocation exceeds 100%:**
-```typescript
-function allocate(total: number, w1: number, w2: number, w3: number): number {
-  requires(positive(total))
-  requires(nonNegative(w1))
-  requires(nonNegative(w2))
-  requires(nonNegative(w3))
-  // missing: requires(w1 + w2 + w3 === 1)
-  ensures(output() <= total)
-  return total * w1 + total * w2 + total * w3
-}
-// ✗ counterexample: total = 1, w1 = 2, w2 = 0, w3 = 0, result = 2
-```
+| Function | Purpose |
+|---|---|
+| `requires(pred)` | Precondition |
+| `ensures(pred)` | Postcondition — sees the final state |
+| `output()` | The return value, inside `ensures` |
+| `check(pred)` | Mid-body assertion — sees the state *after* mutations (SSA-aware) |
+| `assume(pred)` | Taken as fact without proof (external guarantees) |
+| `invariant(() => pred)` | Loop invariant |
+| `decreases(expr)` | Termination measure for loops and recursion |
+| `old(expr)` | Value at function entry |
+| `conserved(...vals)` | Sum preserved across mutation |
+| `modifies(...objs)` | Which objects a function may write ([Verified mutation](#verified-mutation)) |
+| `footprint(spec, member)` | Pairs an invariant with its read-set ([Verified mutation](#verified-mutation)) |
+| `declare(fn, spec)` | Contract for a function you don't own ([External library contracts](#external-library-contracts)) |
 
-### SSA-Aware Check
+Predicate helpers: `positive(x)`, `nonNegative(x)`, `negative(x)`, `between(x, min, max)`, `integer(x)` / `Number.isInteger(x)`.
 
-`check()` sees the state **after** mutations — like Dafny's `assert`:
+### State, before and after
+
+`old()` refers to values at function entry; `check()` sees the current SSA state, like Dafny's `assert`:
 
 ```typescript
 function processPayroll(baseSalary: number): number {
   requires(positive(baseSalary))
-  
-  if (baseSalary > 10000) baseSalary = 10000  // cap
 
-  check(between(baseSalary, 0, 10000))  // ✓ sees value after cap
-  
+  if (baseSalary > 10000) baseSalary = 10000    // cap
+
+  check(between(baseSalary, 0, 10000))          // ✓ sees the value after the cap
+
   return baseSalary * 0.9
 }
 ```
 
-### All Contract Functions
+### Recursion terminates
 
-| Function | Purpose | Example |
-|---|---|---|
-| `requires(pred)` | Precondition | `requires(positive(x))` |
-| `ensures(pred)` | Postcondition (sees final state) | `ensures(nonNegative(output()))` |
-| `output()` | Return value placeholder | `ensures(output() > 0)` |
-| `check(pred)` | Mid-point assertion (SSA-aware) | `check(between(x, 0, 100))` |
-| `assume(pred)` | Assume without proof | `assume(balance >= 0)` |
-| `invariant(pred)` | Loop invariant | `invariant(() => i >= 0)` |
-| `decreases(expr)` | Loop/recursive termination | `decreases(n)` |
-| `old(expr)` | Value at function entry | `old(balance)` |
-| `conserved(...vals)` | Sum preserved across mutation | `conserved(from, to)` |
-| `declare(fn, spec)` | External library contract | `declare(Math.sqrt, ...)` |
-
-### Helpers
-
-| Function | Meaning |
-|---|---|
-| `positive(x)` | `x > 0` |
-| `nonNegative(x)` | `x >= 0` |
-| `between(x, min, max)` | `min <= x <= max` |
-| `integer(x)` | `x` is a whole number |
-
-### Advanced Features
-
-**Pre/post mutation with `old()` and `conserved()`:**
-```typescript
-function withdraw(balance: number, amount: number): number {
-  requires(positive(amount))
-  requires(balance >= amount)
-  
-  balance -= amount  // mutation
-  
-  ensures(output() >= 0)
-  ensures(output() === old(balance) - amount)  // old() = value before mutation
-  return balance
-}
-```
-
-**Closures — factory functions with captured variables:**
-```typescript
-function createDiscount(rate: number) {
-  requires(between(rate, 0, 1))
-  return (price: number) => {
-    requires(positive(price))
-    ensures(output() <= price)
-    return price * (1 - rate)
-  }
-}
-```
-
-**Recursive termination:**
 ```typescript
 function fibonacci(n: number): number {
   requires(n >= 0)
@@ -290,7 +199,8 @@ function fibonacci(n: number): number {
 }
 ```
 
-**Object return types:**
+### Object returns and closures
+
 ```typescript
 function calculateTax(income: number, rate: number): { gross: number; tax: number; net: number } {
   requires(positive(income))
@@ -299,36 +209,28 @@ function calculateTax(income: number, rate: number): { gross: number; tax: numbe
   const tax = income * rate
   return { gross: income, tax, net: income - tax }
 }
-```
 
-**Separate proof files** — keep proofs out of source code:
-```typescript
-// payment.proof.ts — proves contracts for functions in payment.ts
-import { requires, ensures, positive, nonNegative, output } from 'theoremts'
-
-function processPayment(amount: number, fee: number): number {
-  requires(positive(amount))
-  requires(between(fee, 0, 0.1))
-  ensures(positive(output()))
-  return amount * (1 - fee)
+function createDiscount(rate: number) {
+  requires(between(rate, 0, 1))
+  return (price: number) => {
+    requires(positive(price))
+    ensures(output() <= price)
+    return price * (1 - rate)      // captured variable carries its contract
+  }
 }
 ```
 
-Both source and `.proof.ts` files are picked up automatically by `theorem verify`.
+### Alternative styles
 
-### Alternative Styles
-
-**Decorators** (class methods only):
 ```typescript
+// Decorators (class methods)
 class Calculator {
   @requires(positive(b))
   @ensures(nonNegative(output()))
   divide(a: number, b: number): number { return a / b }
 }
-```
 
-**proof() wrapper** (const/arrow functions):
-```typescript
+// proof() wrapper (const/arrow functions)
 export const clamp = proof(
   (value: number, min: number, max: number) =>
     value < min ? min : value > max ? max : value,
@@ -337,18 +239,70 @@ export const clamp = proof(
 )
 ```
 
-**String contracts:**
+Contracts can also live in separate `*.proof.ts` files, keeping source untouched — `theorem verify` picks up both.
+
+## Cross-function verification
+
+Theorem is modular, like Dafny: when `A` calls `B`, it proves `A`'s arguments satisfy `B`'s `requires`, and assumes `B`'s `ensures` for `A`'s own proof. Call sites outside verified code are checked too:
+
 ```typescript
-requires('total is positive')
-ensures('result is between 0 and 100')
+function unitPrice(total: number, quantity: number): number {
+  requires(positive(quantity))
+  return safeDivide(total, quantity)   // ✓ quantity satisfies positive(b)
+}
+
+safeDivide(100, 0)                     // ✗ call-site check: violates positive(b)
 ```
 
-## Schemas as Contracts — zero annotations
+```
+  unitPrice
+    ✓  call safeDivide(total, quantity): positive(b)
+       using: requires: positive(quantity)
 
-Your validation schemas already state your invariants. Theorem reads them:
-`Schema.parse()` throws on invalid data, so after the parse the schema's
-refinements are mathematical facts. No imports, no annotations — the schema
-IS the contract.
+  (call-site checks)
+    ✗  safeDivide(100, 0): positive(b)
+       violation confirmed (literal values)
+```
+
+Any call pattern works — `service.calculate(x)`, `this.payments.process(x)`.
+
+## Loops
+
+A `while` loop is verified by **havoc + invariant**: each `invariant` must hold at loop entry, be preserved by one arbitrary iteration, and after the loop the *only* known facts are `invariant ∧ ¬condition`. `decreases` proves termination. Four obligations per loop, all discharged by the solver:
+
+```typescript
+processUniformBatch(txCount: number, amountPerTx: number): number {
+  requires(Number.isInteger(txCount))
+  requires(positive(txCount))
+  requires(positive(amountPerTx))
+  requires(txCount * amountPerTx <= this.balance)
+  ensures(this.balance === old(this.balance) - (txCount * amountPerTx))
+  ensures(output() === txCount * amountPerTx)
+
+  let remaining = txCount
+  let totalSent = 0
+  while (remaining > 0) {
+    invariant(() => Number.isInteger(remaining))
+    invariant(() => remaining >= 0)
+    invariant(() => totalSent === (txCount - remaining) * amountPerTx)
+    invariant(() => this.balance === old(this.balance) - totalSent)
+    invariant(() => this.totalDistributed === old(this.totalDistributed) + totalSent)
+    decreases(() => remaining)
+
+    this.balance -= amountPerTx
+    this.totalDistributed += amountPerTx
+    totalSent += amountPerTx
+    remaining--
+  }
+  return totalSent
+}
+```
+
+The discipline is honest: state the loop writes is havoced, so an invariant you forget is a counterexample, not a silent assumption. Drop the `totalDistributed` invariant above and the class invariant at method exit is refuted with concrete values. See [`examples/advanced.ts`](examples/advanced.ts).
+
+## Schemas as contracts
+
+Your validation schemas already state your invariants — Theorem reads them. `Schema.parse()` throws on invalid data, so after the parse the schema's refinements are mathematical facts. **Zero annotations needed**:
 
 ```typescript
 const OrderSchema = z.object({
@@ -368,15 +322,11 @@ export function unitAdjustment(input: unknown): number {
 }
 ```
 
-Every function here passes `tsc --strict` — the bug lives in the arithmetic,
-not the types. Only the solver separates safe from broken. Effect Schema has
-full parity (`Schema.decodeUnknownSync`, `Schema.Struct`, `Schema.filter`),
-and `Schema.int()` gives Z3 the integer fact `number` can't express.
+`z.number().int()` gives Z3 the integer fact TypeScript's `number` can't express. Schemas imported from other files are resolved automatically. **Effect Schema** has full parity: `Schema.decodeUnknownSync`, `Schema.Struct` refinements, `Schema.filter`.
 
-### Cross-field model invariants — `.refine()`
+### `.refine()` is a model invariant
 
-A `.refine()` predicate is a **model invariant**: assumed wherever the schema
-is parsed, and **proved for every function that returns the type**.
+A `.refine()` predicate is assumed wherever the schema is parsed — and **proved for every function that returns the type**:
 
 ```typescript
 const TaxRecordSchema = z.object({
@@ -394,9 +344,9 @@ export function buggyRebate(income: number, rebate: number): TaxRecord {
 }
 ```
 
-Schemas imported from other files are resolved through relative imports.
+### Refinement types
 
-### Refinement types — the parameter type is the contract
+A parameter typed with a schema-derived alias carries the schema as its contract — assumed inside the function, **proved at every call site**:
 
 ```typescript
 const RateSchema = z.number().gt(0).lte(1).brand()
@@ -406,33 +356,23 @@ export function applyRate(amount: number, rate: Rate): number {
   return amount / rate            // ✓ proved: the TYPE says rate > 0
 }
 
-applyRate(100, 0 as Rate)         // ✗ caught at the CALL SITE:
-                                  //   `as` satisfies tsc — not Z3
+applyRate(100, 0 as Rate)         // ✗ caught at the call site —
+                                  //   `as` satisfies tsc, not Z3
 ```
 
-### tRPC boundaries
+### Boundaries: tRPC and Prisma
 
-`t.procedure.input(Schema).mutation(handler)` — the handler assumes the input
-schema's constraints and invariants automatically (tRPC validates before
-invoking it). Zod or Effect Schema.
-
-### Database facts — `theorem prisma`
+`t.procedure.input(Schema).mutation(handler)` — the handler assumes the input schema's constraints automatically (tRPC validates before invoking it). Zod or Effect Schema.
 
 ```bash
 theorem prisma prisma/schema.prisma    # → theorem-schemas.ts
 ```
 
-Generates row schemas from your database schema: `Int` columns become
-integer facts, nullability maps to `.nullable()`, enums are documented.
-Column constraints flow into proofs.
+Generates row schemas from your database schema: `Int` columns become integer facts, nullable columns become `.nullable()`. Column constraints flow into proofs.
 
-## Object Invariants
+## Class invariants
 
-### Class invariants — Design by Contract
-
-Declared once on the class; assumed at every method entry, proved at every
-exit (mutations of `this.*` are tracked), and the constructor must establish
-it:
+Declared once on the class — assumed at every method entry, **proved at every exit** (mutations of `this.*` are tracked, including through loops), and the constructor must establish it:
 
 ```typescript
 @invariant((self: Account) => self.balance >= 0)
@@ -458,12 +398,9 @@ class Account {
 }
 ```
 
-## Verifying Mutation — heap, aliasing, and pointers
+## Verified mutation
 
-When a function mutates fields of object parameters, Theorem switches to a
-heap encoding (Z3 arrays): object references become solver values, so
-**aliasing is a case the solver explores** rather than an assumption it
-silently makes.
+When a function mutates fields of object parameters, Theorem switches to a heap encoding (Z3 arrays). Object references become solver values, so **aliasing is a case the solver explores** — not an assumption it silently makes:
 
 ```typescript
 export function drainUnsafe(from: Account, to: Account): void {
@@ -474,17 +411,15 @@ export function drainUnsafe(from: Account, to: Account): void {
   from.value = 0
 }
 // ✗ counterexample: from = 2, to = 2  — the SAME reference!
-//   Aliased, the two writes hit one cell: the value doubles, then zeroes.
+//   Aliased, both writes hit one cell: the value doubles, then zeroes.
 //   Add requires(from !== to) and it proves.
 ```
 
-`modifies(a, b)` restricts which objects a function may write (undeclared
-writes are violations), and `old(x.f)` reads the pre-state.
+`old(x.f)` reads the pre-state heap; `modifies(a, b)` declares which objects may be written — an undeclared write is a violation.
 
 ### Recursive invariants over linked structures
 
-User-defined recursive predicates work over the mutable heap — the full
-Dafny-style workflow, in plain TypeScript functions:
+Plain recursive TypeScript functions serve as spec predicates over the mutable heap — the full Dafny-style workflow:
 
 ```typescript
 interface Node { value: number; next: Node | null; prev: Node | null }
@@ -507,7 +442,7 @@ export function moveToFront(head: Node, node: Node, prevN: Node): void {
   requires(/* bounded window: head.prev === null, prevN.next === node, ... */)
   ensures(node === head || validChain(node))
   if (node === head) return
-  prevN.next = node.next     // write THROUGH a pointer
+  prevN.next = node.next     // a write THROUGH a pointer
   node.prev = null
   node.next = head
   head.prev = node           // forget this line → refuted with a counterexample
@@ -529,15 +464,9 @@ export function evictOthers(head: Node, victim: Node, n: number): void {
 }
 ```
 
-Each loop produces four obligations: invariant at entry, invariant preserved
-by an arbitrary iteration, termination measure bounded and decreasing, and
-the code after the loop resumes under `invariant ∧ ¬condition`. The classic
-LRU bug — forgetting the head back-pointer, whose symptom appears operations
-later as silently dropped entries — is refuted at the source. See
-[`examples/lru.ts`](examples/lru.ts).
+The classic LRU bug — forgetting the head back-pointer, whose symptom appears operations later as silently dropped entries — is refuted at the source ([`examples/lru.ts`](examples/lru.ts)).
 
-Sequences close the abstraction-function loop from the Dafny playbook
-([`examples/cons.ts`](examples/cons.ts)):
+Sequences close the abstraction-function loop from the Dafny playbook ([`examples/cons.ts`](examples/cons.ts)):
 
 ```typescript
 function list(n: Node | null): number[] {
@@ -552,19 +481,15 @@ export function cons(x: number, tail: Node | null): Node {
 }
 ```
 
-All of this runs on ground instantiation — no quantifiers — so solve times
-stay in single-digit milliseconds and results are deterministic.
+All of this runs on ground instantiation — **no quantifiers** — so solve times stay in single-digit milliseconds and results are deterministic.
 
-## Counterexamples as Regression Tests
+## Counterexamples as regression tests
 
 ```bash
 theorem verify --gen-tests src/
 ```
 
-Every disproved obligation carries the exact input that breaks the contract.
-`--gen-tests` turns each one into a `node:test` case calling the real
-function with those values and asserting the contract — **RED until the bug
-is fixed**, then a permanent regression guard:
+Every disproved obligation carries the exact input that breaks the contract. `--gen-tests` turns each into a `node:test` case calling the real function with those values — **RED until the bug is fixed**, then a permanent regression guard:
 
 ```typescript
 // .theorem/regressions/basics.regression.test.ts (auto-generated)
@@ -574,102 +499,9 @@ test('buggySubtract: nonNegative(output())', () => {
 })
 ```
 
-## VS Code Integration
+## Zero-annotation analysis: scan, suggest, infer
 
-```bash
-npm install -D theorem-ts-plugin
-```
-
-```json
-// tsconfig.json
-{ "compilerOptions": { "plugins": [{ "name": "theorem-ts-plugin" }] } }
-```
-
-Shows contract violations inline — squiggly lines, hover tooltips, Problems panel.
-
-## External Library Contracts
-
-Declare contracts for functions you don't own — like `.d.ts` for types, but for logic:
-
-```typescript
-// contracts/math.contracts.ts
-import { declare, requires, ensures, nonNegative, output } from 'theoremts'
-
-declare(Math.sqrt, (x: number): number => {
-  requires(x >= 0)
-  ensures(nonNegative(output()))
-})
-```
-
-```typescript
-// contracts/api.contracts.ts
-import { declare, ensures, nonNegative, output } from 'theoremts'
-
-declare(getBalance, (userId: string): number => {
-  ensures(nonNegative(output()))
-})
-```
-
-Auto-discovered from `node_modules/@theorem-contracts/*` or configured:
-
-```typescript
-// theorem.config.ts
-import { defineConfig } from 'theoremts'
-export default defineConfig({
-  contracts: ['contracts/*.contracts.ts'],
-})
-```
-
-Publishable as npm packages — `@theorem-contracts/bignumber`, `@theorem-contracts/decimal`, etc.
-
-## Configuration
-
-```typescript
-// theorem.config.ts
-import { defineConfig } from 'theoremts'
-export default defineConfig({
-  include: ['src/**/*.ts'],
-  exclude: ['**/*.test.ts'],
-  contracts: ['contracts/*.contracts.ts'],
-  solver: { timeout: 10000, maxCounterexamples: 3 },
-})
-```
-
-## CI Integration
-
-```yaml
-# GitHub Actions
-- run: npx theorem verify --strict src/
-- run: npx theorem scan --strict --format sarif src/ > theorem.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  with: { sarif_file: theorem.sarif }
-```
-
-## Bundler Plugins
-
-Strip contracts at build time — zero runtime overhead:
-
-```typescript
-// vite.config.ts
-import { theoremVite } from 'theoremts/vite'
-export default { plugins: [theoremVite()] }
-```
-
-Also available: `theorem/esbuild`, `theorem/tsup`.
-
-## How It Works
-
-```
-TypeScript → PARSER (ts-morph + SSA) → TRANSLATOR → Z3 WASM → REPORTER
-```
-
-To prove `ensures(P)`, Z3 tries to find an input where all `requires` hold but `P` is violated. UNSAT = proved. SAT = counterexample.
-
-Inspired by [Dafny](https://dafny.org), [Ada/SPARK](https://www.adacore.com/about-spark), and [Frama-C](https://frama-c.com).
-
-## Alpha Features
-
-### scan — detect risks without annotations
+### scan — find risks now
 
 ```bash
 theorem scan src/
@@ -688,9 +520,9 @@ theorem scan src/
     CRITICAL  `data.value` — `data` may be null/undefined (type: Data | null)
 ```
 
-Walks the AST, finds risky operations (division by zero, null access, array bounds, empty reduce, contract violations at call sites), then uses Z3 to confirm reachability. Path-sensitive — filters false positives from guards.
+Walks the AST for risky operations (division/modulo by zero, negative sqrt, log of non-positives, null access, contract violations at call sites), then uses Z3 to confirm reachability. Path-sensitive: `if (x > 0) { ... / x }` is encoded as an assumption, not reported.
 
-### suggest — auto-generate contracts
+### suggest — see what would become provable
 
 ```bash
 theorem suggest src/
@@ -702,12 +534,96 @@ theorem suggest src/
 
   average(a, b)
     →  if you add requires(a >= b), then ensures(output() <= a) becomes provable
-
-  subtract(a, b)
-    →  if you add requires(a >= b), then ensures(nonNegative(output())) becomes provable
 ```
 
-Analyzes unannotated functions and suggests contracts that hold or would hold with specific preconditions.
+### infer — extract the contracts your code already implies
+
+```bash
+theorem infer src/                 # writes to .theorem/contracts/ (gitignored)
+theorem infer --dry-run src/       # preview
+theorem infer --prove src/         # Z3-verify inferred ensures (slower)
+```
+
+Nine strategies: if/throw guards, sentinel returns, arithmetic safety, null safety, array safety, Zod schemas, cross-function propagation, return analysis, relational contracts. Without `--prove` it never touches Z3 — safe to run on any codebase.
+
+## Editor integration
+
+```bash
+npm install -D theoremts-ts-plugin
+```
+
+```jsonc
+// tsconfig.json
+{ "compilerOptions": { "plugins": [{ "name": "theoremts-ts-plugin" }] } }
+```
+
+Contract violations appear as squiggles with counterexamples in the tooltip, live as you type (VS Code, Cursor, any tsserver editor). Verification runs in a child process — it never blocks the editor.
+
+## External library contracts
+
+Declare contracts for functions you don't own — like `.d.ts` for types, but for logic:
+
+```typescript
+// contracts/math.contracts.ts
+import { declare, requires, ensures, nonNegative, output } from 'theoremts'
+
+declare(Math.sqrt, (x: number): number => {
+  requires(x >= 0)
+  ensures(nonNegative(output()))
+})
+```
+
+When both the `declare()` and an implementation exist in the codebase, the contract is **verified against the implementation**. Contract packages (`@theoremts/contracts-*`) are auto-discovered from `node_modules`.
+
+## Configuration, CI, bundlers
+
+```typescript
+// theorem.config.ts
+import { defineConfig } from 'theoremts'
+export default defineConfig({
+  include: ['src/**/*.ts'],
+  exclude: ['**/*.test.ts'],
+  contracts: ['contracts/*.contracts.ts'],
+  solver: { timeout: 10000, maxCounterexamples: 3 },
+})
+```
+
+```yaml
+# GitHub Actions
+- run: npx theorem verify --strict src/
+- run: npx theorem scan --strict --format sarif src/ > theorem.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: { sarif_file: theorem.sarif }
+```
+
+Contracts are already no-ops, but bundler plugins can strip them entirely:
+
+```typescript
+// vite.config.ts
+import { theoremVite } from 'theoremts/vite'
+export default { plugins: [theoremVite()] }
+// also: theoremts/esbuild, theoremts/tsup
+```
+
+## How it works
+
+```
+TypeScript source
+      ↓
+  PARSER      ts-morph + SSA — contracts, function IR, schemas, heap steps
+      ↓
+  TRANSLATOR  IR → Z3 assertions; cross-function obligations; safety obligations
+      ↓
+  SOLVER      Z3 (WASM) — UNSAT = proved, SAT = counterexample
+      ↓
+  REPORTER    CLI / SARIF, with concrete counterexample values
+```
+
+To prove `ensures(P)`, Z3 searches for an input where every `requires` holds but `P` fails. If no such input exists (UNSAT), the contract is proved — for all inputs, not a sample. Division safety obligations are generated automatically (Z3 treats division as total; Theorem doesn't let that hide `x / 0`).
+
+The [`examples/`](examples/) directory is a tour of everything above, each file with passing *and* failing cases.
+
+Inspired by [Dafny](https://dafny.org), [Ada/SPARK](https://www.adacore.com/about-spark), and [Frama-C](https://frama-c.com).
 
 ## License
 
