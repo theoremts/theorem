@@ -32,34 +32,46 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   // HEAP VERSION — requires-side axioms read the INITIAL heap (@pre), while
   // ensures-side axioms read the FINAL heap (@post). Select-over-store then
   // connects the two versions automatically for the written window.
-  let requiresAxioms: Expr[] = []
-  let ensuresAxioms: Expr[] = []
+  let specAxioms: Expr[] = []
   if (ir.specDefs !== undefined && ir.specDefs.size > 0) {
     const defs = ir.specDefs
-    const reqAx: Expr[] = []
-    const ensAx: Expr[] = []
-    ir = {
-      ...ir,
-      contracts: ir.contracts.map(c => {
-        if (!('predicate' in c) || typeof c.predicate !== 'object' || c.predicate === null) return c
-        const unfolded = unfoldSpecCalls(c.predicate as Expr, defs)
-        if (unfolded.axioms.length === 0) return c
-        const bucket = c.kind === 'ensures' ? ensAx : reqAx
-        for (const a of unfolded.axioms) bucket.push(a.predicate)
-        return { ...c, predicate: unfolded.expr } as typeof c
-      }),
+    const pool: Expr[] = []
+    const unfoldPred = (e: Expr): Expr => {
+      const unfolded = unfoldSpecCalls(e, defs)
+      for (const a of unfolded.axioms) pool.push(a.predicate)
+      return unfolded.expr
     }
-    const dedupe = (list: Expr[]): Expr[] => {
-      const seen = new Set<string>()
-      return list.filter(p => {
-        const k = prettyExpr(p)
-        if (seen.has(k)) return false
-        seen.add(k)
-        return true
-      })
-    }
-    requiresAxioms = dedupe(reqAx)
-    ensuresAxioms = dedupe(ensAx)
+    // Contracts
+    let contracts = ir.contracts.map(c => {
+      if (!('predicate' in c) || typeof c.predicate !== 'object' || c.predicate === null) return c
+      return { ...c, predicate: unfoldPred(c.predicate as Expr) } as typeof c
+    })
+    // Loop invariants inside heap steps (F7): unfold in place
+    const unfoldSteps = (list: typeof steps): typeof steps => list.map(s => {
+      if (s.kind === 'loop') {
+        return {
+          ...s,
+          invariants: s.invariants.map(unfoldPred),
+          body: unfoldSteps(s.body),
+        }
+      }
+      if (s.kind === 'branch') {
+        return { ...s, then: unfoldSteps(s.then), else: unfoldSteps(s.else) }
+      }
+      return s
+    })
+    const newSteps = unfoldSteps(steps)
+    steps.length = 0
+    steps.push(...newSteps)
+    ir = { ...ir, contracts }
+
+    const seen = new Set<string>()
+    specAxioms = pool.filter(pr => {
+      const k = prettyExpr(pr)
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
   }
 
   // ── References: one Int constant per object root; aliases share ──────────
@@ -86,7 +98,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   for (const c of ir.contracts) {
     if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) memberRootsOf(c.predicate as Expr)
   }
-  for (const ax of [...requiresAxioms, ...ensuresAxioms]) memberRootsOf(ax)
+  for (const ax of specAxioms) memberRootsOf(ax)
   for (const name of rootNames) refs.set(name, ctx.Int.const(name))
 
   const NULL_REF = ctx.Int.val(0)
@@ -120,7 +132,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
   collectStepFields(steps)
-  for (const ax of [...requiresAxioms, ...ensuresAxioms]) contractPredicates.push(ax)
+  for (const ax of specAxioms) contractPredicates.push(ax)
   for (const p of contractPredicates) collectFields(p, fields)
 
   const refFields = inferRefFields(steps, contractPredicates, rootNames, aliasOf)
@@ -193,12 +205,25 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     return out
   }
 
-  const specUFTag = (callee: string, tag: 'pre' | 'post'): 'pre' | 'post' => {
-    if (tag === 'pre') return 'pre'
+  // Heap-state signatures: UF applications are keyed by the IDENTITY of the
+  // heap arrays the predicate's read-set touches. Two states whose relevant
+  // arrays are the same JS objects share the UF — the F4 read-set frame
+  // bridge falls out automatically, at every state (entry, loop iterations,
+  // post-loop), not just pre/post.
+  const heapObjIds = new Map<object, number>()
+  let nextHeapId = 1
+  const heapId = (o: object): number => {
+    let id = heapObjIds.get(o)
+    if (id === undefined) { id = nextHeapId++; heapObjIds.set(o, id) }
+    return id
+  }
+  const specSignature = (callee: string, env: { heap: Map<string, unknown> }): string => {
     const defName = callee.replace(/^__uf[brs]_/, '')
-    const reads = readSetOf(defName)
-    for (const f of reads) if (writtenFields.has(f)) return 'post'
-    return 'pre'  // reads nothing that was written — value cannot change
+    const reads = [...readSetOf(defName)].sort()
+    return reads.map(f => {
+      const arr = env.heap.get(f)
+      return arr === undefined ? '?' : String(heapId(arr as object))
+    }).join('.')
   }
 
   const translate = (expr: Expr, env: Env, oldEnv: Env): AnyExpr<'main'> | null => {
@@ -273,7 +298,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
             const cache: Map<string, unknown> = anyCtx.__ufCache ?? (anyCtx.__ufCache = new Map())
             // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
             const argSorts = args.map(a => (a as any).sort)
-            const key = `${expr.callee}@${specUFTag(expr.callee, env.tag)}(${argSorts.map((s: unknown) => String(s)).join(',')})`
+            const key = `${expr.callee}#${specSignature(expr.callee, env)}(${argSorts.map((s: unknown) => String(s)).join(',')})`
             let decl = cache.get(key)
             if (decl === undefined) {
               // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
@@ -309,6 +334,84 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
   const oldEnv: Env = { heap: initialHeap, locals: new Map(), nums: new Map(), tag: 'pre' }
 
+  /** Instantiates the definitional-axiom pool at the given heap state. */
+  const pushSpecAxioms = (
+    atEnv: Env,
+    into: Bool<'main'>[],
+    intoLabels: string[],
+    stateLabel: string,
+  ): void => {
+    for (const ax of specAxioms) {
+      const z3 = translate(ax, atEnv, oldEnv)
+      if (z3 !== null) {
+        into.push(z3 as Bool<'main'>)
+        intoLabels.push(`def@${stateLabel}: ${prettyExpr(ax).slice(0, 50)}`)
+      }
+    }
+  }
+
+  /** Collects root-argument spec applications (bridgeable) from an expr. */
+  const collectRootApps = (e: Expr, out: Array<{ callee: string; args: Expr[] }>): void => {
+    if (e.kind === 'call' && (e.callee.startsWith('__ufb_') || e.callee.startsWith('__ufr_'))) {
+      if (e.args.every(a => a.kind === 'ident')) out.push({ callee: e.callee, args: e.args })
+    }
+    if (e.kind === 'call') for (const a of e.args) collectRootApps(a, out)
+    else if (e.kind === 'binary') { collectRootApps(e.left, out); collectRootApps(e.right, out) }
+    else if (e.kind === 'unary') collectRootApps(e.operand, out)
+    else if (e.kind === 'ternary') { collectRootApps(e.condition, out); collectRootApps(e.then, out); collectRootApps(e.else, out) }
+  }
+
+  /**
+   * F5 ownership bridges between two heap states: for X paired with inX via
+   * footprint(), if every written root is outside X's structure, X cannot
+   * have changed between the states.
+   */
+  const emitOwnershipBridges = (
+    apps: Array<{ callee: string; args: Expr[] }>,
+    written: Set<string>,
+    fromEnv: Env,
+    toEnv: Env,
+    into: Bool<'main'>[],
+    intoLabels: string[],
+  ): void => {
+    if (ir.footprints === undefined || written.size === 0) return
+    for (const app of apps) {
+      const specName = app.callee.replace(/^__uf[br]_/, '')
+      const memberName = ir.footprints.get(specName)
+      if (memberName === undefined) continue
+      if (specSignature(app.callee, toEnv) === specSignature(app.callee, fromEnv)) continue
+
+      const memberDef = ir.specDefs?.get(memberName)
+      const memberPrefix = memberDef !== undefined && !memberDef.isBool ? '__ufr_' : '__ufb_'
+
+      const conditions: Bool<'main'>[] = []
+      let ok = true
+      for (const w of written) {
+        const memberApp: Expr = {
+          kind: 'call',
+          callee: `${memberPrefix}${memberName}`,
+          args: [...app.args, { kind: 'ident', name: w }],
+        }
+        const cond = translate(memberApp, fromEnv, oldEnv)
+        if (cond === null) { ok = false; break }
+        conditions.push(ctx.Not(cond as Bool<'main'>))
+      }
+      if (!ok || conditions.length === 0) continue
+
+      const toApp = translate({ kind: 'call', callee: app.callee, args: app.args }, toEnv, oldEnv)
+      const fromApp = translate({ kind: 'call', callee: app.callee, args: app.args }, fromEnv, oldEnv)
+      if (toApp === null || fromApp === null) continue
+      try {
+        const antecedent = conditions.length === 1 ? conditions[0]! : ctx.And(...conditions)
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+        const consequent = (toApp as any).eq(fromApp) as Bool<'main'>
+        into.push(ctx.Implies(antecedent, consequent))
+        intoLabels.push(`frame bridge: ${specName} unchanged (writes outside ${memberName})`)
+      } catch { /* sort mismatch */ }
+    }
+  }
+
+
   // ── Requires: hold in the initial state; named roots are non-null ────────
   const assumptions: Bool<'main'>[] = []
   const assumptionLabels: string[] = []
@@ -324,13 +427,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
       assumptionLabels.push(`requires: ${prettyExpr(c.predicate)}`)
     }
   }
-  for (const ax of requiresAxioms) {
-    const z3 = translate(ax, oldEnv, oldEnv)
-    if (z3 !== null) {
-      assumptions.push(z3 as Bool<'main'>)
-      assumptionLabels.push(`def@pre: ${prettyExpr(ax).slice(0, 60)}`)
-    }
-  }
+  pushSpecAxioms(oldEnv, assumptions, assumptionLabels, 'pre')
 
   // ── Execute steps over the heap ──────────────────────────────────────────
   //
@@ -471,6 +568,8 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           iterAssumptions.push(condFresh as Bool<'main'>)
           iterLabels.push(`loop condition: ${prettyExpr(step.condition)}`)
         }
+        // Spec-definition axioms at the havoced iteration state
+        pushSpecAxioms(freshEnv, iterAssumptions, iterLabels, `iter${loopCounter}`)
 
         const measureBefore = step.decreases !== undefined ? translate(step.decreases, freshEnv, oldEnv) : null
 
@@ -480,6 +579,28 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           nums: new Map(freshEnv.nums), tag: freshEnv.tag,
         }
         runLoopBody(step.body, bodyEnv, null)
+
+        // Axioms at the state AFTER one iteration, plus ownership bridges
+        // across the iteration (writes outside the footprint preserve specs)
+        pushSpecAxioms(bodyEnv, iterAssumptions, iterLabels, `iterEnd${loopCounter}`)
+        {
+          const bodyRoots = new Set<string>()
+          let bodyDirect = true
+          const scanBodyWrites = (list: typeof steps): void => {
+            for (const s of list) {
+              if (s.kind === 'field-write') {
+                if (s.object.kind === 'ident') bodyRoots.add(resolveAlias(s.object.name, aliasOf))
+                else bodyDirect = false
+              } else if (s.kind === 'branch') { scanBodyWrites(s.then); scanBodyWrites(s.else) }
+            }
+          }
+          scanBodyWrites(step.body)
+          if (bodyDirect && bodyRoots.size > 0) {
+            const apps: Array<{ callee: string; args: Expr[] }> = []
+            for (const inv of step.invariants) collectRootApps(inv, apps)
+            emitOwnershipBridges(apps, bodyRoots, freshEnv, bodyEnv, iterAssumptions, iterLabels)
+          }
+        }
 
         for (const inv of step.invariants) {
           const invZ3 = translate(inv, bodyEnv, oldEnv)
@@ -541,6 +662,8 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           assumptions.push(ctx.Not(condPost as Bool<'main'>))
           assumptionLabels.push(`post-loop: !(${prettyExpr(step.condition)})`)
         }
+        // Axioms at the post-loop state
+        pushSpecAxioms(env, assumptions, assumptionLabels, `postLoop${loopCounter}`)
         loopCounter++
         continue
       }
@@ -591,26 +714,12 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   let branchCounter = 0
   processSteps(steps, null)
 
-  // Ensures-side definitional axioms read the FINAL heap (@post) — the
-  // select-over-store chains connect them to the @pre facts automatically
-  for (const ax of ensuresAxioms) {
-    const z3 = translate(ax, env, oldEnv)
-    if (z3 !== null) {
-      assumptions.push(z3 as Bool<'main'>)
-      assumptionLabels.push(`def@post: ${prettyExpr(ax).slice(0, 60)}`)
-    }
-  }
+  // Definitional axioms instantiated at the FINAL state — select-over-store
+  // connects them to the initial-state facts through the written window
+  pushSpecAxioms(env, assumptions, assumptionLabels, 'final')
 
-  // F5 — ownership frame bridges: for a spec predicate X paired with a
-  // membership predicate via footprint(X, inX), a write set entirely OUTSIDE
-  // the structure cannot change X. Per top-level application X@post(roots),
-  // emit the GROUND conditional bridge:
-  //
-  //   (∧_w ¬inX@pre(roots, w))  ⟹  X@post(roots) === X@pre(roots)
-  //
-  // The hypothesis side comes for free: `requires(!inX(head, other))`
-  // unfolds to exactly those @pre applications. Only fires when every write
-  // targets a direct root (pointer-path writes conservatively skip).
+  // F5 — ownership frame bridges between the initial and final states,
+  // via the footprint(spec, membership) pairing (see emitOwnershipBridges)
   if (ir.footprints !== undefined && ir.footprints.size > 0) {
     const writtenRoots = new Set<string>()
     let allWritesDirect = true
@@ -620,65 +729,18 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           if (s.object.kind === 'ident') writtenRoots.add(resolveAlias(s.object.name, aliasOf))
           else allWritesDirect = false
         } else if (s.kind === 'branch') { scanWrites(s.then); scanWrites(s.else) }
+        else if (s.kind === 'loop') scanWrites(s.body)
       }
     }
     scanWrites(steps)
-
-    if (allWritesDirect && writtenRoots.size > 0) {
-      // Top-level spec applications in the (unfolded) ensures predicates
-      // whose args are state-independent roots
-      const bridgeApps: Array<{ callee: string; args: Expr[] }> = []
-      const findApps = (e: Expr): void => {
-        if (e.kind === 'call' && (e.callee.startsWith('__ufb_') || e.callee.startsWith('__ufr_'))) {
-          if (e.args.every(a => a.kind === 'ident')) bridgeApps.push({ callee: e.callee, args: e.args })
-        }
-        if (e.kind === 'call') for (const a of e.args) findApps(a)
-        else if (e.kind === 'binary') { findApps(e.left); findApps(e.right) }
-        else if (e.kind === 'unary') findApps(e.operand)
-        else if (e.kind === 'ternary') { findApps(e.condition); findApps(e.then); findApps(e.else) }
-      }
+    if (allWritesDirect) {
+      const apps: Array<{ callee: string; args: Expr[] }> = []
       for (const c of ir.contracts) {
         if (c.kind === 'ensures' && typeof c.predicate === 'object' && c.predicate !== null) {
-          findApps(c.predicate as Expr)
+          collectRootApps(c.predicate as Expr, apps)
         }
       }
-
-      for (const app of bridgeApps) {
-        const specName = app.callee.replace(/^__uf[br]_/, '')
-        const memberName = ir.footprints.get(specName)
-        if (memberName === undefined) continue
-        // Already aliased by the read-set bridge? Then nothing to do.
-        if (specUFTag(app.callee, 'post') === 'pre') continue
-
-        const memberDef = ir.specDefs?.get(memberName)
-        const memberPrefix = memberDef !== undefined && !memberDef.isBool ? '__ufr_' : '__ufb_'
-
-        const conditions: Bool<'main'>[] = []
-        let ok = true
-        for (const w of writtenRoots) {
-          const memberApp: Expr = {
-            kind: 'call',
-            callee: `${memberPrefix}${memberName}`,
-            args: [...app.args, { kind: 'ident', name: w }],
-          }
-          const cond = translate(memberApp, oldEnv, oldEnv)  // @pre
-          if (cond === null) { ok = false; break }
-          conditions.push(ctx.Not(cond as Bool<'main'>))
-        }
-        if (!ok || conditions.length === 0) continue
-
-        const postApp = translate({ kind: 'call', callee: app.callee, args: app.args }, env, oldEnv)
-        const preApp = translate({ kind: 'call', callee: app.callee, args: app.args }, oldEnv, oldEnv)
-        if (postApp === null || preApp === null) continue
-
-        try {
-          const antecedent = conditions.length === 1 ? conditions[0]! : ctx.And(...conditions)
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
-          const consequent = (postApp as any).eq(preApp) as Bool<'main'>
-          assumptions.push(ctx.Implies(antecedent, consequent))
-          assumptionLabels.push(`frame bridge: ${specName} unchanged if writes outside ${memberName}`)
-        } catch { /* sort mismatch */ }
-      }
+      emitOwnershipBridges(apps, writtenRoots, oldEnv, env, assumptions, assumptionLabels)
     }
   }
 

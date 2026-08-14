@@ -548,6 +548,116 @@ describe('heap loops (F6)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F7: the LRU flagship — full composition
+// ---------------------------------------------------------------------------
+
+describe('LRU flagship (F7): full composition', () => {
+  const source = `
+    interface Node { value: number; next: Node | null; prev: Node | null }
+    function validChain(n: Node | null): boolean {
+      return n === null ? true : n.next === null ? true : n.next.prev === n && validChain(n.next)
+    }
+    function inChain(n: Node | null, x: Node): boolean {
+      return n === null ? false : n === x || inChain(n.next, x)
+    }
+    footprint(validChain, inChain)
+
+    export function moveToFront(head: Node, node: Node, prevN: Node): void {
+      requires(head !== node)
+      requires(prevN !== node)
+      requires(prevN !== head)
+      requires(head.prev === null)
+      requires(head.next === null)
+      requires(prevN.next === node)
+      requires(node.prev === prevN)
+      requires(node.next === null)
+      ensures(node === head || validChain(node))
+      if (node === head) return
+      prevN.next = node.next
+      node.prev = null
+      node.next = head
+      head.prev = node
+    }
+    export function buggyMoveToFront(head: Node, node: Node, prevN: Node): void {
+      requires(head !== node)
+      requires(prevN !== node)
+      requires(prevN !== head)
+      requires(head.prev === null)
+      requires(head.next === null)
+      requires(prevN.next === node)
+      requires(node.prev === prevN)
+      requires(node.next === null)
+      ensures(node === head || validChain(node))
+      if (node === head) return
+      prevN.next = node.next
+      node.prev = null
+      node.next = head
+    }
+    export function evictOthers(head: Node, victim: Node, n: number): void {
+      requires(validChain(head))
+      requires(!inChain(head, victim))
+      requires(nonNegative(n))
+      ensures(validChain(head))
+      while (n > 0) {
+        invariant(() => validChain(head))
+        decreases(() => n)
+        victim.prev = null
+        victim.value = 0
+        n = n - 1
+      }
+    }
+    export function evictBuggy(head: Node, victim: Node, n: number): void {
+      requires(validChain(head))
+      requires(nonNegative(n))
+      ensures(validChain(head))
+      while (n > 0) {
+        invariant(() => validChain(head))
+        decreases(() => n)
+        victim.prev = null
+        n = n - 1
+      }
+    }
+  `
+
+  test('moveToFront: early return + pointer unlink + relink preserves the chain', async () => {
+    const results = await verifyAll(source)
+    for (const r of results.filter(x => x.fn === 'moveToFront')) {
+      assert.strictEqual(r.status, 'proved', `${r.text}`)
+    }
+  })
+
+  test('the classic LRU bug (missing head back-pointer) is refuted', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'buggyMoveToFront' && x.text.includes('validChain'))
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+
+  test('recursive invariant survives a heap-mutating LOOP via ownership', async () => {
+    const results = await verifyAll(source)
+    const mine = results.filter(x => x.fn === 'evictOthers')
+    assert.ok(mine.length >= 4, `Expected ≥4 obligations, got ${mine.length}`)
+    for (const r of mine) {
+      assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.slice(-3).join(', ')}`)
+    }
+  })
+
+  test('without disjointness the loop invariant preservation fails', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'evictBuggy' && x.text.includes('preserved'))
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+
+  test('performance budget: the whole flagship verifies under 2s', async () => {
+    const t0 = Date.now()
+    await verifyAll(source)
+    const elapsed = Date.now() - t0
+    assert.ok(elapsed < 2000, `flagship took ${elapsed}ms (budget 2000ms)`)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 
