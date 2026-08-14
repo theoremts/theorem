@@ -8,7 +8,7 @@ import { writeFileSync, mkdirSync } from 'fs'
 // ---------------------------------------------------------------------------
 
 const SOURCE = 'theorem'
-const PLUGIN_VERSION = '0.6.0'
+const PLUGIN_VERSION = '0.7.0'
 const CHILD_TIMEOUT_MS = 60_000
 
 // ---------------------------------------------------------------------------

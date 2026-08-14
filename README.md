@@ -343,6 +343,237 @@ requires('total is positive')
 ensures('result is between 0 and 100')
 ```
 
+## Schemas as Contracts — zero annotations
+
+Your validation schemas already state your invariants. Theorem reads them:
+`Schema.parse()` throws on invalid data, so after the parse the schema's
+refinements are mathematical facts. No imports, no annotations — the schema
+IS the contract.
+
+```typescript
+const OrderSchema = z.object({
+  total: z.number().positive(),
+  quantity: z.number().int().min(1),
+  discount: z.number().min(0).max(0.5),
+})
+
+export function unitPrice(input: unknown): number {
+  const order = OrderSchema.parse(input)
+  return order.total / order.quantity        // ✓ proved: quantity >= 1
+}
+
+export function unitAdjustment(input: unknown): number {
+  const order = OrderSchema.parse(input)
+  return order.total / (order.quantity - 1)  // ✗ counterexample: quantity = 1
+}
+```
+
+Every function here passes `tsc --strict` — the bug lives in the arithmetic,
+not the types. Only the solver separates safe from broken. Effect Schema has
+full parity (`Schema.decodeUnknownSync`, `Schema.Struct`, `Schema.filter`),
+and `Schema.int()` gives Z3 the integer fact `number` can't express.
+
+### Cross-field model invariants — `.refine()`
+
+A `.refine()` predicate is a **model invariant**: assumed wherever the schema
+is parsed, and **proved for every function that returns the type**.
+
+```typescript
+const TaxRecordSchema = z.object({
+  gross: z.number().positive(),
+  tax: z.number().nonnegative(),
+  net: z.number(),
+}).refine(t => t.gross === t.tax + t.net)
+
+type TaxRecord = z.output<typeof TaxRecordSchema>
+
+export function buggyRebate(income: number, rebate: number): TaxRecord {
+  requires(positive(income))
+  // ✗ counterexample: rebate applied to net but not tax — gross ≠ tax + net
+  return { gross: income, tax: income * 0.2, net: income * 0.8 - rebate }
+}
+```
+
+Schemas imported from other files are resolved through relative imports.
+
+### Refinement types — the parameter type is the contract
+
+```typescript
+const RateSchema = z.number().gt(0).lte(1).brand()
+type Rate = z.output<typeof RateSchema>
+
+export function applyRate(amount: number, rate: Rate): number {
+  return amount / rate            // ✓ proved: the TYPE says rate > 0
+}
+
+applyRate(100, 0 as Rate)         // ✗ caught at the CALL SITE:
+                                  //   `as` satisfies tsc — not Z3
+```
+
+### tRPC boundaries
+
+`t.procedure.input(Schema).mutation(handler)` — the handler assumes the input
+schema's constraints and invariants automatically (tRPC validates before
+invoking it). Zod or Effect Schema.
+
+### Database facts — `theorem prisma`
+
+```bash
+theorem prisma prisma/schema.prisma    # → theorem-schemas.ts
+```
+
+Generates row schemas from your database schema: `Int` columns become
+integer facts, nullability maps to `.nullable()`, enums are documented.
+Column constraints flow into proofs.
+
+## Object Invariants
+
+### Class invariants — Design by Contract
+
+Declared once on the class; assumed at every method entry, proved at every
+exit (mutations of `this.*` are tracked), and the constructor must establish
+it:
+
+```typescript
+@invariant((self: Account) => self.balance >= 0)
+class Account {
+  balance: number
+
+  constructor(initial: number) {
+    requires(positive(initial))
+    this.balance = initial              // ✓ establishes the invariant
+  }
+
+  withdraw(amount: number): void {
+    requires(positive(amount))
+    if (amount <= this.balance) {
+      this.balance = this.balance - amount   // ✓ guarded — preserved
+    }
+  }
+
+  overdraw(amount: number): void {
+    requires(positive(amount))
+    this.balance = this.balance - amount     // ✗ balance = 0, amount = 0.5
+  }
+}
+```
+
+## Verifying Mutation — heap, aliasing, and pointers
+
+When a function mutates fields of object parameters, Theorem switches to a
+heap encoding (Z3 arrays): object references become solver values, so
+**aliasing is a case the solver explores** rather than an assumption it
+silently makes.
+
+```typescript
+export function drainUnsafe(from: Account, to: Account): void {
+  requires(nonNegative(from.value))
+  requires(nonNegative(to.value))
+  ensures(to.value === old(to.value) + old(from.value))
+  to.value = to.value + from.value
+  from.value = 0
+}
+// ✗ counterexample: from = 2, to = 2  — the SAME reference!
+//   Aliased, the two writes hit one cell: the value doubles, then zeroes.
+//   Add requires(from !== to) and it proves.
+```
+
+`modifies(a, b)` restricts which objects a function may write (undeclared
+writes are violations), and `old(x.f)` reads the pre-state.
+
+### Recursive invariants over linked structures
+
+User-defined recursive predicates work over the mutable heap — the full
+Dafny-style workflow, in plain TypeScript functions:
+
+```typescript
+interface Node { value: number; next: Node | null; prev: Node | null }
+
+// The doubly-linked coherence invariant — a plain recursive function
+function validChain(n: Node | null): boolean {
+  return n === null ? true
+    : n.next === null ? true
+    : n.next.prev === n && validChain(n.next)
+}
+
+// Which nodes validChain reads — enables frame reasoning
+function inChain(n: Node | null, x: Node): boolean {
+  return n === null ? false : n === x || inChain(n.next, x)
+}
+footprint(validChain, inChain)
+
+// The LRU cache's core operation: unlink + relink at front
+export function moveToFront(head: Node, node: Node, prevN: Node): void {
+  requires(/* bounded window: head.prev === null, prevN.next === node, ... */)
+  ensures(node === head || validChain(node))
+  if (node === head) return
+  prevN.next = node.next     // write THROUGH a pointer
+  node.prev = null
+  node.next = head
+  head.prev = node           // forget this line → refuted with a counterexample
+}
+
+// A LOOP mutating a field the invariant READS — preserved because the
+// victim is provably OUTSIDE the chain (ownership via footprint)
+export function evictOthers(head: Node, victim: Node, n: number): void {
+  requires(validChain(head))
+  requires(!inChain(head, victim))
+  requires(nonNegative(n))
+  ensures(validChain(head))
+  while (n > 0) {
+    invariant(() => validChain(head))
+    decreases(() => n)
+    victim.prev = null
+    n = n - 1
+  }
+}
+```
+
+Each loop produces four obligations: invariant at entry, invariant preserved
+by an arbitrary iteration, termination measure bounded and decreasing, and
+the code after the loop resumes under `invariant ∧ ¬condition`. The classic
+LRU bug — forgetting the head back-pointer, whose symptom appears operations
+later as silently dropped entries — is refuted at the source. See
+[`examples/lru.ts`](examples/lru.ts).
+
+Sequences close the abstraction-function loop from the Dafny playbook
+([`examples/cons.ts`](examples/cons.ts)):
+
+```typescript
+function list(n: Node | null): number[] {
+  return n === null ? [] : [n.value, ...list(n.next)]
+}
+
+export function cons(x: number, tail: Node | null): Node {
+  ensures(tail === null
+    ? seqEq(list(output()), [x])
+    : seqEq(list(output()), [x, ...list(tail)]))   // ✓ list(cons(x,t)) = [x] ++ list(t)
+  return { value: x, next: tail }
+}
+```
+
+All of this runs on ground instantiation — no quantifiers — so solve times
+stay in single-digit milliseconds and results are deterministic.
+
+## Counterexamples as Regression Tests
+
+```bash
+theorem verify --gen-tests src/
+```
+
+Every disproved obligation carries the exact input that breaks the contract.
+`--gen-tests` turns each one into a `node:test` case calling the real
+function with those values and asserting the contract — **RED until the bug
+is fixed**, then a permanent regression guard:
+
+```typescript
+// .theorem/regressions/basics.regression.test.ts (auto-generated)
+test('buggySubtract: nonNegative(output())', () => {
+  const __r = buggySubtract(0.25, 0.5)
+  assert.ok(__r >= 0, "contract violated: nonNegative(output())")
+})
+```
+
 ## VS Code Integration
 
 ```bash
