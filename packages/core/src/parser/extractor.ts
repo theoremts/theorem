@@ -152,6 +152,10 @@ export function extractFromSource(source: string, fileName = 'input.ts', registr
     if (specDefs.size > 0) {
       for (const ir of results) ir.specDefs = specDefs
     }
+    const footprints = collectFootprints(file)
+    if (footprints.size > 0) {
+      for (const ir of results) ir.footprints = footprints
+    }
   } catch { /* best-effort */ }
 
   // 4. Declared contracts: if registry has contracts for functions in this file,
@@ -1043,6 +1047,20 @@ function collectSpecDefs(
     })
   }
   return defs
+}
+
+/** Collects top-level `footprint(spec, membership)` pairings. */
+function collectFootprints(file: SourceFile): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const call of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (call.getExpression().getText() !== 'footprint') continue
+    const args = call.getArguments()
+    if (args.length !== 2) continue
+    if (Node.isIdentifier(args[0]) && Node.isIdentifier(args[1])) {
+      out.set(args[0].getText(), args[1].getText())
+    }
+  }
+  return out
 }
 
 function isSeqBody(expr: Expr): boolean {

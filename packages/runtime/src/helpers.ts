@@ -68,3 +68,17 @@ export function conserved(..._values: number[]): boolean {
 export function seqEq<T>(a: readonly T[], b: readonly T[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i])
 }
+
+/**
+ * Declares that `membership(root, x)` characterizes the FOOTPRINT of the
+ * spec predicate `spec(root)` — i.e., `spec` only reads fields of objects
+ * `x` for which `membership(root, x)` holds. The engine uses this pairing
+ * for frame reasoning: writes to objects provably OUTSIDE the footprint
+ * cannot change the predicate's value. The pairing itself is TRUSTED
+ * (like a Dafny reads-clause); no-op at runtime.
+ *
+ *   footprint(validChain, inChain)
+ */
+export function footprint(_spec: unknown, _membership: unknown): void {
+  // no-op — read statically by the engine
+}

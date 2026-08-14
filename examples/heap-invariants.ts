@@ -12,7 +12,7 @@
 // Scope: bounded windows (fuel 2). Whole-chain framing beyond the window is
 // F5 (ownership) territory.
 
-import { requires, ensures } from 'theoremts'
+import { requires, ensures, footprint } from 'theoremts'
 
 interface Node { value: number; next: Node | null; prev: Node | null }
 
@@ -57,6 +57,25 @@ export function touchValue(head: Node, v: number): void {
 // (nothing says `other` is outside it) — the bridge correctly refuses.
 export function buggyTouch(head: Node, other: Node): void {
   requires(validChain(head))
+  ensures(validChain(head))
+  other.prev = null
+}
+
+// ── F5: ownership (Repr-lite) ────────────────────────────────────────────────
+// `inChain` characterizes validChain's FOOTPRINT (which objects it reads).
+// The footprint() pairing lets writes provably OUTSIDE the structure
+// preserve the invariant even when they touch fields the invariant reads.
+
+function inChain(n: Node | null, x: Node): boolean {
+  return n === null ? false : n === x || inChain(n.next, x)
+}
+footprint(validChain, inChain)
+
+// ✓ PROVED — same write as buggyTouch, but ownership is stated: `other`
+// is outside the chain, so the invariant cannot be affected.
+export function safeTouch(head: Node, other: Node): void {
+  requires(validChain(head))
+  requires(!inChain(head, other))
   ensures(validChain(head))
   other.prev = null
 }

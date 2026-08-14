@@ -141,6 +141,11 @@ export interface FunctionIR {
    * pure (possibly recursive) same-file functions, unfolded with fuel.
    */
   specDefs?: Map<string, { params: string[]; body: Expr; isBool: boolean; isSeq: boolean }> | undefined
+  /**
+   * footprint(spec, membership) pairings: `membership(root, x)` characterizes
+   * which objects `spec(root)` reads — trusted, used for frame bridges.
+   */
+  footprints?: Map<string, string> | undefined
 }
 
 /** One step of a heap-mode body. */

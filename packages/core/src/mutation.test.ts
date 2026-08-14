@@ -438,6 +438,49 @@ describe('heap invariants (F4)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F5: ownership via footprint pairing (Repr-lite)
+// ---------------------------------------------------------------------------
+
+describe('ownership footprints (F5)', () => {
+  const source = `
+    interface Node { value: number; next: Node | null; prev: Node | null }
+    function validChain(n: Node | null): boolean {
+      return n === null ? true : n.next === null ? true : n.next.prev === n && validChain(n.next)
+    }
+    function inChain(n: Node | null, x: Node): boolean {
+      return n === null ? false : n === x || inChain(n.next, x)
+    }
+    footprint(validChain, inChain)
+
+    export function safeTouch(head: Node, other: Node): void {
+      requires(validChain(head))
+      requires(!inChain(head, other))
+      ensures(validChain(head))
+      other.prev = null
+    }
+    export function unsafeTouch(head: Node, other: Node): void {
+      requires(validChain(head))
+      ensures(validChain(head))
+      other.prev = null
+    }
+  `
+
+  test('writes outside the declared footprint preserve the invariant', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'safeTouch')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.join(', ')}`)
+  })
+
+  test('without the disjointness hypothesis the bridge cannot fire', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'unsafeTouch')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 

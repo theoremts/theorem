@@ -408,6 +408,87 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
 
+  // F5 — ownership frame bridges: for a spec predicate X paired with a
+  // membership predicate via footprint(X, inX), a write set entirely OUTSIDE
+  // the structure cannot change X. Per top-level application X@post(roots),
+  // emit the GROUND conditional bridge:
+  //
+  //   (∧_w ¬inX@pre(roots, w))  ⟹  X@post(roots) === X@pre(roots)
+  //
+  // The hypothesis side comes for free: `requires(!inX(head, other))`
+  // unfolds to exactly those @pre applications. Only fires when every write
+  // targets a direct root (pointer-path writes conservatively skip).
+  if (ir.footprints !== undefined && ir.footprints.size > 0) {
+    const writtenRoots = new Set<string>()
+    let allWritesDirect = true
+    const scanWrites = (list: typeof steps): void => {
+      for (const s of list) {
+        if (s.kind === 'field-write') {
+          if (s.object.kind === 'ident') writtenRoots.add(resolveAlias(s.object.name, aliasOf))
+          else allWritesDirect = false
+        } else if (s.kind === 'branch') { scanWrites(s.then); scanWrites(s.else) }
+      }
+    }
+    scanWrites(steps)
+
+    if (allWritesDirect && writtenRoots.size > 0) {
+      // Top-level spec applications in the (unfolded) ensures predicates
+      // whose args are state-independent roots
+      const bridgeApps: Array<{ callee: string; args: Expr[] }> = []
+      const findApps = (e: Expr): void => {
+        if (e.kind === 'call' && (e.callee.startsWith('__ufb_') || e.callee.startsWith('__ufr_'))) {
+          if (e.args.every(a => a.kind === 'ident')) bridgeApps.push({ callee: e.callee, args: e.args })
+        }
+        if (e.kind === 'call') for (const a of e.args) findApps(a)
+        else if (e.kind === 'binary') { findApps(e.left); findApps(e.right) }
+        else if (e.kind === 'unary') findApps(e.operand)
+        else if (e.kind === 'ternary') { findApps(e.condition); findApps(e.then); findApps(e.else) }
+      }
+      for (const c of ir.contracts) {
+        if (c.kind === 'ensures' && typeof c.predicate === 'object' && c.predicate !== null) {
+          findApps(c.predicate as Expr)
+        }
+      }
+
+      for (const app of bridgeApps) {
+        const specName = app.callee.replace(/^__uf[br]_/, '')
+        const memberName = ir.footprints.get(specName)
+        if (memberName === undefined) continue
+        // Already aliased by the read-set bridge? Then nothing to do.
+        if (specUFTag(app.callee, 'post') === 'pre') continue
+
+        const memberDef = ir.specDefs?.get(memberName)
+        const memberPrefix = memberDef !== undefined && !memberDef.isBool ? '__ufr_' : '__ufb_'
+
+        const conditions: Bool<'main'>[] = []
+        let ok = true
+        for (const w of writtenRoots) {
+          const memberApp: Expr = {
+            kind: 'call',
+            callee: `${memberPrefix}${memberName}`,
+            args: [...app.args, { kind: 'ident', name: w }],
+          }
+          const cond = translate(memberApp, oldEnv, oldEnv)  // @pre
+          if (cond === null) { ok = false; break }
+          conditions.push(ctx.Not(cond as Bool<'main'>))
+        }
+        if (!ok || conditions.length === 0) continue
+
+        const postApp = translate({ kind: 'call', callee: app.callee, args: app.args }, env, oldEnv)
+        const preApp = translate({ kind: 'call', callee: app.callee, args: app.args }, oldEnv, oldEnv)
+        if (postApp === null || preApp === null) continue
+
+        try {
+          const antecedent = conditions.length === 1 ? conditions[0]! : ctx.And(...conditions)
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+          const consequent = (postApp as any).eq(preApp) as Bool<'main'>
+          assumptions.push(ctx.Implies(antecedent, consequent))
+          assumptionLabels.push(`frame bridge: ${specName} unchanged if writes outside ${memberName}`)
+        } catch { /* sort mismatch */ }
+      }
+    }
+  }
+
   // ── Ensures: hold in the final state ─────────────────────────────────────
   const variables = new Map<string, AnyExpr<'main'>>()
   for (const [name, ref] of refs) variables.set(name, ref as unknown as AnyExpr<'main'>)
