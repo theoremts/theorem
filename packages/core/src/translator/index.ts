@@ -44,6 +44,14 @@ export function translate(
   ctx: Z3Context,
   registry?: ContractRegistry,
 ): VerificationTask[] {
+  // Heap mode runs FIRST and owns its own spec-unfolding pipeline: axioms
+  // must be instantiated PER HEAP VERSION (@pre/@post), and heap-mode null
+  // is already a value (NULL_REF) — the general preprocessing below would
+  // convert calls prematurely and rewrite null into an unresolvable ident.
+  if (ir.heapSteps !== undefined && ir.heapSteps.length > 0) {
+    return translateHeapMode(ir, ctx)
+  }
+
   // Spec functions: calls in contract predicates become uninterpreted
   // applications (congruence!), with ground definitional axioms emitted per
   // call instance up to the fuel bound (see translator/spec-unfold.ts)
@@ -102,13 +110,6 @@ export function translate(
     } else if (contracts.some((c, i) => c !== ir.contracts[i])) {
       ir = { ...ir, contracts }
     }
-  }
-
-  // Heap mode: the function mutates fields of object parameters — flat
-  // per-path variables are unsound under aliasing, so the heap is encoded
-  // as Z3 arrays instead (see translator/heap.ts).
-  if (ir.heapSteps !== undefined && ir.heapSteps.length > 0) {
-    return translateHeapMode(ir, ctx)
   }
 
   const vars = createVariables(ir.params, ir.returnSort, ctx)

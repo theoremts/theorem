@@ -3,6 +3,7 @@ import type { Z3Context } from '../solver/context.js'
 import type { Expr, FunctionIR } from '../parser/ir.js'
 import type { VerificationTask } from './index.js'
 import { prettyExpr } from '../parser/pretty.js'
+import { unfoldSpecCalls } from './spec-unfold.js'
 
 /**
  * Heap-as-map encoding — mutation levels 2 and 3, plus the L4 spike:
@@ -26,6 +27,41 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   const declaredRoots = new Set(ir.heapRoots ?? [])
   const tasks: VerificationTask[] = []
 
+  // F4: spec predicates over the mutable heap. Contract predicates are
+  // unfolded (F2 machinery); their definitional axioms are translated PER
+  // HEAP VERSION — requires-side axioms read the INITIAL heap (@pre), while
+  // ensures-side axioms read the FINAL heap (@post). Select-over-store then
+  // connects the two versions automatically for the written window.
+  let requiresAxioms: Expr[] = []
+  let ensuresAxioms: Expr[] = []
+  if (ir.specDefs !== undefined && ir.specDefs.size > 0) {
+    const defs = ir.specDefs
+    const reqAx: Expr[] = []
+    const ensAx: Expr[] = []
+    ir = {
+      ...ir,
+      contracts: ir.contracts.map(c => {
+        if (!('predicate' in c) || typeof c.predicate !== 'object' || c.predicate === null) return c
+        const unfolded = unfoldSpecCalls(c.predicate as Expr, defs)
+        if (unfolded.axioms.length === 0) return c
+        const bucket = c.kind === 'ensures' ? ensAx : reqAx
+        for (const a of unfolded.axioms) bucket.push(a.predicate)
+        return { ...c, predicate: unfolded.expr } as typeof c
+      }),
+    }
+    const dedupe = (list: Expr[]): Expr[] => {
+      const seen = new Set<string>()
+      return list.filter(p => {
+        const k = prettyExpr(p)
+        if (seen.has(k)) return false
+        seen.add(k)
+        return true
+      })
+    }
+    requiresAxioms = dedupe(reqAx)
+    ensuresAxioms = dedupe(ensAx)
+  }
+
   // ── References: one Int constant per object root; aliases share ──────────
   const refs = new Map<string, Arith<'main'>>()
   const aliasOf = new Map<string, string>()
@@ -34,6 +70,23 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   }
   const rootNames = new Set<string>(declaredRoots)
   for (const step of steps) if (step.kind === 'field-write') rootNames.add(resolveAlias(step.root, aliasOf))
+  // Spec predicates dereference their arguments (validChain(node) reads
+  // node.next inside the axioms) — those bases are references too
+  const memberRootsOf = (e: Expr): void => {
+    if (e.kind === 'member') {
+      let base: Expr = e.object
+      while (base.kind === 'member') base = base.object
+      if (base.kind === 'ident') rootNames.add(resolveAlias(base.name, aliasOf))
+      memberRootsOf(e.object)
+    } else if (e.kind === 'binary') { memberRootsOf(e.left); memberRootsOf(e.right) }
+    else if (e.kind === 'unary') memberRootsOf(e.operand)
+    else if (e.kind === 'ternary') { memberRootsOf(e.condition); memberRootsOf(e.then); memberRootsOf(e.else) }
+    else if (e.kind === 'call') for (const a of e.args) memberRootsOf(a)
+  }
+  for (const c of ir.contracts) {
+    if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) memberRootsOf(c.predicate as Expr)
+  }
+  for (const ax of [...requiresAxioms, ...ensuresAxioms]) memberRootsOf(ax)
   for (const name of rootNames) refs.set(name, ctx.Int.const(name))
 
   const NULL_REF = ctx.Int.val(0)
@@ -60,6 +113,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
   collectStepFields(steps)
+  for (const ax of [...requiresAxioms, ...ensuresAxioms]) contractPredicates.push(ax)
   for (const p of contractPredicates) collectFields(p, fields)
 
   const refFields = inferRefFields(steps, contractPredicates, rootNames, aliasOf)
@@ -81,6 +135,60 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     heap: Map<string, any>
     locals: Map<string, AnyExpr<'main'>>
+    /** Heap version tag — spec UFs are distinct per version (@pre/@post). */
+    tag: 'pre' | 'post'
+  }
+
+  // Frame bridge (ground, sound): a spec predicate whose READ-SET is
+  // disjoint from the WRITTEN fields cannot change value across the body —
+  // its @post application IS its @pre application. Read-sets are transitive
+  // over called spec definitions.
+  const writtenFields = new Set<string>()
+  const collectWritten = (list: typeof steps): void => {
+    for (const s of list) {
+      if (s.kind === 'field-write') writtenFields.add(s.field)
+      else if (s.kind === 'branch') { collectWritten(s.then); collectWritten(s.else) }
+    }
+  }
+  collectWritten(steps)
+
+  const readSetCache = new Map<string, Set<string>>()
+  const readSetOf = (defName: string, visiting = new Set<string>()): Set<string> => {
+    const cached = readSetCache.get(defName)
+    if (cached !== undefined) return cached
+    if (visiting.has(defName)) return new Set()
+    visiting.add(defName)
+    const out = new Set<string>()
+    const def = ir.specDefs?.get(defName)
+    if (def !== undefined) {
+      const walk = (e: Expr): void => {
+        switch (e.kind) {
+          case 'member': out.add(e.property); walk(e.object); break
+          case 'binary': walk(e.left); walk(e.right); break
+          case 'unary': walk(e.operand); break
+          case 'ternary': walk(e.condition); walk(e.then); walk(e.else); break
+          case 'call': {
+            for (const sub of readSetOf(e.callee, visiting)) out.add(sub)
+            for (const a of e.args) walk(a)
+            break
+          }
+          case 'array': for (const el of e.elements) walk(el); break
+          case 'spread': walk(e.operand); break
+          default: break
+        }
+      }
+      walk(def.body)
+    }
+    readSetCache.set(defName, out)
+    return out
+  }
+
+  const specUFTag = (callee: string, tag: 'pre' | 'post'): 'pre' | 'post' => {
+    if (tag === 'pre') return 'pre'
+    const defName = callee.replace(/^__uf[brs]_/, '')
+    const reads = readSetOf(defName)
+    for (const f of reads) if (writtenFields.has(f)) return 'post'
+    return 'pre'  // reads nothing that was written — value cannot change
   }
 
   const translate = (expr: Expr, env: Env, oldEnv: Env): AnyExpr<'main'> | null => {
@@ -141,6 +249,32 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         return ctx.If(c as Bool<'main'>, t, e)
       }
       case 'call': {
+        // Spec-function UF applications, versioned by heap tag: the same
+        // predicate reads DIFFERENT heaps at entry vs exit, so @pre and
+        // @post are distinct uninterpreted functions
+        if (expr.callee.startsWith('__ufb_') || expr.callee.startsWith('__ufr_')) {
+          const args = expr.args.map(a => translate(a, env, oldEnv))
+          if (args.some(a => a === null)) return null
+          const isBool = expr.callee.startsWith('__ufb_')
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const anyCtx = ctx as any
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+            const cache: Map<string, unknown> = anyCtx.__ufCache ?? (anyCtx.__ufCache = new Map())
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+            const argSorts = args.map(a => (a as any).sort)
+            const key = `${expr.callee}@${specUFTag(expr.callee, env.tag)}(${argSorts.map((s: unknown) => String(s)).join(',')})`
+            let decl = cache.get(key)
+            if (decl === undefined) {
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+              decl = ctx.Function.declare(key.replace(/[^\w]/g, '_'), ...argSorts, isBool ? ctx.Bool.sort() : ctx.Real.sort())
+              cache.set(key, decl)
+            }
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+            return (decl as any).call(...args)
+          } catch { return null }
+        }
+
         // old(x.f): value in the INITIAL heap
         if (expr.callee === 'old' && expr.args.length === 1) {
           return translate(expr.args[0]!, oldEnv, oldEnv)
@@ -163,7 +297,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
 
-  const oldEnv: Env = { heap: initialHeap, locals: new Map() }
+  const oldEnv: Env = { heap: initialHeap, locals: new Map(), tag: 'pre' }
 
   // ── Requires: hold in the initial state; named roots are non-null ────────
   const assumptions: Bool<'main'>[] = []
@@ -180,6 +314,13 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
       assumptionLabels.push(`requires: ${prettyExpr(c.predicate)}`)
     }
   }
+  for (const ax of requiresAxioms) {
+    const z3 = translate(ax, oldEnv, oldEnv)
+    if (z3 !== null) {
+      assumptions.push(z3 as Bool<'main'>)
+      assumptionLabels.push(`def@pre: ${prettyExpr(ax).slice(0, 60)}`)
+    }
+  }
 
   // ── Execute steps over the heap ──────────────────────────────────────────
   //
@@ -188,7 +329,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   // Sequential processing composes correctly — a then-branch mutation read
   // from the else-branch resolves to the original value because its ITE
   // guard is false there. Early returns clear `alive` for their paths.
-  const env: Env = { heap: new Map(initialHeap), locals: new Map() }
+  const env: Env = { heap: new Map(initialHeap), locals: new Map(), tag: 'post' }
   const modifiesContract = ir.contracts.find(c => c.kind === 'modifies')
   const allowedWrites = modifiesContract !== undefined
     ? new Set((modifiesContract as { refs: string[] }).refs.map(r => resolveAlias(r, aliasOf)))
@@ -256,6 +397,16 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
 
   let branchCounter = 0
   processSteps(steps, null)
+
+  // Ensures-side definitional axioms read the FINAL heap (@post) — the
+  // select-over-store chains connect them to the @pre facts automatically
+  for (const ax of ensuresAxioms) {
+    const z3 = translate(ax, env, oldEnv)
+    if (z3 !== null) {
+      assumptions.push(z3 as Bool<'main'>)
+      assumptionLabels.push(`def@post: ${prettyExpr(ax).slice(0, 60)}`)
+    }
+  }
 
   // ── Ensures: hold in the final state ─────────────────────────────────────
   const variables = new Map<string, AnyExpr<'main'>>()

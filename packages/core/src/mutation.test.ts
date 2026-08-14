@@ -369,6 +369,75 @@ describe('sequences (F3): the Cons example', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F4: recursive spec predicates over the mutable heap
+// ---------------------------------------------------------------------------
+
+describe('heap invariants (F4)', () => {
+  const source = `
+    interface Node { value: number; next: Node | null; prev: Node | null }
+    function validChain(n: Node | null): boolean {
+      return n === null ? true
+        : n.next === null ? true
+        : n.next.prev === n && validChain(n.next)
+    }
+    export function linkFront(head: Node, node: Node): void {
+      requires(head !== node)
+      requires(head.next === null)
+      requires(node.next === null)
+      requires(node.prev === null)
+      ensures(validChain(node))
+      node.next = head
+      head.prev = node
+    }
+    export function buggyLink(head: Node, node: Node): void {
+      requires(head !== node)
+      requires(head.next === null)
+      requires(node.next === null)
+      ensures(validChain(node))
+      node.next = head
+    }
+    export function touchValue(head: Node, v: number): void {
+      requires(validChain(head))
+      ensures(validChain(head))
+      head.value = v
+    }
+    export function buggyTouch(head: Node, other: Node): void {
+      requires(validChain(head))
+      ensures(validChain(head))
+      other.prev = null
+    }
+  `
+
+  test('pointer surgery establishes the recursive invariant', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'linkFront')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.join(', ')}`)
+  })
+
+  test('missing back-pointer write is refuted', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'buggyLink')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+
+  test('frame bridge: disjoint-field writes preserve the invariant', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'touchValue')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved')
+  })
+
+  test('frame bridge refuses when a read field is written', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'buggyTouch')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 
