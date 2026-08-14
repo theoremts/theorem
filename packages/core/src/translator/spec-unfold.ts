@@ -33,6 +33,8 @@ export interface SpecDef {
   body: Expr
   /** Whether the definition's root expression is boolean-valued. */
   isBool: boolean
+  /** Whether the definition's root expression is sequence-valued. */
+  isSeq: boolean
 }
 
 export type SpecDefs = Map<string, SpecDef>
@@ -42,6 +44,7 @@ export const DEFAULT_FUEL = 2
 /** Marker prefixes consumed by the translator's call handler. */
 export const UF_BOOL_PREFIX = '__ufb_'
 export const UF_REAL_PREFIX = '__ufr_'
+export const UF_SEQ_PREFIX = '__ufs_'
 
 export interface UnfoldResult {
   /** The predicate with spec calls turned into uninterpreted applications. */
@@ -73,6 +76,10 @@ export function unfoldSpecCalls(expr: Expr, defs: SpecDefs, fuel = DEFAULT_FUEL)
         return { kind: 'member', object: toUF(e.object), property: e.property }
       case 'element-access':
         return { kind: 'element-access', object: toUF(e.object), index: toUF(e.index) }
+      case 'array':
+        return { kind: 'array', elements: e.elements.map(toUF) }
+      case 'spread':
+        return { kind: 'spread', operand: toUF(e.operand) }
       default:
         return e
     }
@@ -120,6 +127,10 @@ export function unfoldSpecCalls(expr: Expr, defs: SpecDefs, fuel = DEFAULT_FUEL)
         return { kind: 'member', object: convertBody(e.object, remaining), property: e.property }
       case 'element-access':
         return { kind: 'element-access', object: convertBody(e.object, remaining), index: convertBody(e.index, remaining) }
+      case 'array':
+        return { kind: 'array', elements: e.elements.map(el => convertBody(el, remaining)) }
+      case 'spread':
+        return { kind: 'spread', operand: convertBody(e.operand, remaining) }
       default:
         return e
     }
@@ -129,5 +140,46 @@ export function unfoldSpecCalls(expr: Expr, defs: SpecDefs, fuel = DEFAULT_FUEL)
 }
 
 function ufName(name: string, def: SpecDef): string {
-  return `${def.isBool ? UF_BOOL_PREFIX : UF_REAL_PREFIX}${name}`
+  const prefix = def.isSeq ? UF_SEQ_PREFIX : def.isBool ? UF_BOOL_PREFIX : UF_REAL_PREFIX
+  return `${prefix}${name}`
+}
+
+/**
+ * Rewrites null comparisons into VALUE comparisons against `__nullref`.
+ *
+ * The default encoding models `x === null` as an independent boolean
+ * variable per NAME — which breaks congruence in spec reasoning:
+ * `result.next = tail` would not propagate nullness. Within spec-function
+ * tasks, null must be a VALUE so equalities carry it.
+ */
+export function rewriteNullToRef(expr: Expr): Expr {
+  switch (expr.kind) {
+    case 'binary': {
+      if ((expr.op === '===' || expr.op === '!==')) {
+        const leftNull = expr.left.kind === 'literal' && expr.left.value === null
+        const rightNull = expr.right.kind === 'literal' && expr.right.value === null
+        if (leftNull || rightNull) {
+          const subject = rewriteNullToRef(leftNull ? expr.right : expr.left)
+          return { kind: 'binary', op: expr.op, left: subject, right: { kind: 'ident', name: '__nullref' } }
+        }
+      }
+      return { kind: 'binary', op: expr.op, left: rewriteNullToRef(expr.left), right: rewriteNullToRef(expr.right) }
+    }
+    case 'unary':
+      return { kind: 'unary', op: expr.op, operand: rewriteNullToRef(expr.operand) }
+    case 'ternary':
+      return { kind: 'ternary', condition: rewriteNullToRef(expr.condition), then: rewriteNullToRef(expr.then), else: rewriteNullToRef(expr.else) }
+    case 'call':
+      return { kind: 'call', callee: expr.callee, args: expr.args.map(rewriteNullToRef) }
+    case 'member':
+      return { kind: 'member', object: rewriteNullToRef(expr.object), property: expr.property }
+    case 'element-access':
+      return { kind: 'element-access', object: rewriteNullToRef(expr.object), index: rewriteNullToRef(expr.index) }
+    case 'array':
+      return { kind: 'array', elements: expr.elements.map(rewriteNullToRef) }
+    case 'spread':
+      return { kind: 'spread', operand: rewriteNullToRef(expr.operand) }
+    default:
+      return expr
+  }
 }

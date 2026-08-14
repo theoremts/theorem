@@ -1,6 +1,6 @@
 import type { AnyExpr, Arith, Bool } from 'z3-solver'
 import type { Z3Context } from '../solver/context.js'
-import type { Expr, FunctionIR, Loc, LoopInfo, Param, Predicate } from '../parser/ir.js'
+import type { Contract, Expr, FunctionIR, Loc, LoopInfo, Param, Predicate } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { createVariables, makeConst } from './variables.js'
@@ -8,7 +8,7 @@ import { toZ3 } from './expr.js'
 import { translateStringContract } from './string-contracts.js'
 import { substituteExpr, substituteOutput } from './substitution.js'
 import { translateHeapMode } from './heap.js'
-import { unfoldSpecCalls } from './spec-unfold.js'
+import { unfoldSpecCalls, rewriteNullToRef } from './spec-unfold.js'
 
 export type { Z3Context }
 
@@ -58,7 +58,7 @@ export function translate(
       }
       return c
     })
-    if (axioms.length > 0 || contracts.some((c, i) => c !== ir.contracts[i])) {
+    if (axioms.length > 0) {
       const seenAxioms = new Set<string>()
       const uniqueAxioms = axioms.filter(a => {
         const key = prettyExpr(a.predicate)
@@ -66,15 +66,41 @@ export function translate(
         seenAxioms.add(key)
         return true
       })
+
+      // Within spec tasks null must be a VALUE (see rewriteNullToRef): the
+      // per-name boolean encoding breaks congruence through equalities.
+      const specContracts = contracts.map(c =>
+        'predicate' in c && typeof c.predicate === 'object' && c.predicate !== null
+          ? { ...c, predicate: rewriteNullToRef(c.predicate as Expr) } as typeof c
+          : c)
+      const specAxioms = uniqueAxioms.map(a => rewriteNullToRef(a.predicate))
+
+      // Object-literal producers yield non-null results
+      const notNullFacts: Contract[] = []
+      if (ir.body !== undefined && (ir.body.kind === 'object' ||
+          (ir.body.kind === 'ternary' && ir.body.then.kind === 'object' && ir.body.else.kind === 'object'))) {
+        notNullFacts.push({
+          kind: 'assume',
+          predicate: {
+            kind: 'binary', op: '!==',
+            left: { kind: 'call', callee: 'output', args: [] },
+            right: { kind: 'ident', name: '__nullref' },
+          },
+        })
+      }
+
       // Axioms PREPENDED: assume/ensures share one sequential pass, and the
       // ensures task snapshots the assumptions gathered so far
       ir = {
         ...ir,
         contracts: [
-          ...uniqueAxioms.map(a => ({ kind: 'assume' as const, predicate: a.predicate })),
-          ...contracts,
+          ...specAxioms.map(p => ({ kind: 'assume' as const, predicate: p })),
+          ...notNullFacts,
+          ...specContracts,
         ],
       }
+    } else if (contracts.some((c, i) => c !== ir.contracts[i])) {
+      ir = { ...ir, contracts }
     }
   }
 
@@ -136,7 +162,13 @@ export function translate(
         if (!vars.has(propName)) {
           vars.set(propName, makeConst(propName, 'real', ctx))
         }
-        const propZ3 = toZ3(prop.value, vars, ctx)
+        // `prop: null` → equate with the null VALUE reference (spec tasks
+        // reason about nullness through equalities, not per-name booleans)
+        const isNullProp = prop.value.kind === 'literal' && prop.value.value === null
+        if (isNullProp && !vars.has('__nullref')) {
+          vars.set('__nullref', makeConst('__nullref', 'real', ctx))
+        }
+        const propZ3 = isNullProp ? vars.get('__nullref')! : toZ3(prop.value, vars, ctx)
         const propVar = vars.get(propName)
         if (propZ3 !== null && propVar !== undefined) {
           try {

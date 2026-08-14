@@ -319,6 +319,56 @@ describe('spec functions (F2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// F3: sequence theory — the full Dafny Cons
+// ---------------------------------------------------------------------------
+
+describe('sequences (F3): the Cons example', () => {
+  const source = `
+    interface Node { readonly value: number; readonly next: Node | null }
+    function list(n: Node | null): number[] {
+      return n === null ? [] : [n.value, ...list(n.next)]
+    }
+    export function single(x: number): Node {
+      ensures(seqEq(list(output()), [x]))
+      return { value: x, next: null }
+    }
+    export function cons(x: number, tail: Node | null): Node {
+      ensures(tail === null
+        ? seqEq(list(output()), [x])
+        : seqEq(list(output()), [x, ...list(tail)]))
+      return { value: x, next: tail }
+    }
+    export function buggyCons(x: number, tail: Node | null): Node {
+      ensures(tail === null
+        ? seqEq(list(output()), [x])
+        : seqEq(list(output()), [x, ...list(tail)]))
+      return { value: x, next: null }
+    }
+  `
+
+  test('base case: list(single(x)) === [x]', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'single')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved', `${r.text}: ${r.labels.join(', ')}`)
+  })
+
+  test('the defining equation of cons proves for all inputs', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'cons')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'proved')
+  })
+
+  test('dropping the tail is refuted', async () => {
+    const results = await verifyAll(source)
+    const r = results.find(x => x.fn === 'buggyCons')
+    assert.ok(r)
+    assert.strictEqual(r.status, 'disproved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Refinement types on parameters
 // ---------------------------------------------------------------------------
 

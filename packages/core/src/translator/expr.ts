@@ -201,6 +201,19 @@ export function toZ3(
         return ctx.Bool.val(true)
       }
 
+      // Sequence equality: if either side is sequence-valued (array literal,
+      // spread, or a seq-valued spec function), translate both in seq mode
+      if ((expr.op === '===' || expr.op === '!==') && (isSeqIR(expr.left) || isSeqIR(expr.right))) {
+        const l = toSeqZ3(expr.left, vars, ctx)
+        const r = toSeqZ3(expr.right, vars, ctx)
+        if (l === null || r === null) return null
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+          const eq = (l as any).eq(r) as Z3Bool
+          return expr.op === '===' ? eq : ctx.Not(eq)
+        } catch { return null }
+      }
+
       // null/undefined comparisons: x === null, output() === null, etc.
       // Model as a boolean variable __is_null_<name> since Z3 has no null value.
       if (expr.op === '===' || expr.op === '!==') {
@@ -421,6 +434,22 @@ function translateCall(
   ctx: Z3Context,
 ): Z3Expr | null {
   const args = argExprs.map(a => toZ3(a, vars, ctx))
+
+  // seqEq(a, b): structural sequence equality — both sides in seq mode
+  if (callee === 'seqEq' && argExprs.length === 2) {
+    const l = toSeqZ3(argExprs[0]!, vars, ctx)
+    const r = toSeqZ3(argExprs[1]!, vars, ctx)
+    if (l === null || r === null) return null
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+      return (l as any).eq(r)
+    } catch { return null }
+  }
+
+  // Sequence-valued spec functions in NON-seq context (rare) — translate as UF
+  if (callee.startsWith('__ufs_')) {
+    return toSeqZ3({ kind: 'call', callee, args: argExprs }, vars, ctx)
+  }
 
   // Fuel-exhausted spec-function calls → Z3 uninterpreted functions.
   // Congruence closure makes equal arguments yield equal results, which
@@ -910,4 +939,108 @@ function oldVarName(expr: Expr): string | null {
     return `__old_${flat}`
   }
   return null
+}
+
+// ---------------------------------------------------------------------------
+// Sequence mode (F3) — spec-level sequences over Z3 Seq theory
+// ---------------------------------------------------------------------------
+
+/** True when the IR expression is sequence-valued in spec context. */
+export function isSeqIR(expr: Expr): boolean {
+  switch (expr.kind) {
+    case 'array': return true
+    case 'spread': return true
+    case 'call': return expr.callee.startsWith('__ufs_')
+    case 'ternary': return isSeqIR(expr.then) || isSeqIR(expr.else)
+    default: return false
+  }
+}
+
+/**
+ * Translates an expression as a Z3 SEQUENCE (of Real):
+ *   []                → seq.empty
+ *   [a, b]            → unit(a) ++ unit(b)
+ *   [x, ...rest]      → unit(x) ++ seq(rest)
+ *   __ufs_f(args)     → uninterpreted seq-valued application
+ *   cond ? s1 : s2    → If over sequences
+ */
+export function toSeqZ3(expr: Expr, vars: Map<string, Z3Expr>, ctx: Z3Context): Z3Expr | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const anyCtx = ctx as any
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+  const seqSort = anyCtx.Seq.sort(ctx.Real.sort())
+
+  switch (expr.kind) {
+    case 'array': {
+      if (expr.elements.length === 0) {
+        // NOTE: ctx.Empty is the REGEX empty — Seq.empty(elemSort) is the one
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+        return anyCtx.Seq.empty(ctx.Real.sort())
+      }
+      let acc: Z3Expr | null = null
+      for (const el of expr.elements) {
+        let piece: Z3Expr | null
+        if (el.kind === 'spread') {
+          piece = toSeqZ3(el.operand, vars, ctx)
+        } else {
+          const v = toZ3(el, vars, ctx)
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+          piece = v === null ? null : anyCtx.Seq.unit(v)
+        }
+        if (piece === null) return null
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+        acc = acc === null ? piece : (acc as any).concat(piece)
+      }
+      return acc
+    }
+
+    case 'spread':
+      return toSeqZ3(expr.operand, vars, ctx)
+
+    case 'call': {
+      if (expr.callee.startsWith('__ufs_')) {
+        const args = expr.args.map(a => toZ3(a, vars, ctx))
+        if (args.some(a => a === null)) return null
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+          const cache: Map<string, unknown> = anyCtx.__ufCache ?? (anyCtx.__ufCache = new Map())
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+          const argSorts = args.map(a => (a as any).sort)
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+          const key = `${expr.callee}(${argSorts.map((s: unknown) => String(s)).join(',')})`
+          let decl = cache.get(key)
+          if (decl === undefined) {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+            decl = ctx.Function.declare(key.replace(/[^\w]/g, '_'), ...argSorts, seqSort)
+            cache.set(key, decl)
+          }
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+          return (decl as any).call(...args)
+        } catch { return null }
+      }
+      return null
+    }
+
+    case 'ternary': {
+      const cond = toZ3(expr.condition, vars, ctx)
+      const t = toSeqZ3(expr.then, vars, ctx)
+      const e = toSeqZ3(expr.else, vars, ctx)
+      if (cond === null || t === null || e === null) return null
+      try {
+        return ctx.If(cond as Z3Bool, t, e)
+      } catch { return null }
+    }
+
+    case 'ident': {
+      const existing = vars.get(expr.name)
+      if (existing !== undefined) return existing
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+      const fresh = anyCtx.Const(expr.name, seqSort)
+      vars.set(expr.name, fresh as Z3Expr)
+      return fresh as Z3Expr
+    }
+
+    default:
+      return null
+  }
 }

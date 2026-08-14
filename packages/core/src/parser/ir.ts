@@ -140,7 +140,7 @@ export interface FunctionIR {
    * Spec-function definitions visible to this function's contracts —
    * pure (possibly recursive) same-file functions, unfolded with fuel.
    */
-  specDefs?: Map<string, { params: string[]; body: Expr; isBool: boolean }> | undefined
+  specDefs?: Map<string, { params: string[]; body: Expr; isBool: boolean; isSeq: boolean }> | undefined
 }
 
 /** One step of a heap-mode body. */

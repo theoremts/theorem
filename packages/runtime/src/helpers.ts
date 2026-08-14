@@ -57,3 +57,14 @@ export function integer(x: number): boolean {
 export function conserved(..._values: number[]): boolean {
   return true
 }
+
+/**
+ * Structural equality of sequences in specifications.
+ * At runtime performs an element-wise comparison; the engine translates it
+ * to Z3 sequence equality (`[x, ...list(tail)]` becomes seq.concat).
+ *
+ *   ensures(seqEq(list(output()), [x, ...list(tail)]))
+ */
+export function seqEq<T>(a: readonly T[], b: readonly T[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i])
+}

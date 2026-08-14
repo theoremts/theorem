@@ -1031,17 +1031,26 @@ function collectRefComparisonRoots(expr: Expr, roots: Set<string>): void {
 function collectSpecDefs(
   source: string,
   fileName: string,
-): Map<string, { params: string[]; body: Expr; isBool: boolean }> {
-  const defs = new Map<string, { params: string[]; body: Expr; isBool: boolean }>()
+): Map<string, { params: string[]; body: Expr; isBool: boolean; isSeq: boolean }> {
+  const defs = new Map<string, { params: string[]; body: Expr; isBool: boolean; isSeq: boolean }>()
   for (const fn of extractFunctionsFromSource(source, fileName)) {
     if (!fn.name || fn.body === undefined) continue
     defs.set(fn.name, {
       params: fn.params.map(p => p.name),
       body: fn.body,
       isBool: isBooleanBody(fn.body),
+      isSeq: isSeqBody(fn.body),
     })
   }
   return defs
+}
+
+function isSeqBody(expr: Expr): boolean {
+  switch (expr.kind) {
+    case 'array': return true
+    case 'ternary': return isSeqBody(expr.then) || isSeqBody(expr.else)
+    default: return false
+  }
 }
 
 function isBooleanBody(expr: Expr): boolean {
