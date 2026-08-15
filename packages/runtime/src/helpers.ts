@@ -82,3 +82,37 @@ export function seqEq<T>(a: readonly T[], b: readonly T[]): boolean {
 export function footprint(_spec: unknown, _membership: unknown): void {
   // no-op — read statically by the engine
 }
+
+/**
+ * Pairwise distinctness of a projected field: `uniqueBy(users, u => u.balance)`
+ * holds when no two elements share the projected value. No-op at runtime.
+ */
+export function uniqueBy<T>(_arr: readonly T[], _by: (x: T) => unknown): boolean {
+  return true
+}
+
+/**
+ * Order by a projected field: `sortedBy(users, u => u.balance)` holds when
+ * the projection is non-decreasing across adjacent elements. No-op at runtime.
+ */
+export function sortedBy<T>(_arr: readonly T[], _by: (x: T) => number): boolean {
+  return true
+}
+
+/**
+ * Sum of a projected numeric field: `sumBy(users, u => u.balance)`.
+ * In contracts, writes through DISTINCT elements (requires(unique(arr)))
+ * update the sum by exactly their delta — conservation becomes provable.
+ * No-op at runtime.
+ */
+export function sumBy<T>(_arr: readonly T[], _by: (x: T) => number): number {
+  return 0
+}
+
+/**
+ * Count of elements satisfying a predicate: `countBy(users, u => u.balance > 0)`.
+ * Always between 0 and arr.length. No-op at runtime.
+ */
+export function countBy<T>(_arr: readonly T[], _by: (x: T) => boolean): number {
+  return 0
+}

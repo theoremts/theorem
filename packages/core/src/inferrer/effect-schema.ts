@@ -1,5 +1,6 @@
 import { SyntaxKind, Node, type Block, type SourceFile, type Expression } from 'ts-morph'
 import type { InferredContract } from './index.js'
+import { forallOverArray, extractUniquenessRefine } from './zod.js'
 import type { Expr } from '../parser/ir.js'
 import {
   resolveSchemaVariable,
@@ -126,6 +127,7 @@ export function extractEffectConstraintsFromSchemaText(
   varName: string,
 ): InferredContract[] {
   const constraints: EffectFieldConstraint[] = []
+  const quantified: InferredContract[] = []
 
   const structMatch = /(?:\w+\.)?Struct\s*\(\s*\{/.exec(schemaText)
   if (structMatch) {
@@ -134,14 +136,21 @@ export function extractEffectConstraintsFromSchemaText(
     if (bodyEnd !== -1) {
       for (const { name, chain } of splitStructFields(schemaText.slice(bodyStart, bodyEnd))) {
         extractEffectChainConstraints(name, chain, constraints)
+        // Schema.Array(<element>): element constraints become forall facts
+        const target: Expr = { kind: 'member', object: { kind: 'ident', name: varName }, property: name }
+        quantified.push(...extractEffectArrayElementFacts(target, `${varName}.${name}`, chain))
+        quantified.push(...extractUniquenessRefine(target, `${varName}.${name}`, chain, 'filter'))
       }
     }
   } else {
     // Top-level (non-struct) schema: the variable itself is constrained
     extractEffectChainConstraints('', schemaText, constraints)
+    const target: Expr = { kind: 'ident', name: varName }
+    quantified.push(...extractEffectArrayElementFacts(target, varName, schemaText))
+    quantified.push(...extractUniquenessRefine(target, varName, schemaText, 'filter'))
   }
 
-  return constraints.map(c => {
+  return [...quantified, ...constraints.map(c => {
     if (c.isInt) {
       const fieldExpr = buildFieldExpr(varName, c.field, false)
       return {
@@ -165,7 +174,68 @@ export function extractEffectConstraintsFromSchemaText(
       confidence: 'guard' as const,
       source: `from Effect Schema: ${c.source}`,
     }
-  })
+  })]
+}
+
+/**
+ * Schema.Array(<inner>) element constraints → forall facts, mirroring the
+ * Zod translation. Numeric elements use the pipe-chain extractors; Struct
+ * elements contribute per-field facts.
+ */
+function extractEffectArrayElementFacts(target: Expr, targetText: string, chain: string): InferredContract[] {
+  const out: InferredContract[] = []
+  const arrMatch = /(?:\w+\.)?Array\s*\(/.exec(chain)
+  if (arrMatch === null) return out
+  const openAt = arrMatch.index + arrMatch[0].length
+  const closeAt = findBalancedParenEffect(chain, openAt)
+  if (closeAt === -1) return out
+  const inner = chain.slice(openAt, closeAt).trim()
+
+  const factsOf = (innerChain: string): EffectFieldConstraint[] => {
+    const cs: EffectFieldConstraint[] = []
+    extractEffectChainConstraints('', innerChain, cs)
+    return cs.filter(c => !c.isInt && !c.isLength)
+  }
+
+  // Numeric elements: Schema.Number.pipe(...)
+  if (/^(?:\w+\.)?Number\b/.test(inner)) {
+    for (const f of factsOf(inner)) {
+      const pred = forallOverArray(target, `forall(${targetText}, (v) => v ${f.op} ${f.value})`, elemAt =>
+        ({ kind: 'binary', op: f.op, left: elemAt, right: { kind: 'literal', value: f.value } }))
+      if (pred !== null) {
+        out.push({ kind: 'requires', text: `every element of ${targetText} ${f.op} ${f.value}`, predicate: pred, confidence: 'guard', source: `from Effect Schema: Array(${f.source})` })
+      }
+    }
+    return out
+  }
+
+  // Struct elements: Schema.Array(Schema.Struct({ f: ... }))
+  const structM = /(?:\w+\.)?Struct\s*\(\s*\{/.exec(inner)
+  if (structM !== null) {
+    const bodyStart = structM.index + structM[0].length
+    const bodyEnd = findBalancedBrace(inner, bodyStart)
+    if (bodyEnd !== -1) {
+      for (const { name: prop, chain: fieldChain } of splitStructFields(inner.slice(bodyStart, bodyEnd))) {
+        for (const f of factsOf(fieldChain)) {
+          const pred = forallOverArray(target, `forall(${targetText}, (u) => u.${prop} ${f.op} ${f.value})`, elemAt =>
+            ({ kind: 'binary', op: f.op, left: { kind: 'member', object: elemAt, property: prop }, right: { kind: 'literal', value: f.value } }))
+          if (pred !== null) {
+            out.push({ kind: 'requires', text: `every ${targetText}[i].${prop} ${f.op} ${f.value}`, predicate: pred, confidence: 'guard', source: `from Effect Schema: Array(Struct(${prop}))` })
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+function findBalancedParenEffect(text: string, openIdx: number): number {
+  let depth = 1
+  for (let i = openIdx; i < text.length; i++) {
+    if (text[i] === '(') depth++
+    else if (text[i] === ')') { depth--; if (depth === 0) return i }
+  }
+  return -1
 }
 
 /** Splits a Struct object-literal body into top-level `name: chain` fields. */

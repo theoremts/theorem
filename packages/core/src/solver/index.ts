@@ -201,7 +201,7 @@ function extractModelFrom(
   const ce: Record<string, unknown> = {}
   for (const [name, expr] of variables) {
     // Internal machinery — noise in a counterexample
-    if (name.startsWith('__field_') || name === '__fn__' || name.startsWith('__chc_') || name.startsWith('__qs') || name.startsWith('__qi')) continue
+    if (name.startsWith('__field_') || name === '__fn__' || name.startsWith('__chc_') || name.startsWith('__qs') || name.startsWith('__qi') || name === '__cell') continue
     const displayName = name.startsWith('__old_') ? `old(${name.slice(6)})` : name
     try {
       ce[displayName] = parseZ3Value(model.eval(expr, true).toString())

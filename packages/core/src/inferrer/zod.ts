@@ -195,6 +195,7 @@ export function findBalancedParen(text: string, start: number): number {
 
 export function extractConstraintsFromSchemaText(schemaText: string, varName: string): InferredContract[] {
   const constraints: FieldConstraint[] = []
+  const quantified: InferredContract[] = []
 
   // Match z.object({ field: z.number().<method>(), ... }) patterns
   // We extract field names and their constraint chains.
@@ -216,6 +217,27 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
     const chainText = chainMatch?.[1] ?? ''
 
     extractChainConstraints(fieldName, baseType, chainText, constraints)
+
+    // Array ELEMENT constraints + uniqueness refine on the field
+    if (baseType === 'array') {
+      const target: Expr = { kind: 'member', object: { kind: 'ident', name: varName }, property: fieldName }
+      const innerText = schemaText.slice(afterOpen, closeIdx)
+      quantified.push(...extractArrayElementFacts(target, `${varName}.${fieldName}`, innerText))
+      quantified.push(...extractUniquenessRefine(target, `${varName}.${fieldName}`, rest))
+    }
+  }
+
+  // Top-level array schema: z.array(...).refine(...)
+  const topArray = /^z\.array\s*\(/.exec(schemaText.trim())
+  if (topArray) {
+    const trimmed = schemaText.trim()
+    const openAt = trimmed.indexOf('(') + 1
+    const closeAt = findBalancedParen(trimmed, openAt)
+    if (closeAt !== -1) {
+      const target: Expr = { kind: 'ident', name: varName }
+      quantified.push(...extractArrayElementFacts(target, varName, trimmed.slice(openAt, closeAt)))
+      quantified.push(...extractUniquenessRefine(target, varName, trimmed.slice(closeAt + 1)))
+    }
   }
 
   // Discriminated unions: z.discriminatedUnion('kind', [z.object({...}), ...])
@@ -286,7 +308,7 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
   }
 
   // Convert field constraints to InferredContracts
-  return constraintsToContracts(constraints, varName)
+  return [...constraintsToContracts(constraints, varName), ...quantified]
 }
 
 function constraintsToContracts(constraints: FieldConstraint[], varName: string): InferredContract[] {
@@ -644,4 +666,110 @@ function splitBalancedItems(s: string): string[] {
     }
   }
   return items.filter(t => t.length > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Array-element facts and uniqueness refines → quantified predicates
+// ---------------------------------------------------------------------------
+
+let _qzCounter = 0
+const qz = (): string => `__qz${_qzCounter++}`
+
+export function forallOverArray(target: Expr, display: string, mkBody: (elemAt: Expr) => Expr | null): Expr | null {
+  const qi = qz()
+  const elemAt: Expr = { kind: 'element-access', object: target, index: { kind: 'ident', name: qi } }
+  const body = mkBody(elemAt)
+  if (body === null) return null
+  const inRange: Expr = {
+    kind: 'binary', op: '&&',
+    left: { kind: 'binary', op: '>=', left: { kind: 'ident', name: qi }, right: { kind: 'literal', value: 0 } },
+    right: { kind: 'binary', op: '<', left: { kind: 'ident', name: qi }, right: { kind: 'member', object: target, property: 'length' } },
+  }
+  return {
+    kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int', display,
+    body: { kind: 'binary', op: '==>', left: inRange, right: body },
+  }
+}
+
+/** z.array(<inner>): element-level constraints become forall facts. */
+function extractArrayElementFacts(target: Expr, targetText: string, innerText: string): InferredContract[] {
+  const out: InferredContract[] = []
+  const inner = innerText.trim()
+
+  const numericFacts = (chain: string, proj: (elemAt: Expr) => Expr): Array<{ op: '>' | '>=' | '<' | '<=', value: number, text: string }> => {
+    const cs: FieldConstraint[] = []
+    extractChainConstraints('__elem', 'number', chain, cs)
+    return cs
+      .filter(c => !c.isInt && c.regex === undefined)
+      .map(c => ({ op: c.op, value: c.value, text: c.source }))
+  }
+
+  // z.array(z.number()<chain>)
+  const numMatch = /^z\.number\s*\(\s*\)((?:\.\w+\([^)]*\))*)$/.exec(inner)
+  if (numMatch) {
+    for (const f of numericFacts(numMatch[1] ?? '', e => e)) {
+      const pred = forallOverArray(target, `forall(${targetText}, (v) => v ${f.op} ${f.value})`, elemAt =>
+        ({ kind: 'binary', op: f.op, left: elemAt, right: { kind: 'literal', value: f.value } }))
+      if (pred !== null) {
+        out.push({ kind: 'requires', text: `every element of ${targetText} ${f.op} ${f.value}`, predicate: pred, confidence: 'guard', source: `from Zod schema: z.array(${f.text})` })
+      }
+    }
+    return out
+  }
+
+  // z.array(z.object({ field: z.number()<chain>, ... }))
+  if (/^z\.object\s*\(/.test(inner)) {
+    const fieldPattern = /(\w+)\s*:\s*z\.number\s*\(\s*\)((?:\.\w+\([^)]*\))*)/g
+    let m: RegExpExecArray | null
+    while ((m = fieldPattern.exec(inner)) !== null) {
+      const prop = m[1]!
+      for (const f of numericFacts(m[2] ?? '', e => e)) {
+        const pred = forallOverArray(target, `forall(${targetText}, (u) => u.${prop} ${f.op} ${f.value})`, elemAt =>
+          ({ kind: 'binary', op: f.op, left: { kind: 'member', object: elemAt, property: prop }, right: { kind: 'literal', value: f.value } }))
+        if (pred !== null) {
+          out.push({ kind: 'requires', text: `every ${targetText}[i].${prop} ${f.op} ${f.value}`, predicate: pred, confidence: 'guard', source: `from Zod schema: z.array(z.object({ ${prop}: ... }))` })
+        }
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * The canonical uniqueness refine:
+ *   .refine(a => new Set(a).size === a.length)                 → unique(arr)
+ *   .refine(a => new Set(a.map(x => x.id)).size === a.length)  → uniqueBy(arr, x => x.id)
+ * The display is EXACTLY `unique(<target>)` — which also opens the sumBy
+ * delta gate downstream.
+ */
+export function extractUniquenessRefine(target: Expr, targetText: string, rest: string, keyword = 'refine'): InferredContract[] {
+  const m = new RegExp(String.raw`(?:\.pipe\(\s*)?(?:\w+\.)?${keyword}\(\s*\(?(\w+)\)?\s*=>\s*new Set\(\s*\1\s*(?:\.map\(\s*\(?(\w+)\)?\s*=>\s*\2\.(\w+)\s*\)\s*)?\)\.size\s*===?\s*\1\.length\s*\)`).exec(rest)
+  if (m === null) return []
+  const prop = m[3]
+  const qi = qz()
+  const qj = qz()
+  const at = (name: string): Expr => {
+    const elem: Expr = { kind: 'element-access', object: target, index: { kind: 'ident', name } }
+    return prop !== undefined ? { kind: 'member', object: elem, property: prop } : elem
+  }
+  const len: Expr = { kind: 'member', object: target, property: 'length' }
+  const ge0 = (name: string): Expr => ({ kind: 'binary', op: '>=', left: { kind: 'ident', name }, right: { kind: 'literal', value: 0 } })
+  const ltLen = (name: string): Expr => ({ kind: 'binary', op: '<', left: { kind: 'ident', name }, right: len })
+  const display = prop !== undefined ? `uniqueBy(${targetText}, (x) => x.${prop})` : `unique(${targetText})`
+  const pred: Expr = {
+    kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int', display,
+    body: {
+      kind: 'quantifier', quantifier: 'forall', param: qj, sort: 'int',
+      body: {
+        kind: 'binary', op: '==>',
+        left: {
+          kind: 'binary', op: '&&',
+          left: { kind: 'binary', op: '&&', left: { kind: 'binary', op: '&&', left: ge0(qi), right: ltLen(qi) }, right: { kind: 'binary', op: '&&', left: ge0(qj), right: ltLen(qj) } },
+          right: { kind: 'binary', op: '!==', left: { kind: 'ident', name: qi }, right: { kind: 'ident', name: qj } },
+        },
+        right: { kind: 'binary', op: '!==', left: at(qi), right: at(qj) },
+      },
+    },
+  }
+  return [{ kind: 'requires', text: display, predicate: pred, confidence: 'guard', source: `from schema: Set-size uniqueness ${keyword}` }]
 }

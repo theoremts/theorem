@@ -486,3 +486,243 @@ describe('loop contracts: header position', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Houdini: requires/ensures conjuncts as guess-and-check loop invariants
+// ---------------------------------------------------------------------------
+
+import { translateWithAutoInvariants } from './verifier/houdini.js'
+
+describe('houdini: automatic loop invariants', () => {
+  const loopSource = (op: string, extra = '') => `
+    interface Account { balance: number }
+    export function touchAll(users: Account[], amount: number, n: number): void {
+      requires(positive(amount))
+      requires(nonNegative(n))
+      requires(forall(users, (u) => u.balance >= 0))
+      ensures(forall(users, (u) => u.balance >= 0))
+      let k = 0
+      while (k < n) {
+        ${extra}
+        decreases(() => n - k)
+        users[k]!.balance = users[k]!.balance ${op} amount
+        k = k + 1
+      }
+    }
+  `
+
+  async function verifyAuto(source: string) {
+    const ctx = await getContext()
+    const results: Array<{ text: string; status: string }> = []
+    for (const ir of extractFromSource(source)) {
+      for (const task of await translateWithAutoInvariants(ir, ctx)) {
+        results.push({ text: task.contractText, status: (await check(task)).status })
+      }
+    }
+    return results
+  }
+
+  test('an uninvarianted crediting loop proves via an (auto) invariant', async () => {
+    const results = await verifyAuto(loopSource('+'))
+    const auto = results.filter(r => r.text.includes('(auto)'))
+    assert.ok(auto.length >= 2, `Expected auto entry+preserved, got: ${results.map(r => r.text).join('; ')}`)
+    for (const r of results) {
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
+    }
+  })
+
+  test('a debiting loop drops the candidate and refutes honestly', async () => {
+    const results = await verifyAuto(loopSource('-'))
+    assert.strictEqual(results.filter(r => r.text.includes('(auto)')).length, 0,
+      'A failed candidate must NOT be assumed')
+    const ens = results.find(r => r.text.includes('forall') && !r.text.includes('loop'))
+    assert.strictEqual(ens?.status, 'disproved')
+  })
+
+  test('explicit invariants compose — never displaced', async () => {
+    const results = await verifyAuto(loopSource('+', 'invariant(() => k >= 0)'))
+    assert.ok(results.some(r => r.text.includes('k >= 0') && !r.text.includes('(auto)')),
+      'Explicit invariant keeps its own identity')
+    assert.ok(results.some(r => r.text.includes('(auto)')), 'Auto candidate still added')
+    for (const r of results) {
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
+    }
+  })
+})
+
+describe('uniqueBy: pairwise-distinct projected fields', () => {
+  const src = (withReq: boolean) => `
+    interface Account { balance: number }
+    export function firstTwoDiffer(users: Account[]): boolean {
+      requires(users.length >= 2)
+      ${withReq ? 'requires(uniqueBy(users, (u) => u.balance))' : ''}
+      ensures(output() === true)
+      return users[0]!.balance !== users[1]!.balance
+    }
+  `
+  test('the fact flows: distinct balances prove element inequality', async () => {
+    const results = await verifyAll(src(true))
+    assert.strictEqual(results.find(r => r.text.includes('=== true'))?.status, 'proved')
+  })
+  test('without it: counterexample with the tied balances', async () => {
+    const results = await verifyAll(src(false))
+    assert.strictEqual(results.find(r => r.text.includes('=== true'))?.status, 'disproved')
+  })
+  test('as an ENSURES it is an obligation — refuted when the code ties values', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function tieThem(users: Account[]): void {
+        requires(users.length >= 2)
+        ensures(uniqueBy(users, (u) => u.balance))
+        users[0]!.balance = 7
+        users[1]!.balance = 7
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('uniqueBy'))?.status, 'disproved')
+  })
+})
+
+describe('collection vocabulary: sortedBy, unique-on-refs, exists membership', () => {
+  test('sortedBy makes users[0] the field minimum of adjacent pairs', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function poorestFirst(users: Account[]): number {
+        requires(users.length >= 2)
+        requires(sortedBy(users, (u) => u.balance))
+        ensures(output() <= users[1]!.balance)
+        return users[0]!.balance
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('users[1]'))?.status, 'proved')
+  })
+
+  test('unique(users) on a ref-array IS pairwise slot distinctness (anti-aliasing)', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function payBonus(users: Account[], bonus: number): void {
+        requires(users.length >= 2)
+        requires(unique(users))
+        requires(positive(bonus))
+        ensures(users[0]!.balance === old(users[0]!.balance) + bonus)
+        users[0]!.balance = users[0]!.balance + bonus
+        users[1]!.balance = users[1]!.balance + bonus
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('users[0]'))?.status, 'proved',
+      'unique(users) must rule out the aliased-slots counterexample')
+  })
+
+  test('membership via exists over the array form', async () => {
+    const results = await verifyAll(`
+      interface Account { id: number }
+      export function found(users: Account[], wanted: number): boolean {
+        requires(exists(users, (u) => u.id === wanted))
+        ensures(output() === true)
+        return true
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('=== true'))?.status, 'proved')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Folds: sumBy / countBy as heap-versioned symbols with delta axioms
+// ---------------------------------------------------------------------------
+
+describe('folds: sumBy conservation and countBy deltas', () => {
+  const transfer = (extraCredit: string) => `
+    interface Account { balance: number }
+    export function transfer(users: Account[], i: number, j: number, amt: number): void {
+      requires(unique(users))
+      requires(Number.isInteger(i))
+      requires(Number.isInteger(j))
+      requires(i >= 0)
+      requires(i < users.length)
+      requires(j >= 0)
+      requires(j < users.length)
+      requires(positive(amt))
+      ensures(sumBy(users, (u) => u.balance) === old(sumBy(users, (u) => u.balance)))
+      users[i]!.balance = users[i]!.balance - amt
+      users[j]!.balance = users[j]!.balance + amt${extraCredit}
+    }
+  `
+
+  test('transfer conserves the total — even when i === j', async () => {
+    const results = await verifyAll(transfer(''))
+    assert.strictEqual(results.find(r => r.text.includes('sumBy'))?.status, 'proved')
+  })
+
+  test('a phantom fee is refuted: money out of thin air', async () => {
+    const results = await verifyAll(transfer(' + 1'))
+    assert.strictEqual(results.find(r => r.text.includes('sumBy'))?.status, 'disproved')
+  })
+
+  test('without requires(unique) conservation is unprovable — duplicates double deltas', async () => {
+    const source = transfer('').replace('requires(unique(users))', '')
+    const results = await verifyAll(source)
+    assert.strictEqual(results.find(r => r.text.includes('sumBy'))?.status, 'disproved',
+      'delta axioms must be gated on uniqueness')
+  })
+
+  test('countBy: zeroing a positive account drops the count by exactly one', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function zeroOut(users: Account[], k: number): void {
+        requires(unique(users))
+        requires(Number.isInteger(k))
+        requires(k >= 0)
+        requires(k < users.length)
+        requires(users[k]!.balance > 0)
+        ensures(countBy(users, (u) => u.balance > 0) === old(countBy(users, (u) => u.balance > 0)) - 1)
+        users[k]!.balance = 0
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('countBy'))?.status, 'proved')
+  })
+})
+
+describe('effect schema arrays + loop folds', () => {
+  test('Effect Array element constraints become forall facts', async () => {
+    const results = await verifyAll(`
+      const OrderSchema = Schema.Struct({
+        scores: Schema.Array(Schema.Number.pipe(Schema.greaterThanOrEqualTo(1))),
+      })
+      export function firstScore(input: unknown, k: number): number {
+        const order = Schema.decodeUnknownSync(OrderSchema)(input)
+        requires(Number.isInteger(k))
+        requires(k >= 0)
+        requires(k < order.scores.length)
+        ensures(output() >= 1)
+        return order.scores[k]!
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('>= 1'))?.status, 'proved')
+  })
+
+  test('sum invariants chain through loop bodies', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function creditLoop(users: Account[], n: number): void {
+        requires(unique(users))
+        requires(Number.isInteger(n))
+        requires(nonNegative(n))
+        requires(n <= users.length)
+        ensures(sumBy(users, (u) => u.balance) === old(sumBy(users, (u) => u.balance)) + n)
+        let k = 0
+        invariant(() => Number.isInteger(k))
+        invariant(() => k >= 0)
+        invariant(() => k <= n)
+        invariant(() => sumBy(users, (u) => u.balance) === old(sumBy(users, (u) => u.balance)) + k)
+        decreases(() => n - k)
+        while (k < n) {
+          users[k]!.balance = users[k]!.balance + 1
+          k = k + 1
+        }
+      }
+    `)
+    assert.ok(results.length >= 10)
+    for (const r of results) {
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
+    }
+  })
+})

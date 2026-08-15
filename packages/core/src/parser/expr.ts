@@ -317,6 +317,123 @@ function parseExprInner(node: Expression): Expr | null {
       }
     }
 
+    // sumBy(arr, (x) => x.field) / countBy(arr, (x) => P(x)) — fold symbols.
+    // sumBy keeps the simple-projection restriction (a named field); countBy
+    // stores the predicate with the element replaced by the __cell marker.
+    if ((callee === 'sumBy' || callee === 'countBy') && node.getArguments().length === 2) {
+      const argsF = node.getArguments()
+      const arrExpr = parseExpr(argsF[0] as Expression)
+      const arrow = argsF[1]
+      if (arrExpr !== null && Node.isArrowFunction(arrow)) {
+        const arrowBody = arrow.getBody()
+        const params = arrow.getParameters()
+        if (Node.isExpression(arrowBody) && params.length >= 1) {
+          const display = node.getText().replace(/\s+/g, ' ')
+          if (callee === 'sumBy') {
+            const proj = parseExpr(arrowBody)
+            if (proj !== null && proj.kind === 'member' && proj.object.kind === 'ident'
+                && proj.object.name === params[0]!.getName()) {
+              return {
+                kind: 'call', callee: '__sumBy',
+                args: [arrExpr, { kind: 'literal', value: proj.property }, { kind: 'literal', value: display }],
+              }
+            }
+          } else {
+            const rawPred = parseExpr(arrowBody)
+            if (rawPred !== null) {
+              const pred = substituteIdents(rawPred, new Map([[params[0]!.getName(), { kind: 'ident', name: '__cell' } as Expr]]))
+              return {
+                kind: 'call', callee: '__countBy',
+                args: [arrExpr, pred, { kind: 'literal', value: display }],
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // sortedBy(arr, (x) => x.field) — ∀ i: 0 ≤ i ∧ i+1 < len ⟹ proj(arr[i]) <= proj(arr[i+1])
+    // (adjacent pairs: the form that composes well with the solver)
+    if (callee === 'sortedBy' && node.getArguments().length === 2) {
+      const argsSB = node.getArguments()
+      const arrExpr = parseExpr(argsSB[0] as Expression)
+      const arrow = argsSB[1]
+      if (arrExpr !== null && Node.isArrowFunction(arrow)) {
+        const arrowBody = arrow.getBody()
+        const params = arrow.getParameters()
+        if (Node.isExpression(arrowBody) && params.length >= 1) {
+          const rawProj = parseExpr(arrowBody)
+          if (rawProj !== null) {
+            const qi = nextQuantifierIndexName()
+            const projAt = (idx: Expr): Expr => substituteIdents(rawProj, new Map([[
+              params[0]!.getName(),
+              { kind: 'element-access', object: arrExpr, index: idx } as Expr,
+            ]]))
+            const len: Expr = { kind: 'member', object: arrExpr, property: 'length' }
+            const iVar: Expr = { kind: 'ident', name: qi }
+            const iNext: Expr = { kind: 'binary', op: '+', left: iVar, right: { kind: 'literal', value: 1 } }
+            return {
+              kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int',
+              display: node.getText().replace(/\s+/g, ' '),
+              body: {
+                kind: 'binary', op: '==>',
+                left: {
+                  kind: 'binary', op: '&&',
+                  left: { kind: 'binary', op: '>=', left: iVar, right: { kind: 'literal', value: 0 } },
+                  right: { kind: 'binary', op: '<', left: iNext, right: len },
+                },
+                right: { kind: 'binary', op: '<=', left: projAt(iVar), right: projAt(iNext) },
+              },
+            }
+          }
+        }
+      }
+    }
+
+    // uniqueBy(arr, (x) => x.field) — ∀ i j: in-range ∧ i ≠ j ⟹ proj(arr[i]) !== proj(arr[j])
+    if (callee === 'uniqueBy' && node.getArguments().length === 2) {
+      const args2 = node.getArguments()
+      const arrExpr = parseExpr(args2[0] as Expression)
+      const arrow = args2[1]
+      if (arrExpr !== null && Node.isArrowFunction(arrow)) {
+        const arrowBody = arrow.getBody()
+        const params = arrow.getParameters()
+        if (Node.isExpression(arrowBody) && params.length >= 1) {
+          const rawProj = parseExpr(arrowBody)
+          if (rawProj !== null) {
+            const qi = nextQuantifierIndexName()
+            const qj = nextQuantifierIndexName()
+            const projAt = (name: string): Expr => substituteIdents(rawProj, new Map([[
+              params[0]!.getName(),
+              { kind: 'element-access', object: arrExpr, index: { kind: 'ident', name } } as Expr,
+            ]]))
+            const len: Expr = { kind: 'member', object: arrExpr, property: 'length' }
+            const inRange = (name: string): Expr => ({
+              kind: 'binary', op: '&&',
+              left: { kind: 'binary', op: '>=', left: { kind: 'ident', name }, right: { kind: 'literal', value: 0 } },
+              right: { kind: 'binary', op: '<', left: { kind: 'ident', name }, right: len },
+            })
+            return {
+              kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int',
+              display: node.getText().replace(/\s+/g, ' '),
+              body: {
+                kind: 'quantifier', quantifier: 'forall', param: qj, sort: 'int',
+                body: {
+                  kind: 'binary', op: '==>',
+                  left: {
+                    kind: 'binary', op: '&&',
+                    left: { kind: 'binary', op: '&&', left: inRange(qi), right: inRange(qj) },
+                    right: { kind: 'binary', op: '!==', left: { kind: 'ident', name: qi }, right: { kind: 'ident', name: qj } },
+                  },
+                  right: { kind: 'binary', op: '!==', left: projAt(qi), right: projAt(qj) },
+                },
+              },
+            }
+          }
+        }
+      }
+    }
+
     // sorted(arr) — ∀ i j: 0 ≤ i ≤ j < len ⟹ arr[i] <= arr[j]
     // unique(arr) — ∀ i j: in-range ∧ i ≠ j ⟹ arr[i] !== arr[j]
     if ((callee === 'sorted' || callee === 'unique') && node.getArguments().length === 1) {

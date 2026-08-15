@@ -86,15 +86,25 @@ export function printFileReport(report: FileReport): void {
           console.log(`       ${c.dim}violation confirmed (literal values)${c.reset}`)
         }
 
-        // Show intermediate value trace with source locations if available
+        // Show the execution path (branch decisions) and intermediate values.
+        // Ternary/if conditions are traced as "(cond)" entries with boolean
+        // values — rendered as the path the counterexample takes.
         if (result.trace) {
           const traceEntries = Object.entries(result.trace).filter(([, v]) => v !== '?')
-          if (traceEntries.length > 0) {
-            for (const [name, value] of traceEntries) {
-              const loc = result.traceLocs?.[name]
-              const locStr = loc ? ` ${c.dim}(line ${loc.line})${c.reset}` : ''
-              console.log(`       ${c.dim}  where ${name} = ${value}${locStr}${c.reset}`)
-            }
+          const isPath = ([name, value]: [string, unknown]): boolean =>
+            name.startsWith('(') && name.endsWith(')') && typeof value === 'boolean'
+          const paths = traceEntries.filter(isPath)
+          const values = traceEntries.filter(e => !isPath(e))
+          for (const [name, value] of paths) {
+            const loc = result.traceLocs?.[name]
+            const locStr = loc ? `line ${loc.line}: ` : ''
+            const cond = name.slice(1, -1)
+            console.log(`       ${c.dim}  path: ${locStr}${cond} → ${value === true ? 'taken' : 'not taken'}${c.reset}`)
+          }
+          for (const [name, value] of values) {
+            const loc = result.traceLocs?.[name]
+            const locStr = loc ? ` ${c.dim}(line ${loc.line})${c.reset}` : ''
+            console.log(`       ${c.dim}  where ${name} = ${value}${locStr}${c.reset}`)
           }
         }
 

@@ -11,6 +11,7 @@ import {
   verifyToSarif,
   buildRegistry,
   extractCallSiteObligations,
+  translateWithAutoInvariants,
 } from '@theoremts/core'
 import type { FunctionReport, TaskResult, FunctionIR, VerificationTask, FileReport, ContractRegistry, ResolvedConfig } from '@theoremts/core'
 import { generateRegressionTests, type RegressionEntry } from '../gen-tests.js'
@@ -191,7 +192,9 @@ async function verifyFile(
   const startAll = Date.now()
 
   for (const ir of irs) {
-    const tasks = translate(ir, ctx, registry)
+    // Houdini: uninvarianted loops get requires/ensures conjuncts as
+    // guess-and-check invariant candidates — survivors show as (auto)
+    const tasks = await translateWithAutoInvariants(ir, ctx, registry)
     if (tasks.length === 0) continue
 
     if (opts.debug) debugTranslator(tasks)

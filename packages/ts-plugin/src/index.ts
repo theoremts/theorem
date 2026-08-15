@@ -15,12 +15,22 @@ const CHILD_TIMEOUT_MS = 60_000
 // Types
 // ---------------------------------------------------------------------------
 
+interface TheoremFix {
+  start: number
+  length: number
+  title: string
+  insertPos: number
+  insertText: string
+}
+
 interface CachedDiagnostics {
   sourceHash: string
   diagnostics: tslib.Diagnostic[]
   /** Element accesses whose bounds Theorem PROVED — tsc's possibly-undefined
    *  errors at these spots are suppressed (proof beats assertion). */
   suppressions: Array<{ line: number; exprText: string }>
+  /** One-click fixes: Spacer-inferred invariants inserted at the loop. */
+  fixes: TheoremFix[]
 }
 
 interface ChildFailure {
@@ -34,6 +44,7 @@ interface ChildFailure {
 interface ChildOutput {
   failures: ChildFailure[]
   suppressions?: Array<{ line: number; exprText: string }>
+  fixes?: TheoremFix[]
 }
 
 // ---------------------------------------------------------------------------
@@ -147,17 +158,19 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
 
         let failures: ChildFailure[]
         let suppressions: Array<{ line: number; exprText: string }>
+        let fixes: TheoremFix[]
         try {
           const parsed = JSON.parse(Buffer.concat(stdoutChunks).toString('utf-8')) as ChildOutput
           failures = parsed.failures
           suppressions = parsed.suppressions ?? []
+          fixes = parsed.fixes ?? []
         } catch (err) {
           log(`failed to parse verifier output for ${fileName}: ${err}`)
           return
         }
 
         const diagnostics = failures.map(f => toDiagnostic(f))
-        cache.set(fileName, { sourceHash: hash, diagnostics, suppressions })
+        cache.set(fileName, { sourceHash: hash, diagnostics, suppressions, fixes })
         pendingVersions.delete(fileName)
         refreshDiags()
         dumpDebug(fileName, source, hash, failures)
@@ -313,6 +326,31 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
 
       // Return original only — don't show stale diagnostics with wrong offsets
       return original
+    }
+
+    // -------------------------------------------------------------------
+    // Code fixes: the lightbulb that inserts Spacer-inferred invariants
+    // -------------------------------------------------------------------
+
+    proxy.getCodeFixesAtPosition = (fileName, start, end, errorCodes, formatOptions, preferences) => {
+      const original = info.languageService.getCodeFixesAtPosition(
+        fileName, start, end, errorCodes, formatOptions, preferences)
+      const cached = cache.get(fileName)
+      if (cached === undefined || cached.fixes.length === 0) return original
+      const ours: tslib.CodeFixAction[] = []
+      for (const fix of cached.fixes) {
+        const overlaps = start <= fix.start + fix.length && end >= fix.start
+        if (!overlaps) continue
+        ours.push({
+          fixName: 'theorem-insert-invariants',
+          description: fix.title,
+          changes: [{
+            fileName,
+            textChanges: [{ span: { start: fix.insertPos, length: 0 }, newText: fix.insertText }],
+          }],
+        })
+      }
+      return ours.length > 0 ? [...original, ...ours] : original
     }
 
     return proxy

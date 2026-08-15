@@ -112,7 +112,10 @@ export function toZ3(
 
     // ── Element access: arr[i] ───────────────────────────────────
     case 'element-access': {
-      const objName = expr.object.kind === 'ident' ? expr.object.name : null
+      // Member-array access (user.scores[k]) flattens to the dotted name
+      const objName = expr.object.kind === 'ident'
+        ? expr.object.name
+        : expr.object.kind === 'member' ? flattenMember(expr.object) : null
       if (objName === null) return null
 
       // Check if the object is a Z3 Array — use select

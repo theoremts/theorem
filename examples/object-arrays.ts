@@ -57,7 +57,7 @@ export function creditAll(users: Account[], bonus: number, n: number): void {
   let k = 0
 
   while (k < n) {
-    // invariant(() => forall(users, (u) => u.balance >= 0))
+    invariant(() => forall(users, (u) => u.balance >= 0))
     decreases(() => n - k)
     users[k].balance = users[k].balance + bonus
     k = k + 1

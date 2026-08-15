@@ -31,6 +31,10 @@ async function main(): Promise<void> {
   const core = await import('@theoremts/core')
   const failures: ChildFailure[] = []
   const suppressions: Array<{ line: number; exprText: string }> = []
+  const fixes: Array<{ start: number; length: number; title: string; insertPos: number; insertText: string }> = []
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const maybeOfferInvariantFix = (ir: any, span: { start: number; length: number }): Promise<void> =>
+    maybeOfferInvariantFixImpl(core, ctx, source, fixes, ir, span)
 
   let irList: import('@theoremts/core').FunctionIR[]
   try {
@@ -78,7 +82,7 @@ async function main(): Promise<void> {
   for (const ir of irList) {
     let tasks: import('@theoremts/core').VerificationTask[]
     try {
-      tasks = core.translate(ir, ctx, registry, { boundsChecks: true })
+      tasks = await core.translateWithAutoInvariants(ir, ctx, registry, { boundsChecks: true })
     } catch {
       continue
     }
@@ -104,6 +108,8 @@ async function main(): Promise<void> {
           const ceText = formatCounterexample(result.counterexample)
           const traceText = result.trace ? formatTrace(result.trace) : ''
           const span = findContractPosition(source, ir.name, task.contractText)
+          // Spacer-inferred invariants become a one-click editor fix
+          await maybeOfferInvariantFix(ir, span)
           // Labeled, multi-line: editors show the first line in the Problems
           // panel and the full text in the hover. The 'theorem' source tag
           // already identifies us — no prefix needed.
@@ -158,16 +164,59 @@ async function main(): Promise<void> {
     }
   } catch { /* skip call-site extraction errors */ }
 
-  emit(failures, suppressions)
+  emit(failures, suppressions, fixes)
 }
 
-function emit(failures: ChildFailure[], suppressions: Array<{ line: number; exprText: string }> = []): void {
-  process.stdout.write(JSON.stringify({ failures, suppressions }))
+function emit(
+  failures: ChildFailure[],
+  suppressions: Array<{ line: number; exprText: string }> = [],
+  fixes: Array<{ start: number; length: number; title: string; insertPos: number; insertText: string }> = [],
+): void {
+  process.stdout.write(JSON.stringify({ failures, suppressions, fixes }))
 }
 
 // ---------------------------------------------------------------------------
 // Source position helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * When a failing function has an uninvarianted loop and Spacer can infer
+ * candidates, offer a code fix inserting them in the header position
+ * (directly before the while — same semantics as inside the body).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function maybeOfferInvariantFixImpl(
+  core: any, ctx: any, source: string,
+  fixes: Array<{ start: number; length: number; title: string; insertPos: number; insertText: string }>,
+  ir: any, span: { start: number; length: number },
+): Promise<void> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
+    const hasBareLoop = ir.heapSteps?.some((st: { kind: string; invariants?: unknown[] }) =>
+      st.kind === 'loop' && (st.invariants?.length ?? 0) === 0)
+    if (hasBareLoop !== true || typeof ir.name !== 'string') return
+    if (fixes.some(f => f.start === span.start)) return
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+    const inferred = await core.inferLoopInvariants(ir, ctx)
+    if (inferred === null || inferred.invariants.length === 0) return
+    // Insertion point: the line of the first `while` after the function header
+    const fnIdx = source.indexOf(`function ${ir.name}`)
+    if (fnIdx === -1) return
+    const whileIdx = source.indexOf('while', fnIdx)
+    if (whileIdx === -1) return
+    const lineStart = source.lastIndexOf('\n', whileIdx) + 1
+    const indent = source.slice(lineStart, whileIdx).match(/^\s*/)?.[0] ?? '  '
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
+    const lines = (inferred.invariants as string[]).map((i: string) => `${indent}invariant(() => ${i})`)
+    fixes.push({
+      start: span.start,
+      length: span.length,
+      title: `Theorem: insert ${lines.length} inferred loop invariant(s)`,
+      insertPos: lineStart,
+      insertText: lines.join('\n') + '\n',
+    })
+  } catch { /* fix offers are best-effort */ }
+}
 
 function findContractPosition(
   source: string,

@@ -15,6 +15,11 @@ export function prettyExpr(expr: Expr): string {
       if (expr.op === '-') return `-${prettyExpr(expr.operand)}`
       return `!${prettyExpr(expr.operand)}`
     case 'call':
+      // fold symbols carry their original source text as the last arg
+      if ((expr.callee === '__sumBy' || expr.callee === '__countBy') && expr.args.length === 3) {
+        const d = expr.args[2]
+        if (d !== undefined && d.kind === 'literal' && typeof d.value === 'string') return d.value
+      }
       // __reTest(s, pattern, flags) prints as its source form
       if (expr.callee === '__reTest' && expr.args.length === 3
           && expr.args[1]!.kind === 'literal' && expr.args[2]!.kind === 'literal') {

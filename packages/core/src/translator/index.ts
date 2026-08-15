@@ -129,6 +129,20 @@ export function translate(
 
   const vars = createVariables(ir.params, ir.returnSort, ctx)
 
+  // Params declared integral by contract become Int-sorted — they can index
+  // arrays and keep their arithmetic in LIA (mirrors heap-mode intParams)
+  for (const c of ir.contracts) {
+    if (c.kind !== 'requires' || !('predicate' in c) || typeof c.predicate !== 'object' || c.predicate === null) continue
+    const pred = c.predicate as Expr
+    if (pred.kind === 'call' && pred.callee === 'Number.isInteger'
+        && pred.args.length === 1 && pred.args[0]!.kind === 'ident') {
+      const pname = (pred.args[0] as { name: string }).name
+      if (ir.params.some(p => p.name === pname && p.sort === 'real')) {
+        vars.set(pname, ctx.Int.const(pname) as unknown as AnyExpr<'main'>)
+      }
+    }
+  }
+
   // Pre-create String variables for __reTest targets: regex membership
   // implies string-ness, and the body may read `x.length` BEFORE the
   // assume that would otherwise create x — a late String would leave the
@@ -137,7 +151,31 @@ export function translate(
     const name = t.kind === 'ident' ? t.name : t.kind === 'member' ? flattenMemberName(t) : null
     if (name !== null && !vars.has(name)) vars.set(name, makeConst(name, 'string', ctx))
   }
+  const preCreateArray = (t: Expr, sort: 'array' | 'ref-array'): void => {
+    const name = t.kind === 'ident' ? t.name : t.kind === 'member' ? flattenMemberName(t) : null
+    if (name === null) return
+    // ref-array (object elements) wins over a numeric-array guess — all
+    // pre-creation happens before any translation, so overriding is safe
+    if (!vars.has(name) || sort === 'ref-array') vars.set(name, makeConst(name, sort, ctx))
+  }
   const preCreateRegexTargets = (e: Expr): void => {
+    if (e.kind === 'element-access') {
+      // Element access types its object: an ARRAY, before any member walk
+      // defaults it to a scalar (order.scores[k] in a schema fact)
+      preCreateArray(e.object, 'array')
+      preCreateRegexTargets(e.object)
+      preCreateRegexTargets(e.index)
+      return
+    }
+    if (e.kind === 'member') {
+      // user.scores[i].balance: the object of the element access holds
+      // OBJECT elements — a reference array
+      if (e.object.kind === 'element-access' && e.property !== 'length') {
+        preCreateArray(e.object.object, 'ref-array')
+      }
+      preCreateRegexTargets(e.object)
+      return
+    }
     if (e.kind === 'call') {
       if (e.callee === '__reTest' && e.args.length >= 1) preCreateString(e.args[0]!)
       for (const a of e.args) preCreateRegexTargets(a)

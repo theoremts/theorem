@@ -269,3 +269,54 @@ describe('bounds obligations (opt-in)', () => {
     assert.strictEqual(tasks.filter(t => t.boundsCheck !== undefined).length, 0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Zod arrays → quantified facts: element schemas, object elements, and the
+// canonical Set-size uniqueness refine
+// ---------------------------------------------------------------------------
+
+describe('zod arrays: element facts and uniqueness', () => {
+  const source = `
+    const OrderSchema = z.object({
+      scores: z.array(z.number().min(1)),
+      users: z.array(z.object({ balance: z.number().nonnegative() })),
+      ids: z.array(z.number()).refine(a => new Set(a).size === a.length),
+    })
+    export function firstScore(input: unknown, k: number): number {
+      const order = OrderSchema.parse(input)
+      requires(Number.isInteger(k))
+      requires(k >= 0)
+      requires(k < order.scores.length)
+      ensures(output() >= 1)
+      return order.scores[k]!
+    }
+    export function balanceAt(input: unknown, k: number): number {
+      const order = OrderSchema.parse(input)
+      requires(Number.isInteger(k))
+      requires(k >= 0)
+      requires(k < order.users.length)
+      ensures(output() >= 0)
+      return order.users[k]!.balance
+    }
+    export function idsDiffer(input: unknown): boolean {
+      const order = OrderSchema.parse(input)
+      requires(order.ids.length >= 2)
+      ensures(output() === true)
+      return order.ids[0]! !== order.ids[1]!
+    }
+  `
+
+  test('z.array element constraints become forall facts', async () => {
+    const results = await verifyAll(source)
+    assert.strictEqual(results.find(r => r.text.includes('>= 1'))?.status, 'proved', 'numeric elements')
+    assert.strictEqual(results.find(r => r.text.includes('>= 0'))?.status, 'proved', 'object-element field')
+    assert.strictEqual(results.find(r => r.text.includes('=== true'))?.status, 'proved', 'uniqueness refine')
+  })
+
+  test('facts are exact — a stronger claim is never proved', async () => {
+    const results = await verifyAll(source.replace('ensures(output() >= 1)', 'ensures(output() >= 2)'))
+    const r = results.find(r => r.text.includes('>= 2'))
+    assert.ok(r !== undefined)
+    assert.notStrictEqual(r.status, 'proved', 'min(1) must not prove >= 2')
+  })
+})

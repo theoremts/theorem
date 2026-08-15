@@ -130,6 +130,37 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
   const out: RawCandidate[] = []
 
   // ── Division / modulo ──────────────────────────────────────────────────────
+  // Module-level `const X = <number>` — denominators bound to nonzero
+  // literals are not risks (constant resolution the type system lacks).
+  // Constants IMPORTED via relative paths are resolved one level deep.
+  const moduleConsts = new Map<string, number>()
+  const harvestConsts = (text: string): void => {
+    const constPattern = /(?:export\s+)?const\s+(\w+)\s*=\s*([\d\s*+.]+)[;\n]/g
+    let cm: RegExpExecArray | null
+    while ((cm = constPattern.exec(text)) !== null) {
+      const expr2 = cm[2]!.replace(/\s+/g, '')
+      if (!/^[\d*+.]+$/.test(expr2)) continue
+      try {
+        // eslint-disable-next-line no-new-func
+        const v = Function(`"use strict"; return (${expr2})`)() as number
+        if (Number.isFinite(v) && !moduleConsts.has(cm[1]!)) moduleConsts.set(cm[1]!, v)
+      } catch { /* skip */ }
+    }
+  }
+  harvestConsts(file.getFullText())
+  try {
+    const { readFileSync } = require('fs') as typeof import('fs')
+    const { dirname, resolve: presolve } = require('path') as typeof import('path')
+    for (const imp of file.getImportDeclarations()) {
+      const spec = imp.getModuleSpecifierValue()
+      if (!spec.startsWith('.')) continue
+      const base = presolve(dirname(file.getFilePath()), spec)
+      for (const cand of [`${base}.ts`, `${base}/index.ts`, `${base}.tsx`]) {
+        try { harvestConsts(readFileSync(cand, 'utf-8')); break } catch { /* next */ }
+      }
+    }
+  } catch { /* import resolution is best-effort */ }
+
   for (const node of file.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
     const op = node.getOperatorToken().getText()
     if (op !== '/' && op !== '%') continue
@@ -140,14 +171,25 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
     // Constant divisor: `const BATCH = 50; x / BATCH` — resolve same-file
     // const declarations initialized with a non-zero literal.
     if (Node.isIdentifier(denominator) && isNonZeroConstIdent(denominator, file)) continue
+    // Resolved module/imported constants (incl. folded products like 60*60*1000)
+    let constDowngrade = false
+    if (Node.isIdentifier(denominator)) {
+      const known = moduleConsts.get(denominator.getText())
+      if (known !== undefined && known !== 0) continue
+      // SCREAMING_CASE names are conventionally constants we could not
+      // resolve (aliased imports) — report LOW, not CRITICAL
+      if (known === undefined && /^[A-Z][A-Z0-9_]{2,}$/.test(denominator.getText())) {
+        constDowngrade = true
+      }
+    }
 
     const { functionName, params } = enclosingFnInfo(node)
     out.push({
       functionName,
       params,
       kind: op === '/' ? 'division-by-zero' : 'modulo-by-zero',
-      level: 'critical',
-      description: `${op === '/' ? 'division' : 'modulo'} by \`${denominator.getText().trim()}\``,
+      level: constDowngrade ? 'low' : 'critical',
+      description: `${op === '/' ? 'division' : 'modulo'} by \`${denominator.getText().trim()}\`${constDowngrade ? ' (unresolved constant — verify it is never 0)' : ''}`,
       trigger: parseExpr(denominator as Expression),
       line: node.getStartLineNumber(),
       pathConditions: collectPathConditions(node),
@@ -202,11 +244,17 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
     let varName: string | null = null
     const parent = node.getParent()
     if (parent !== undefined && Node.isVariableDeclaration(parent)) varName = parent.getName()
-    const guarded = enclosing !== undefined && varName !== null
+    const argText = node.getArguments()[0]?.getText()
+    const guarded = enclosing !== undefined
       && enclosing.getDescendantsOfKind(SyntaxKind.CallExpression).some(c => {
         const t = c.getExpression().getText()
-        return (t === 'isNaN' || t === 'Number.isNaN')
-          && c.getArguments()[0]?.getText() === varName
+        const guardFns = t === 'isNaN' || t === 'Number.isNaN' || t === 'Number.isFinite'
+          || /(?:^|\.)is(?:Number|Numeric|Finite)$/.test(t)
+        if (!guardFns) return false
+        const guardArg = c.getArguments()[0]?.getText()
+        // Guarding either the parse RESULT variable or the raw ARGUMENT
+        // (helpers like isNumber(x) internally do !isNaN(Number(x)))
+        return guardArg !== undefined && (guardArg === varName || guardArg === argText)
       })
     if (guarded) continue
 

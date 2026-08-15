@@ -92,7 +92,7 @@ export function translateHeapMode(
     if (e.kind === 'member') {
       let base: Expr = e.object
       while (base.kind === 'member') base = base.object
-      if (base.kind === 'ident') rootNames.add(resolveAlias(base.name, aliasOf))
+      if (base.kind === 'ident' && base.name !== '__cell') rootNames.add(resolveAlias(base.name, aliasOf))
       memberRootsOf(e.object)
     } else if (e.kind === 'binary') { memberRootsOf(e.left); memberRootsOf(e.right) }
     else if (e.kind === 'unary') memberRootsOf(e.operand)
@@ -566,6 +566,18 @@ export function translateHeapMode(
           const oldWithBindings: Env = { ...oldEnv, locals: env.locals }
           return translate(expr.args[0]!, oldWithBindings, oldEnv)
         }
+        // Fold symbols: constant of the CURRENT heap version of their field
+        if ((expr.callee === '__sumBy' || expr.callee === '__countBy') && expr.args.length === 3) {
+          const key = foldKeyOf(expr)
+          const t = key !== null ? foldTracks.get(key) : undefined
+          if (t === undefined) return null
+          const f = foldFieldOf(t)
+          if (f === null) return null
+          const heapObj = env.heap.get(f)
+          if (heapObj === undefined) return null
+          return foldConstAt(t, heapObj)
+        }
+
         // output(): the returned value — bound by the trailing return step
         if (expr.callee === 'output' && expr.args.length === 0) {
           return env.locals.get('__result') ?? env.nums.get('__result') ?? null
@@ -610,6 +622,121 @@ export function translateHeapMode(
   }
 
   const oldEnv: Env = { heap: initialHeap, locals: new Map(), nums: new Map(), arrays: new Map(initialArrays), tag: 'pre' }
+
+  // Assumption sink: fold-delta axioms emitted while executing a LOOP BODY
+  // belong to the iteration's assumption set, not the global one.
+  let sinkAssumptions: Bool<'main'>[] | null = null
+  let sinkLabels: string[] | null = null
+
+  // ── Fold symbols: sumBy/countBy as heap-versioned constants ──────────────
+  // Each (array, field/predicate) pair gets one constant PER HEAP VERSION of
+  // the projected field. Writes through element accesses chain versions with
+  // a DELTA axiom — valid only under requires(unique(arr)) (a duplicated
+  // reference would count its delta twice). Anything else (pointer writes,
+  // sort, missing uniqueness) leaves the next version unconstrained: honest.
+  interface FoldTrack {
+    kind: 'sum' | 'count'
+    arr: string
+    field: string | null      // sum: projected field. count: field(s) via pred
+    pred: Expr | null          // count predicate over __cell
+    display: string
+    consts: Map<unknown, AnyExpr<'main'>>
+    counter: number
+  }
+  const foldTracks = new Map<string, FoldTrack>()
+  const foldKeyOf = (e: Expr): string | null => {
+    if (e.kind !== 'call' || (e.callee !== '__sumBy' && e.callee !== '__countBy')) return null
+    const arr = e.args[0]
+    if (arr?.kind !== 'ident') return null
+    const d = e.args[2]
+    return `${e.callee}:${arr.name}:${d?.kind === 'literal' ? String(d.value) : '?'}`
+  }
+  const registerFolds = (e: Expr): void => {
+    switch (e.kind) {
+      case 'call': {
+        const key = foldKeyOf(e)
+        if (key !== null && !foldTracks.has(key)) {
+          const arr = (e.args[0] as { name: string }).name
+          if (arrayVars.has(arr)) {
+            const isSum = e.callee === '__sumBy'
+            const fieldArg = e.args[1]
+            foldTracks.set(key, {
+              kind: isSum ? 'sum' : 'count',
+              arr,
+              field: isSum && fieldArg?.kind === 'literal' ? String(fieldArg.value) : null,
+              pred: !isSum ? (e.args[1] ?? null) : null,
+              display: (e.args[2] as { value: string }).value,
+              consts: new Map(),
+              counter: 0,
+            })
+          }
+        }
+        for (const a of e.args) registerFolds(a)
+        break
+      }
+      case 'binary': registerFolds(e.left); registerFolds(e.right); break
+      case 'unary': registerFolds(e.operand); break
+      case 'ternary': registerFolds(e.condition); registerFolds(e.then); registerFolds(e.else); break
+      case 'quantifier': registerFolds(e.body); break
+      default: break
+    }
+  }
+  for (const c of ir.contracts) {
+    if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) registerFolds(c.predicate as Expr)
+  }
+  // (initial versions are seeded right after foldConstAt is defined below —
+  // the write chain needs the first link to exist BEFORE processSteps runs)
+
+  // For count predicates: which fields does the predicate read? (heap version key)
+  const predFields = (pred: Expr | null): string[] => {
+    const out = new Set<string>()
+    const walk = (e: Expr): void => {
+      if (e.kind === 'member') { out.add(e.property); walk(e.object) }
+      else if (e.kind === 'binary') { walk(e.left); walk(e.right) }
+      else if (e.kind === 'unary') walk(e.operand)
+      else if (e.kind === 'ternary') { walk(e.condition); walk(e.then); walk(e.else) }
+      else if (e.kind === 'call') e.args.forEach(walk)
+    }
+    if (pred !== null) walk(pred)
+    return [...out]
+  }
+  const foldFieldOf = (t: FoldTrack): string | null =>
+    t.kind === 'sum' ? t.field : (predFields(t.pred)[0] ?? null)
+
+  const hasUniqueRequires = (arr: string): boolean =>
+    ir.contracts.some(c => c.kind === 'requires' && 'predicate' in c
+      && typeof c.predicate === 'object' && c.predicate !== null
+      && (c.predicate as { display?: string }).display === `unique(${arr})`)
+
+  /** Constant for a fold at the given heap version, creating (unconstrained) on first sight. */
+  const foldConstAt = (t: FoldTrack, heapObj: unknown): AnyExpr<'main'> => {
+    let v = t.consts.get(heapObj)
+    if (v === undefined) {
+      const name = `__${t.kind}_${t.arr}_${t.counter++}`
+      v = t.kind === 'sum' ? ctx.Real.const(name) : (ctx.Int.const(name) as unknown as AnyExpr<'main'>)
+      t.consts.set(heapObj, v)
+      if (t.kind === 'count') {
+        const av = arrayVars.get(t.arr)
+        if (av !== undefined) {
+          try {
+            assumptions.push(ctx.And(
+              (v as Arith<'main'>).ge(ctx.Int.val(0) as unknown as Arith<'main'>),
+              (v as Arith<'main'>).le(av.len),
+            ))
+            assumptionLabels.push(`count range: 0 <= ${t.display} <= ${t.arr}.length`)
+          } catch { /* skip */ }
+        }
+      }
+    }
+    return v
+  }
+  // Seed the INITIAL heap version of every tracked fold: the delta chain in
+  // processSteps extends from an existing link — ensures/old() are translated
+  // only after the writes, far too late to start it.
+  for (const t of foldTracks.values()) {
+    const f = foldFieldOf(t)
+    if (f !== null && initialHeap.has(f)) foldConstAt(t, initialHeap.get(f))
+  }
 
   /** Instantiates the definitional-axiom pool at the given heap state. */
   const pushSpecAxioms = (
@@ -775,8 +902,10 @@ export function translateHeapMode(
         if (target === null || heap === undefined || value === null) continue
         // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
         const stored = heap.store(target, value)
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-        bodyEnv.heap.set(s.field, pc === null ? stored : ctx.If(pc, stored, heap))
+        const newHeap = pc === null ? stored : ctx.If(pc, stored, heap)
+        bodyEnv.heap.set(s.field, newHeap)
+        emitFoldDeltas(s, bodyEnv, oldEnv, heap, stored, newHeap, target, value,
+          pc === null ? ctx.Bool.val(true) : pc)
         continue
       }
     }
@@ -932,7 +1061,11 @@ export function translateHeapMode(
         const savedL = activeLabels
         activeAssumptions = () => [...iterAssumptions]
         activeLabels = () => [...iterLabels]
+        sinkAssumptions = iterAssumptions
+        sinkLabels = iterLabels
         runLoopBody(step.body, bodyEnv, null)
+        sinkAssumptions = null
+        sinkLabels = null
         activeAssumptions = savedA
         activeLabels = savedL
 
@@ -1064,9 +1197,76 @@ export function translateHeapMode(
       // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
       const stored = heap.store(target, value)
       const guard = pc === null ? alive : ctx.And(alive, pc)
+      const newHeap = ctx.If(guard, stored, heap)
       // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-      env.heap.set(step.field, ctx.If(guard, stored, heap))
+      env.heap.set(step.field, newHeap)
+
+      emitFoldDeltas(step, env, oldEnv, heap, stored, newHeap, target, value, guard)
     }
+  }
+
+  /**
+   * Fold delta axioms: an indexed write through DISTINCT elements moves
+   * sum/count by exactly its cell delta. Non-indexed writes (through
+   * pointers) leave the next fold version unconstrained — honest havoc.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function emitFoldDeltas(step: Extract<import('../parser/ir.js').HeapStep, { kind: 'field-write' }>, env: Env, oldEnvX: Env, heap: any, stored: any, newHeap: any, target: AnyExpr<'main'> | null, value: AnyExpr<'main'> | null, guard: Bool<'main'>): void {
+      const pushA = (a: Bool<'main'>, l: string): void => {
+        if (sinkAssumptions !== null && sinkLabels !== null) { sinkAssumptions.push(a); sinkLabels.push(l) }
+        else { assumptions.push(a); assumptionLabels.push(l) }
+      }
+      for (const t of foldTracks.values()) {
+        if (foldFieldOf(t) !== step.field) continue
+        const prevConst = t.consts.get(heap)
+        if (prevConst === undefined) continue   // fold never observed at this version
+        const nextConst = foldConstAt(t, newHeap)
+        if (step.object.kind !== 'element-access'
+            || step.object.object.kind !== 'ident'
+            || step.object.object.name !== t.arr
+            || !hasUniqueRequires(t.arr)) {
+          continue   // nextConst stays unconstrained
+        }
+        const av = arrayVars.get(t.arr)
+        const idxZ3 = translate(step.object.index, env, oldEnvX)
+        if (av === undefined || idxZ3 === null || target === null || value === null) continue
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+          const oldCell = heap.select(target)
+          const inBounds = ctx.And(
+            (idxZ3 as Arith<'main'>).ge(ctx.Int.val(0) as unknown as Arith<'main'>),
+            (idxZ3 as Arith<'main'>).lt(av.len),
+          )
+          let deltaEq: Bool<'main'>
+          if (t.kind === 'sum') {
+            deltaEq = (nextConst as Arith<'main'>).eq(
+              (prevConst as Arith<'main'>).add((value as Arith<'main'>).sub(oldCell as Arith<'main'>)))
+          } else {
+            // The predicate speaks about the ELEMENT (__cell is the ref);
+            // evaluate it against the pre-write and post-write heaps.
+            const evalPred = (heapForField: unknown): Bool<'main'> | null => {
+              const predEnv: Env = { ...env, heap: new Map(env.heap), locals: new Map(env.locals) }
+              predEnv.heap.set(step.field, heapForField)
+              predEnv.locals.set('__cell', target!)
+              const z = translate(t.pred!, predEnv, oldEnvX)
+              return z === null ? null : z as Bool<'main'>
+            }
+            const pOld = evalPred(heap)
+            const pNew = evalPred(stored)
+            if (pNew === null || pOld === null) continue
+            const one = ctx.Int.val(1) as unknown as Arith<'main'>
+            const zero = ctx.Int.val(0) as unknown as Arith<'main'>
+            deltaEq = (nextConst as Arith<'main'>).eq(
+              (prevConst as Arith<'main'>)
+                .add(ctx.If(pNew, one, zero) as Arith<'main'>)
+                .sub(ctx.If(pOld, one, zero) as Arith<'main'>))
+          }
+          pushA(ctx.And(
+            ctx.Implies(ctx.And(guard, inBounds), deltaEq),
+            ctx.Implies(ctx.Not(guard), (nextConst as Arith<'main'>).eq(prevConst as Arith<'main'>)),
+          ), `fold delta: ${t.display} across ${t.arr}[${prettyExpr(step.object.index)}].${step.field} write`)
+        } catch { /* leave unconstrained */ }
+      }
   }
 
   let branchCounter = 0

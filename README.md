@@ -300,6 +300,23 @@ processUniformBatch(txCount: number, amountPerTx: number): number {
 
 The discipline is honest: state the loop writes is havoced, so an invariant you forget is a counterexample, not a silent assumption. Drop the `totalDistributed` invariant above and the class invariant at method exit is refuted with concrete values. See [`examples/advanced.ts`](examples/advanced.ts).
 
+Loop contracts may also sit directly **before** the `while` (Dafny-style header) — same semantics as the first statements of the body.
+
+### Invariants that write themselves
+
+Two engines take the boilerplate away:
+
+- **Houdini (automatic, default on)** — the requires/ensures conjuncts that mention loop-written state become guess-and-check invariant candidates. Each must prove loop entry *and* preservation; failures are dropped and the check reiterates; survivors show up marked `(auto)`:
+
+  ```
+  ✓  loop invariant (entry): forall(users, (u) => u.balance >= 0)  (auto)
+  ✓  loop invariant (preserved): forall(users, (u) => u.balance >= 0)  (auto)
+  ```
+
+  Nothing is ever assumed without both obligations proved — a debiting loop simply loses its candidate and refutes honestly.
+
+- **Spacer inference (CHC)** — for invariants that appear in *no* contract (linear combinations like `paid + 3 * remaining === 3 * total`), the loop is encoded as Horn clauses and Z3's Spacer engine synthesizes the inductive invariant. Surfaced two ways: `theorem suggest` prints it, and in the editor the failing loop gets a **quick-fix (💡) that inserts the inferred invariants** one click away.
+
 ## Schemas as contracts
 
 Your validation schemas already state your invariants — Theorem reads them. `Schema.parse()` throws on invalid data, so after the parse the schema's refinements are mathematical facts. **Zero annotations needed**:
@@ -359,6 +376,20 @@ export function applyRate(amount: number, rate: Rate): number {
 applyRate(100, 0 as Rate)         // ✗ caught at the call site —
                                   //   `as` satisfies tsc, not Z3
 ```
+
+### Arrays in schemas
+
+Element-level constraints become quantified facts, and the canonical Set-size refine becomes distinctness:
+
+```typescript
+const OrderSchema = z.object({
+  scores: z.array(z.number().min(1)),                                // → forall(scores, v => v >= 1)
+  users:  z.array(z.object({ balance: z.number().nonnegative() })),  // → forall(users, u => u.balance >= 0)
+  ids:    z.array(z.number()).refine(a => new Set(a).size === a.length),  // → unique(ids)
+})
+```
+
+After the parse, `order.scores[k] >= 1` proves (with `k` in bounds), and `order.ids[0] !== order.ids[1]` follows from the refine. Effect Schema mirrors all of it (`Schema.Array(Schema.Number.pipe(Schema.positive()))`, `Schema.Array(Schema.Struct({...}))`).
 
 ### Boundaries: tRPC and Prisma
 
@@ -482,6 +513,41 @@ export function cons(x: number, tail: Node | null): Node {
 ```
 
 All of this runs on ground instantiation — **no quantifiers** — so solve times stay in single-digit milliseconds and results are deterministic.
+
+## Collection vocabulary
+
+One word per property, over arrays of numbers or objects:
+
+```typescript
+requires(unique(users))                         // pairwise-distinct OBJECTS — the anti-aliasing hypothesis
+requires(uniqueBy(users, (u) => u.id))          // pairwise-distinct field values
+requires(sortedBy(users, (u) => u.balance))     // ordered by a field
+requires(exists(users, (u) => u.id === wanted)) // membership
+requires(forall(users, (u) => u.balance >= 0))  // every element
+```
+
+And the folds — `sumBy` / `countBy` — make conservation provable:
+
+```typescript
+export function transfer(users: Account[], i: number, j: number, amt: number): void {
+  requires(unique(users))
+  // ... bounds on i, j ...
+  ensures(sumBy(users, (u) => u.balance) === old(sumBy(users, (u) => u.balance)))
+  users[i]!.balance = users[i]!.balance - amt
+  users[j]!.balance = users[j]!.balance + amt      // ✓ conserves — even when i === j
+}
+// change the credit to `+ amt + 1` → refuted: money out of thin air
+```
+
+Every indexed write moves the sum by exactly its cell delta — an axiom valid only under `requires(unique(users))` (a duplicated reference would count its delta twice; without uniqueness the sum is honestly unconstrained). Two-state quantified contracts compose with loops: `ensures(forall(users, (u) => u.balance >= old(u.balance)))` proves through a crediting loop regardless of aliasing. The full tour: [`examples/collections.ts`](examples/collections.ts) and [`examples/schema-arrays.ts`](examples/schema-arrays.ts).
+
+## Proof-backed editor experience
+
+The TS plugin does more than squiggles:
+
+- **Readable failures** — labeled multi-line messages (`Contract violated:` / `Unmet requires:` / `Call:` / `Counterexample:`), counterexamples that name aliasing (`users[1] = same object as users[0]`) and show per-element fields (`users[1].balance = -100`), and the execution path (`path: line 33: p.kind === "boleto" → not taken`).
+- **tsc errors suppressed by proof** — for each `arr[i]`, Theorem proves `0 <= i < arr.length` from your requires; proved accesses have tsc's possibly-undefined error (2532/18048) filtered at exactly that spot. The unverified `!` gives way to a proof — and the error comes back by itself if a requires weakens.
+- **Quick-fix invariants** — a failing loop offers a 💡 code action that inserts the Spacer-inferred `invariant(() => ...)` lines.
 
 ## Counterexamples as regression tests
 
