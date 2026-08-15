@@ -473,7 +473,7 @@ export function translate(
     // We process checks/assumes with the body's SSA bindings applied.
     for (const step of ir.bodySteps) {
       if (step.kind === 'check') {
-        const goalZ3 = translatePredicate(step.predicate, vars, ctx)
+        const goalZ3 = translateContractPredicate(step.predicate)
         if (goalZ3 === null) continue
         const text = `check: ${predicateText(step.predicate)}`
         positionalCheckDone.add(text)
@@ -490,7 +490,7 @@ export function translate(
         })
       }
       if (step.kind === 'assume') {
-        const z3 = translatePredicate(step.predicate, vars, ctx)
+        const z3 = translateContractPredicate(step.predicate)
         if (z3 !== null) {
           assumptions.push(z3 as Bool<'main'>)
           assumptionLabels.push(`assume: ${predicateText(step.predicate)}`)

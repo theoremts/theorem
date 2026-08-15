@@ -40,7 +40,13 @@ export function extractCallSiteObligations(
 
   const tasks: VerificationTask[] = []
 
-  for (const node of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+  // Constructor sites participate too: `new X(...)` matches a contract
+  // declared on `X` (declare(FeeCalculator, ...)), same as the translator.
+  const callNodes = [
+    ...file.getDescendantsOfKind(SyntaxKind.CallExpression),
+    ...file.getDescendantsOfKind(SyntaxKind.NewExpression),
+  ]
+  for (const node of callNodes) {
     const calleeName = node.getExpression().getText()
     const contract = resolveContract(calleeName, registry, node.getArguments().length)
     if (!contract) continue
