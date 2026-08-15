@@ -62,7 +62,8 @@ export function unfoldSpecCalls(expr: Expr, defs: SpecDefs, fuel = DEFAULT_FUEL)
       case 'call': {
         const args = e.args.map(toUF)
         const def = defs.get(e.callee)
-        if (def === undefined) return { kind: 'call', callee: e.callee, args }
+        // Not a spec call — pass through, preserving recv/loc metadata
+        if (def === undefined) return { ...e, args, ...(e.recv !== undefined ? { recv: toUF(e.recv) } : {}) }
         instantiate(e.callee, def, args, fuel)
         return { kind: 'call', callee: ufName(e.callee, def), args }
       }
@@ -113,7 +114,7 @@ export function unfoldSpecCalls(expr: Expr, defs: SpecDefs, fuel = DEFAULT_FUEL)
       case 'call': {
         const args = e.args.map(a => convertBody(a, remaining))
         const def = defs.get(e.callee)
-        if (def === undefined) return { kind: 'call', callee: e.callee, args }
+        if (def === undefined) return { ...e, args, ...(e.recv !== undefined ? { recv: convertBody(e.recv, remaining) } : {}) }
         instantiate(e.callee, def, args, remaining)
         return { kind: 'call', callee: ufName(e.callee, def), args }
       }
@@ -170,7 +171,7 @@ export function rewriteNullToRef(expr: Expr): Expr {
     case 'ternary':
       return { kind: 'ternary', condition: rewriteNullToRef(expr.condition), then: rewriteNullToRef(expr.then), else: rewriteNullToRef(expr.else) }
     case 'call':
-      return { kind: 'call', callee: expr.callee, args: expr.args.map(rewriteNullToRef) }
+      return { ...expr, args: expr.args.map(rewriteNullToRef), ...(expr.recv !== undefined ? { recv: rewriteNullToRef(expr.recv) } : {}) }
     case 'member':
       return { kind: 'member', object: rewriteNullToRef(expr.object), property: expr.property }
     case 'element-access':

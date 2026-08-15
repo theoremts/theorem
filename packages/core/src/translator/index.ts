@@ -67,6 +67,9 @@ export function translate(
     return translateHeapMode(ir, ctx, opts)
   }
 
+  // Fresh per-function memo for modular-call rewrites (see rewriteRegisteredCalls)
+  callRewriteMemo = new Map()
+
   // Spec functions: calls in contract predicates become uninterpreted
   // applications (congruence!), with ground definitional axioms emitted per
   // call instance up to the fuel bound (see translator/spec-unfold.ts)
@@ -223,6 +226,27 @@ export function translate(
   // 1. Translate requires → assumptions (with labels for unsat core)
   const assumptions: Bool<'main'>[] = []
   const assumptionLabels: string[] = []
+  const callObligations: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }> = []
+  const callAssumptions: Bool<'main'>[] = []
+
+  // Contract predicates may themselves call registered functions — most
+  // notably declared method contracts like `rate.greaterThanOrEqualTo(0)`.
+  // Route them through the modular rewriter: each such call becomes a fresh
+  // __ret variable whose defining ensures land directly in `assumptions`
+  // (tasks snapshot `assumptions` at creation, so definitions must be in
+  // place before the predicate's task is built).
+  const translateContractPredicate = (pred: Predicate): AnyExpr<'main'> | null => {
+    if (typeof pred !== 'string' && registry !== undefined && hasCallTo(pred, registry)) {
+      const defs: Bool<'main'>[] = []
+      const rewritten = rewriteRegisteredCalls(pred, vars, ctx, registry, callObligations, defs, [])
+      for (const d of defs) {
+        assumptions.push(d)
+        assumptionLabels.push('method contract')
+      }
+      return toZ3(rewritten, vars, ctx)
+    }
+    return translatePredicate(pred, vars, ctx)
+  }
 
   // L1 visibility: field mutations the parser could not model are a
   // stated assumption, not silence — they show up in every task's context.
@@ -234,7 +258,7 @@ export function translate(
 
   for (const contract of ir.contracts) {
     if (contract.kind !== 'requires') continue
-    const z3 = translatePredicate(contract.predicate, vars, ctx)
+    const z3 = translateContractPredicate(contract.predicate)
     if (z3 !== null) {
       assumptions.push(z3 as Bool<'main'>)
       assumptionLabels.push(`requires: ${predicateText(contract.predicate)}`)
@@ -243,8 +267,6 @@ export function translate(
 
   // 2. Body constraint: result === body(params)
   //    Also collects call-site obligations from cross-function calls.
-  const callObligations: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }> = []
-  const callAssumptions: Bool<'main'>[] = []
   const traceExprs = new Map<string, AnyExpr<'main'>>()
   const traceLocs = new Map<string, Loc>()
 
@@ -480,7 +502,7 @@ export function translate(
   for (const contract of ir.contracts) {
     if (contract.kind === 'assume') {
       if (ir.bodySteps) continue  // already processed positionally
-      const z3 = translatePredicate(contract.predicate, vars, ctx)
+      const z3 = translateContractPredicate(contract.predicate)
       if (z3 !== null) {
         assumptions.push(z3 as Bool<'main'>)
         assumptionLabels.push(`assume: ${predicateText(contract.predicate)}`)
@@ -490,7 +512,7 @@ export function translate(
 
     if (contract.kind === 'check') {
       if (ir.bodySteps) continue  // already processed positionally with SSA
-      const goalZ3 = translatePredicate(contract.predicate, vars, ctx)
+      const goalZ3 = translateContractPredicate(contract.predicate)
       if (goalZ3 === null) continue
       tasks.push({
         functionName: ir.name,
@@ -538,7 +560,7 @@ export function translate(
     }
 
     if (contract.kind !== 'ensures') continue
-    const goalZ3 = translatePredicate(contract.predicate, vars, ctx)
+    const goalZ3 = translateContractPredicate(contract.predicate)
     if (goalZ3 === null) continue
 
     tasks.push({
@@ -792,16 +814,93 @@ function translateBody(
  * Handles dotted names: `this.payments.calculateFee` → `calculateFee`
  *                       `service.applyDiscount` → `applyDiscount`
  */
-function resolveCallee(callee: string, registry: ContractRegistry): string | null {
+/** Globals whose methods toZ3 models natively — never hijack them with
+ *  `Type.prototype.*` method contracts (Math.abs is exact; a declared
+ *  Decimal.prototype.abs envelope would only weaken it). */
+const NATIVE_NAMESPACES = new Set(['Math', 'Number', 'JSON', 'Object', 'Date', 'Array', 'String', 'Boolean', 'Promise'])
+
+/** Per-translate memo: (callee, args, path) → __ret name. Reset by translate();
+ *  __ret constants live in that call's vars map, so entries must never leak
+ *  across functions. */
+let callRewriteMemo = new Map<string, string>()
+
+function resolveCallee(callee: string, registry: ContractRegistry, allowProtoSuffix = true): string | null {
   // Direct match
   if (registry.has(callee)) return callee
+  // Constructor: `new Decimal(x)` matches a contract declared on `Decimal`
+  if (callee.startsWith('new ') && registry.has(callee.slice(4))) return callee.slice(4)
   // Try the last segment of a dotted name: this.x.method → method
   const lastDot = callee.lastIndexOf('.')
   if (lastDot >= 0) {
     const methodName = callee.slice(lastDot + 1)
     if (registry.has(methodName)) return methodName
+    if (!allowProtoSuffix) return null
+    // Method contracts declared as `Type.prototype.method` (e.g. by
+    // @theoremts/contracts-decimal). The receiver's static type is not
+    // resolvable in the in-memory parse project, so match by method name —
+    // but only when exactly one declared type provides it (ambiguity = no match).
+    const suffix = `.prototype.${methodName}`
+    let found: string | null = null
+    for (const key of registry.keys()) {
+      if (key.endsWith(suffix)) {
+        if (found !== null) return null
+        found = key
+      }
+    }
+    return found
   }
   return null
+}
+
+/** Prototype-method matching is off for calls whose receiver is a native
+ *  namespace ident (Math.round must stay Math.round). */
+function protoSuffixAllowed(expr: Extract<Expr, { kind: 'call' }>): boolean {
+  return !(expr.recv !== undefined && expr.recv.kind === 'ident' && NATIVE_NAMESPACES.has(expr.recv.name))
+}
+
+/**
+ * Inlines PURE method contracts (no requires, single `ensures(output() === E)`)
+ * into an expression, recursively. No __ret constants, no obligations — safe
+ * anywhere, including quantifier bodies and the call-site checker's predicate
+ * translation (which has no modular-call machinery of its own).
+ */
+export function inlinePureMethodCalls(expr: Expr, registry: ContractRegistry, depth = 0): Expr {
+  if (depth > 10) return expr  // self-referential contract — stop expanding
+  const walk = (e: Expr): Expr => {
+    switch (e.kind) {
+      case 'call': {
+        const args = e.args.map(walk)
+        const recv = e.recv !== undefined ? walk(e.recv) : undefined
+        const resolved = resolveCallee(e.callee, registry, protoSuffixAllowed(e))
+        if (resolved !== null) {
+          const contract = registry.get(resolved)
+          const callArgs = resolved.includes('.prototype.') && recv !== undefined ? [recv, ...args] : args
+          if (contract !== undefined && contract.requires.length === 0 && contract.ensures.length === 1) {
+            const ens = contract.ensures[0]!
+            if (typeof ens !== 'string' && ens.kind === 'binary' && ens.op === '===' &&
+                ens.left.kind === 'call' && ens.left.callee === 'output' && ens.left.args.length === 0) {
+              const mapping = new Map<string, Expr>()
+              for (let i = 0; i < Math.min(contract.params.length, callArgs.length); i++) {
+                mapping.set(contract.params[i]!.name, callArgs[i]!)
+              }
+              return inlinePureMethodCalls(substituteExpr(ens.right, mapping), registry, depth + 1)
+            }
+          }
+        }
+        return recv !== undefined ? { ...e, args, recv } : { ...e, args }
+      }
+      case 'binary':         return { ...e, left: walk(e.left), right: walk(e.right) }
+      case 'unary':          return { ...e, operand: walk(e.operand) }
+      case 'ternary':        return { ...e, condition: walk(e.condition), then: walk(e.then), else: walk(e.else) }
+      case 'member':         return { ...e, object: walk(e.object) }
+      case 'element-access': return { ...e, object: walk(e.object), index: walk(e.index) }
+      case 'quantifier':     return { ...e, body: walk(e.body) }
+      case 'array':          return { ...e, elements: e.elements.map(walk) }
+      case 'object':         return { ...e, properties: e.properties.map(p => ({ key: p.key, value: walk(p.value) })) }
+      default:               return e
+    }
+  }
+  return walk(expr)
 }
 
 function translateModularCall(
@@ -876,19 +975,67 @@ function rewriteRegisteredCalls(
   obligations: Array<{ text: string; z3: Bool<'main'>; pathConditions?: Expr[] }>,
   callAssumptions: Bool<'main'>[],
   pathConditions: Expr[] = [],
+  pureOnly = false,
 ): Expr {
   const recurse = (e: Expr, pcs: Expr[]): Expr =>
-    rewriteRegisteredCalls(e, vars, ctx, registry, obligations, callAssumptions, pcs)
+    rewriteRegisteredCalls(e, vars, ctx, registry, obligations, callAssumptions, pcs, pureOnly)
 
   switch (expr.kind) {
     case 'call': {
       const args = expr.args.map(a => recurse(a, pathConditions))
-      const resolved = resolveCallee(expr.callee, registry)
-      if (resolved !== null) {
-        const call = translateModularCall(resolved, args, vars, ctx, registry, obligations, callAssumptions, pathConditions)
-        if (call !== null) return { kind: 'ident', name: call.retName }
+      const recv = expr.recv !== undefined ? recurse(expr.recv, pathConditions) : undefined
+      let resolved = resolveCallee(expr.callee, registry, protoSuffixAllowed(expr))
+      // Last-segment fallback (x.method → free function `method`) is accepted
+      // only with matching arity — `calculator.total()` must not inherit the
+      // contract of `total(lineItems, taxRate, rules)`.
+      if (resolved !== null && resolved !== expr.callee && !resolved.includes('.prototype.') &&
+          !expr.callee.startsWith('new ') &&
+          registry.get(resolved) !== undefined && registry.get(resolved)!.params.length !== args.length) {
+        resolved = null
       }
-      return { kind: 'call', callee: expr.callee, args }
+      if (resolved !== null) {
+        // A `Type.prototype.method` contract takes the receiver as its first
+        // parameter: `x.plus(y)` binds (a := x, b := y).
+        const callArgs = resolved.includes('.prototype.') && recv !== undefined ? [recv, ...args] : args
+        // Pure definitional contract — no requires, single `output() === E`
+        // ensures: inline E with the arguments substituted. This keeps the
+        // formula ground (no __ret indirection) and covers predicate methods
+        // like gte whose boolean result feeds directly into logic.
+        const contract = registry.get(resolved)
+        if (contract !== undefined && contract.requires.length === 0 && contract.ensures.length === 1) {
+          const ens = contract.ensures[0]!
+          if (typeof ens !== 'string' && ens.kind === 'binary' && ens.op === '===' &&
+              ens.left.kind === 'call' && ens.left.callee === 'output' && ens.left.args.length === 0) {
+            const mapping = new Map<string, Expr>()
+            for (let i = 0; i < Math.min(contract.params.length, callArgs.length); i++) {
+              mapping.set(contract.params[i]!.name, callArgs[i]!)
+            }
+            return substituteExpr(ens.right, mapping)
+          }
+        }
+        // Inside a quantifier body only pure inlining is sound: a fresh
+        // __ret constant would live OUTSIDE the binder while its defining
+        // ensures mentions the bound variable (capture). Leave the call
+        // unrewritten — the translation honestly fails instead.
+        if (pureOnly) {
+          return recv !== undefined ? { ...expr, args, recv } : { ...expr, args }
+        }
+        // Memoize per (callee, args, path): re-translating the same body
+        // expression (per result property, per contract) must reuse ONE
+        // return variable — fresh __rets per occurrence lose congruence
+        // (hours and minutes would each get their own differenceInSeconds).
+        const memoKey = `${resolved}(${callArgs.map(a => prettyExpr(a)).join(',')})|${pathConditions.map(p => prettyExpr(p)).join('&')}`
+        const hit = callRewriteMemo.get(memoKey)
+        if (hit !== undefined) return { kind: 'ident', name: hit }
+        const call = translateModularCall(resolved, callArgs, vars, ctx, registry, obligations, callAssumptions, pathConditions)
+        if (call !== null) {
+          callRewriteMemo.set(memoKey, call.retName)
+          return { kind: 'ident', name: call.retName }
+        }
+      }
+      return recv !== undefined
+        ? { ...expr, args, recv }
+        : { ...expr, args }
     }
 
     case 'binary':
@@ -903,14 +1050,23 @@ function rewriteRegisteredCalls(
 
     case 'ternary': {
       const condition = recurse(expr.condition, pathConditions)
-      // In the then-branch, the condition holds; in the else-branch, it is negated
-      const then = recurse(expr.then, [...pathConditions, expr.condition])
-      const els = recurse(expr.else, [...pathConditions, { kind: 'unary' as const, op: '!' as const, operand: expr.condition }])
+      // In the then-branch, the condition holds; in the else-branch, it is
+      // negated. Path conditions use the REWRITTEN condition: a raw guard
+      // containing registered method calls (e.g. cost.equals(ZERO)) would not
+      // translate in the obligation task and be silently dropped.
+      const then = recurse(expr.then, [...pathConditions, condition])
+      const els = recurse(expr.else, [...pathConditions, { kind: 'unary' as const, op: '!' as const, operand: condition }])
       return { kind: 'ternary', condition, then, else: els }
     }
 
     case 'member':
       return { kind: 'member', object: recurse(expr.object, pathConditions), property: expr.property }
+
+    case 'quantifier':
+      return {
+        ...expr,
+        body: rewriteRegisteredCalls(expr.body, vars, ctx, registry, obligations, callAssumptions, pathConditions, true),
+      }
 
     case 'element-access':
       return {
@@ -933,7 +1089,7 @@ function rewriteRegisteredCalls(
 /** Check if an expression tree contains a call to a registered function. */
 function hasCallTo(expr: Expr, registry: ContractRegistry): boolean {
   switch (expr.kind) {
-    case 'call':           return resolveCallee(expr.callee, registry) !== null || expr.args.some(a => hasCallTo(a, registry))
+    case 'call':           return resolveCallee(expr.callee, registry, protoSuffixAllowed(expr)) !== null || expr.args.some(a => hasCallTo(a, registry)) || (expr.recv !== undefined && hasCallTo(expr.recv, registry))
     case 'binary':         return hasCallTo(expr.left, registry) || hasCallTo(expr.right, registry)
     case 'ternary':        return hasCallTo(expr.condition, registry) || hasCallTo(expr.then, registry) || hasCallTo(expr.else, registry)
     case 'unary':          return hasCallTo(expr.operand, registry)

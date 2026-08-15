@@ -287,6 +287,55 @@ describe('sort: havoc + trusted sortedness', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Enclosing requires reach call sites inside callbacks — captured variables
+// are the same variables, so the outer facts carry over lexically unless a
+// callback parameter shadows the name.
+// ---------------------------------------------------------------------------
+
+describe('call sites: enclosing requires through callbacks', () => {
+  const callbackSource = (outer: string, callbackParams: string, rateArg: string) => `
+    export function taxFor(amount: number, taxRate: number): number {
+      requires(taxRate >= 0 && taxRate <= 1)
+      ensures(output() >= 0)
+      return amount * taxRate
+    }
+    export function total(items: number[], taxRate: number): number {
+      ${outer}
+      return items.reduce(${callbackParams} => acc + taxFor(item, ${rateArg}), 0)
+    }
+  `
+
+  const runCallSites = async (source: string) => {
+    const ctx = await getContext()
+    const registry = buildRegistry(extractFromSource(source))
+    const tasks = extractCallSiteObligations(source, 'test.ts', registry, ctx)
+    const results = []
+    for (const t of tasks) results.push({ text: t.contractText, status: (await check(t)).status })
+    return results.find(r => r.text.includes('taxFor('))
+  }
+
+  test('outer requires discharges the obligation inside a reduce callback', async () => {
+    const req = await runCallSites(callbackSource('requires(taxRate >= 0 && taxRate <= 1)', '(acc, item)', 'taxRate'))
+    assert.ok(req, 'Expected the callback call-site obligation')
+    assert.strictEqual(req.status, 'proved')
+  })
+
+  test('without the outer requires the callback call site is refuted', async () => {
+    const req = await runCallSites(callbackSource('', '(acc, item)', 'taxRate'))
+    assert.ok(req, 'Expected the callback call-site obligation')
+    assert.strictEqual(req.status, 'disproved')
+  })
+
+  test('a callback parameter shadowing the name drops the outer fact', async () => {
+    // The callback rebinds `taxRate` — the outer requires is about a
+    // DIFFERENT variable and must not discharge this obligation.
+    const req = await runCallSites(callbackSource('requires(taxRate >= 0 && taxRate <= 1)', '(acc, taxRate)', 'taxRate'))
+    assert.ok(req, 'Expected the callback call-site obligation')
+    assert.strictEqual(req.status, 'disproved')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Array literals establish structural facts at call sites
 // ---------------------------------------------------------------------------
 

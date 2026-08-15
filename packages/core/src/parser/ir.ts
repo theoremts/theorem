@@ -43,7 +43,7 @@ export type Expr =
   | { kind: 'element-access'; object: Expr; index: Expr; loc?: Loc | undefined }
   | { kind: 'unary';          op: UnaryOp; operand: Expr; loc?: Loc | undefined }
   | { kind: 'binary';         op: BinaryOp; left: Expr; right: Expr; loc?: Loc | undefined }
-  | { kind: 'call';           callee: string; args: Expr[]; loc?: Loc | undefined }
+  | { kind: 'call';           callee: string; args: Expr[]; recv?: Expr | undefined; loc?: Loc | undefined }
   | { kind: 'ternary';        condition: Expr; then: Expr; else: Expr; loc?: Loc | undefined }
   | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr; sort?: 'int' | 'real' | undefined; display?: string | undefined; loc?: Loc | undefined }
   | { kind: 'array';          elements: Expr[]; loc?: Loc | undefined }

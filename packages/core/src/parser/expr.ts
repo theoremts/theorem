@@ -482,6 +482,13 @@ function parseExprInner(node: Expression): Expr | null {
       if (parsed === null) return null
       args.push(parsed)
     }
+    // Method calls keep their receiver as a structured expression so the
+    // translator can match `x.plus(y)` against a declared
+    // `Type.prototype.plus` contract with x as the first contract argument.
+    if (Node.isPropertyAccessExpression(calleeExpr)) {
+      const recvParsed = parseExpr(calleeExpr.getExpression())
+      if (recvParsed !== null) return { kind: 'call', callee, args, recv: recvParsed }
+    }
     return { kind: 'call', callee, args }
   }
 
@@ -1363,7 +1370,11 @@ function substituteIdents(expr: Expr, bindings: Map<string, Expr>): Expr {
     case 'ternary':
       return { ...expr, condition: substituteIdents(expr.condition, bindings), then: substituteIdents(expr.then, bindings), else: substituteIdents(expr.else, bindings) }
     case 'call':
-      return { ...expr, args: expr.args.map(a => substituteIdents(a, bindings)) }
+      return {
+        ...expr,
+        args: expr.args.map(a => substituteIdents(a, bindings)),
+        ...(expr.recv !== undefined ? { recv: substituteIdents(expr.recv, bindings) } : {}),
+      }
     case 'member':
       return { ...expr, object: substituteIdents(expr.object, bindings) }
     case 'element-access':

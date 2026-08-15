@@ -9,6 +9,7 @@ import type { Z3Context } from '../solver/context.js'
 import type { Expr, Predicate } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
 import type { VerificationTask } from '../translator/index.js'
+import { inlinePureMethodCalls } from '../translator/index.js'
 import { parseExpr } from '../parser/expr.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { substituteExpr, substituteOutput } from '../translator/substitution.js'
@@ -41,7 +42,7 @@ export function extractCallSiteObligations(
 
   for (const node of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const calleeName = node.getExpression().getText()
-    const contract = resolveContract(calleeName, registry)
+    const contract = resolveContract(calleeName, registry, node.getArguments().length)
     if (!contract) continue
 
     // Skip calls inside proof() / proof.fn() / requires() / ensures() — already handled by translator
@@ -74,7 +75,10 @@ export function extractCallSiteObligations(
     // For each requires, generate a verification task
     for (const req of contract.requires) {
       if (typeof req === 'string') continue
-      const substituted = substituteExpr(req, mapping)
+      // Method contracts (Decimal.gte etc.) inline to plain comparisons —
+      // without this, a requires like rate.greaterThanOrEqualTo(1) fails
+      // toZ3 and the obligation is silently dropped.
+      const substituted = inlinePureMethodCalls(substituteExpr(req, mapping), registry)
 
       // Create Z3 variables for all identifiers in the substituted expression.
       // Arg idents are typed by the CALLEE's parameter sorts first — an
@@ -251,7 +255,8 @@ export function extractCallSiteObligations(
       }
 
       // Add enclosing function's requires as assumptions
-      for (const reqExpr of enclosingRequires) {
+      for (const rawReqExpr of enclosingRequires) {
+        const reqExpr = inlinePureMethodCalls(rawReqExpr, registry)
         collectAndCreateVars(reqExpr, vars, ctx)
         const reqZ3 = toZ3(reqExpr, vars, ctx)
         if (reqZ3) {
@@ -306,10 +311,15 @@ export function extractCallSiteObligations(
  * Resolves a callee name against the registry: tries the full text first,
  * then the last segment of a dotted name (e.g. `utils.safeAdd` → `safeAdd`).
  */
-function resolveContract(calleeName: string, registry: ContractRegistry) {
+function resolveContract(calleeName: string, registry: ContractRegistry, argCount?: number) {
   if (registry.has(calleeName)) return registry.get(calleeName)
   if (calleeName.includes('.')) {
-    return registry.get(calleeName.slice(calleeName.lastIndexOf('.') + 1))
+    const contract = registry.get(calleeName.slice(calleeName.lastIndexOf('.') + 1))
+    // A method-shaped call matching a free function by name only is accepted
+    // only when the arity agrees — `calculator.total()` must not inherit the
+    // contract of `total(lineItems, taxRate, rules)`.
+    if (contract !== undefined && argCount !== undefined && contract.params.length !== argCount) return undefined
+    return contract
   }
   return undefined
 }
@@ -333,7 +343,7 @@ function instantiateContractCalls(
     switch (e.kind) {
       case 'call': {
         const args = e.args.map(walk)
-        const contract = resolveContract(e.callee, registry)
+        const contract = resolveContract(e.callee, registry, e.args.length)
         if (!contract) {
           return args.some((a, i) => a !== e.args[i]) ? { kind: 'call', callee: e.callee, args } : e
         }
@@ -511,13 +521,19 @@ function matchSortStatement(expr: Node): { name: string; numeric: boolean } | nu
  */
 function collectEnclosingRequires(callNode: Node): Expr[] {
   const requires: Expr[] = []
+  // Parameter names rebound by callbacks BETWEEN the call and an outer
+  // function. An outer requires is only sound inside the callback if it
+  // doesn't mention a rebound name (captured variables are the SAME
+  // variables, so everything else carries over lexically).
+  const shadowed = new Set<string>()
 
   let current: Node | undefined = callNode
   while (current) {
     const parent = current.getParent()
     if (!parent) break
 
-    if (Node.isFunctionDeclaration(parent) || Node.isArrowFunction(parent) || Node.isFunctionExpression(parent)) {
+    if (Node.isFunctionDeclaration(parent) || Node.isArrowFunction(parent) ||
+        Node.isFunctionExpression(parent) || Node.isMethodDeclaration(parent)) {
       const body = (parent as any).getBody()
       if (body && Node.isBlock(body)) {
         for (const stmt of body.getStatements()) {
@@ -530,25 +546,62 @@ function collectEnclosingRequires(callNode: Node): Expr[] {
           if (args.length === 0) continue
           const firstArg = args[0]!
           // Handle arrow-wrapped: requires(({x}) => x > 0)
+          let parsed: Expr | null = null
           if (Node.isArrowFunction(firstArg)) {
             const argBody = (firstArg as any).getBody()
-            if (argBody) {
-              const parsed = parseExpr(argBody as Expression)
-              if (parsed) requires.push(parsed)
-            }
+            if (argBody) parsed = parseExpr(argBody as Expression)
           } else {
-            const parsed = parseExpr(firstArg as Expression)
-            if (parsed) requires.push(parsed)
+            parsed = parseExpr(firstArg as Expression)
           }
+          if (parsed && !mentionsAnyIdent(parsed, shadowed)) requires.push(parsed)
         }
       }
-      break // only collect from the immediate enclosing function
+      // This function's parameters shadow same-named outer bindings for
+      // everything collected above this level — a reduce callback's
+      // (amount, lineItem) must not invalidate the outer taxRate requires,
+      // but an outer requires about `lineItem` would be about a DIFFERENT
+      // variable and is dropped.
+      try {
+        for (const p of (parent as any).getParameters?.() ?? []) {
+          const nameNode = p.getNameNode?.()
+          if (nameNode !== undefined && !Node.isIdentifier(nameNode)) {
+            // Destructuring pattern: every bound identifier shadows
+            for (const id of nameNode.getDescendantsOfKind(SyntaxKind.Identifier)) {
+              shadowed.add(id.getText())
+            }
+          } else {
+            shadowed.add(p.getName())
+          }
+        }
+      } catch { /* parameter reflection is best-effort */ }
+      // Keep walking: a call inside a callback still sits under the outer
+      // function whose requires constrain the captured variables.
     }
 
     current = parent
   }
 
   return requires
+}
+
+/** True if the expression mentions any of the given identifier names
+ *  (including as the root of a member chain). */
+function mentionsAnyIdent(expr: Expr, names: Set<string>): boolean {
+  if (names.size === 0) return false
+  switch (expr.kind) {
+    case 'ident':          return names.has(expr.name) || names.has(expr.name.split('.')[0]!)
+    case 'binary':         return mentionsAnyIdent(expr.left, names) || mentionsAnyIdent(expr.right, names)
+    case 'unary':          return mentionsAnyIdent(expr.operand, names)
+    case 'ternary':        return mentionsAnyIdent(expr.condition, names) || mentionsAnyIdent(expr.then, names) || mentionsAnyIdent(expr.else, names)
+    case 'call':           return expr.args.some(a => mentionsAnyIdent(a, names)) || (expr.recv !== undefined && mentionsAnyIdent(expr.recv, names)) || names.has(expr.callee.split('.')[0]!)
+    case 'member':         return mentionsAnyIdent(expr.object, names)
+    case 'element-access': return mentionsAnyIdent(expr.object, names) || mentionsAnyIdent(expr.index, names)
+    case 'quantifier':     return mentionsAnyIdent(expr.body, names)
+    case 'array':          return expr.elements.some(e => mentionsAnyIdent(e, names))
+    case 'object':         return expr.properties.some(p => mentionsAnyIdent(p.value, names))
+    case 'spread':         return mentionsAnyIdent(expr.operand, names)
+    default:               return false
+  }
 }
 
 /**

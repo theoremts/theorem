@@ -91,21 +91,26 @@ function matchesPattern(name: string, pattern: string): boolean {
  * Looks for index.contracts.ts or theorem.contracts.ts in each.
  */
 function autoDiscoverContracts(cwd: string, out: string[]): void {
-  const nmDir = join(cwd, 'node_modules', '@theorem-contracts')
-  try {
-    const packages = readdirSync(nmDir)
-    for (const pkg of packages) {
-      const pkgDir = join(nmDir, pkg)
-      for (const filename of ['index.contracts.ts', 'theorem.contracts.ts']) {
-        const contractFile = join(pkgDir, filename)
-        try {
-          if (statSync(contractFile).isFile()) {
-            out.push(contractFile)
-          }
-        } catch { /* skip */ }
+  // Both historical scopes ship contract packages: @theorem-contracts/* and
+  // @theoremts/contracts-* (e.g. @theoremts/contracts-decimal).
+  for (const scope of ['@theorem-contracts', '@theoremts']) {
+    const nmDir = join(cwd, 'node_modules', scope)
+    try {
+      const packages = readdirSync(nmDir)
+      for (const pkg of packages) {
+        if (scope === '@theoremts' && !pkg.startsWith('contracts-')) continue
+        const pkgDir = join(nmDir, pkg)
+        for (const filename of ['index.contracts.ts', 'theorem.contracts.ts']) {
+          const contractFile = join(pkgDir, filename)
+          try {
+            if (statSync(contractFile).isFile()) {
+              out.push(contractFile)
+            }
+          } catch { /* skip */ }
+        }
       }
-    }
-  } catch { /* @theorem-contracts not installed — skip */ }
+    } catch { /* scope not installed — skip */ }
+  }
 }
 
 /**

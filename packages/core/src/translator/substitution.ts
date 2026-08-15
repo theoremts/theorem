@@ -67,8 +67,9 @@ export function simplifyExpr(expr: Expr): Expr {
 
     case 'call': {
       const args = expr.args.map(a => simplifyExpr(a))
-      const changed = args.some((a, i) => a !== expr.args[i])
-      return changed ? { ...expr, args } : expr
+      const recv = expr.recv !== undefined ? simplifyExpr(expr.recv) : undefined
+      const changed = args.some((a, i) => a !== expr.args[i]) || recv !== expr.recv
+      return changed ? { ...expr, args, ...(recv !== undefined ? { recv } : {}) } : expr
     }
 
     default:
@@ -85,7 +86,11 @@ export function substituteOutput(expr: Expr, replacement: Expr): Expr {
   switch (expr.kind) {
     case 'call':
       if (expr.callee === 'output' && expr.args.length === 0) return replacement
-      return { ...expr, args: expr.args.map(a => substituteOutput(a, replacement)) }
+      return {
+        ...expr,
+        args: expr.args.map(a => substituteOutput(a, replacement)),
+        ...(expr.recv !== undefined ? { recv: substituteOutput(expr.recv, replacement) } : {}),
+      }
     case 'binary':
       return { ...expr, left: substituteOutput(expr.left, replacement), right: substituteOutput(expr.right, replacement) }
     case 'unary':
@@ -130,8 +135,9 @@ function substituteRaw(expr: Expr, mapping: Map<string, Expr>): Expr {
 
     case 'call': {
       const args = expr.args.map(a => substituteExpr(a, mapping))
-      const changed = args.some((a, i) => a !== expr.args[i])
-      return changed ? { ...expr, args } : expr
+      const recv = expr.recv !== undefined ? substituteExpr(expr.recv, mapping) : undefined
+      const changed = args.some((a, i) => a !== expr.args[i]) || recv !== expr.recv
+      return changed ? { ...expr, args, ...(recv !== undefined ? { recv } : {}) } : expr
     }
 
     case 'ternary': {

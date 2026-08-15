@@ -65,6 +65,43 @@ async function main(): Promise<void> {
       }
       walk(contractsDir)
     } catch { /* no contracts dir */ }
+
+    // Auto-discovery, mirroring the CLI: contract packages in node_modules
+    // (@theoremts/contracts-*, @theorem-contracts/*) and local *.contracts.ts
+    // under src/ — the editor must see the same registry `theorem verify` does.
+    try {
+      const { readFileSync, statSync, readdirSync } = await import('fs')
+      const { join, dirname } = await import('path')
+      const projectRoot = dirname(dirname(contractsDir))  // <root>/.theorem/contracts
+      const tryLoad = (p: string): void => {
+        try {
+          if (statSync(p).isFile()) externalIRs.push(...core.extractDeclareContracts(readFileSync(p, 'utf-8'), p))
+        } catch { /* skip */ }
+      }
+      for (const scope of ['@theoremts', '@theorem-contracts']) {
+        const scopeDir = join(projectRoot, 'node_modules', scope)
+        try {
+          for (const pkg of readdirSync(scopeDir)) {
+            if (scope === '@theoremts' && !pkg.startsWith('contracts-')) continue
+            tryLoad(join(scopeDir, pkg, 'index.contracts.ts'))
+            tryLoad(join(scopeDir, pkg, 'theorem.contracts.ts'))
+          }
+        } catch { /* scope not installed */ }
+      }
+      const walkSrc = (dir: string, depth: number): void => {
+        if (depth > 6) return
+        for (const entry of readdirSync(dir)) {
+          if (entry === 'node_modules' || entry.startsWith('.')) continue
+          const p = join(dir, entry)
+          try {
+            const stat = statSync(p)
+            if (stat.isFile() && p.endsWith('.contracts.ts')) tryLoad(p)
+            else if (stat.isDirectory()) walkSrc(p, depth + 1)
+          } catch { /* skip */ }
+        }
+      }
+      try { walkSrc(join(projectRoot, 'src'), 0) } catch { /* no src dir */ }
+    } catch { /* discovery is best-effort */ }
   }
 
   const registry = core.buildRegistry(irList)
