@@ -22,7 +22,7 @@ async function getConfig(): Promise<ResolvedConfig> {
 const program = new Command()
   .name('theorem')
   .description('Formal verification for TypeScript')
-  .version('0.7.0')
+  .version('0.8.0')
 
 program
   .command('verify <paths...>')
