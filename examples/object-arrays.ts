@@ -24,10 +24,19 @@ export function payBonusUnsafe(users: Account[], bonus: number): void {
   users[1]!.balance = users[1]!.balance + bonus
 }
 
-// ✓ PROVED — with distinct slots both ensures hold.
+// ✓ PROVED — with distinct slots both ensures hold. The forall requires
+// makes every CALLER prove that no account arrives with a negative balance.
+//
+// The per-slot ensures are this file's ALIASING TRIPWIRE: they promise each
+// slot grew by exactly `bonus`. payBonusUnsafe has the same body without the
+// distinctness requires — and it is THESE ensures that refute it (aliased,
+// both writes land on one cell: old + 2*bonus). Delete them and the aliasing
+// bug becomes unobservable. A forall version would be WRONG here — elements
+// 2..n receive nothing.
 export function payBonusSafe(users: Account[], bonus: number): void {
   requires(users.length >= 2)
   requires(users[0]! !== users[1]!)
+  requires(forall(users, (u) => u.balance >= 0))
   requires(positive(bonus))
   ensures(users[0]!.balance === old(users[0]!.balance) + bonus)
   ensures(users[1]!.balance === old(users[1]!.balance) + bonus)
@@ -46,11 +55,11 @@ export function creditAll(users: Account[], bonus: number, n: number): void {
   ensures(forall(users, (u) => u.balance >= 0))
 
   let k = 0
-  while (k < n) {
-    invariant(() => forall(users, (u) => u.balance >= 0))
-    decreases(() => n - k)
 
-    users[k]!.balance = users[k]!.balance + bonus
+  while (k < n) {
+    // invariant(() => forall(users, (u) => u.balance >= 0))
+    decreases(() => n - k)
+    users[k].balance = users[k].balance + bonus
     k = k + 1
   }
 }
@@ -82,18 +91,21 @@ export function debitAll(users: Account[], fee: number, n: number): void {
 export function quarterlyBonus(users: Account[], amount: number): void {
   requires(users.length >= 2)
   requires(users[0]! !== users[1]!)
+  requires(forall(users, (u) => u.balance >= 0))
   requires(positive(amount))
 
   payBonusSafe(users, amount * 3)
 }
 
-// ✓ PROVED — an array LITERAL establishes structural facts: exact length,
-// and object literals are fresh, pairwise-DISTINCT references. Both of
-// payBonusSafe's array requires follow with no requires of our own.
+// ✗ DISPROVED — an array LITERAL establishes structural facts: exact
+// length, fresh pairwise-DISTINCT references, and each element's FIELD
+// values. Length and distinctness follow — but balance -100 violates
+// payBonusSafe's forall(users, (u) => u.balance >= 0).
+// Change -100 to any non-negative value and everything proves.
 export function quarterlyBonusFresh(amount: number): void {
   requires(positive(amount))
 
-  let users: Account[] = [{ balance: 100 }, { balance: 200 }]
+  let users: Account[] = [{ balance: 100 }, { balance: -100 }]
 
   payBonusSafe(users, amount)
 }

@@ -24,6 +24,7 @@ import { check } from '../solver/index.js'
 export type RiskLevel = 'critical' | 'high' | 'low'
 
 export type RiskKind =
+  | 'nan-propagation'
   | 'division-by-zero'
   | 'modulo-by-zero'
   | 'negative-sqrt'
@@ -180,6 +181,46 @@ function collectCandidates(file: SourceFile): RawCandidate[] {
       line: node.getStartLineNumber(),
       pathConditions: collectPathConditions(node),
       zodAssumptions: collectZodAssumptions(node),
+    })
+  }
+
+  // ── NaN propagation: parseFloat/parseInt/Number results used without an
+  //    isNaN guard. parseFloat('garbage') is NaN, and NaN silently poisons
+  //    every arithmetic expression it touches (NaN > x is false, NaN + x is
+  //    NaN) — the classic silently-wrong-score bug. ─────────────────────────
+  for (const node of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const callee = node.getExpression().getText()
+    if (callee !== 'parseFloat' && callee !== 'parseInt' && callee !== 'Number') continue
+    // Number literals / obviously-numeric arguments can't produce NaN
+    const arg = node.getArguments()[0]
+    if (arg === undefined || Node.isNumericLiteral(arg)) continue
+
+    // Guarded? Look for isNaN / Number.isNaN over the result's variable in
+    // the enclosing function
+    const enclosing = node.getFirstAncestor(a =>
+      Node.isFunctionDeclaration(a) || Node.isArrowFunction(a) || Node.isMethodDeclaration(a))
+    let varName: string | null = null
+    const parent = node.getParent()
+    if (parent !== undefined && Node.isVariableDeclaration(parent)) varName = parent.getName()
+    const guarded = enclosing !== undefined && varName !== null
+      && enclosing.getDescendantsOfKind(SyntaxKind.CallExpression).some(c => {
+        const t = c.getExpression().getText()
+        return (t === 'isNaN' || t === 'Number.isNaN')
+          && c.getArguments()[0]?.getText() === varName
+      })
+    if (guarded) continue
+
+    const { functionName, params } = enclosingFnInfo(node)
+    out.push({
+      functionName,
+      params,
+      kind: 'nan-propagation',
+      level: 'low',
+      description: `${callee}(${node.getArguments()[0]?.getText().trim() ?? ''}) — result may be NaN and is never isNaN-checked`,
+      trigger: null,
+      line: node.getStartLineNumber(),
+      pathConditions: [],
+      zodAssumptions: [],
     })
   }
 
@@ -703,6 +744,7 @@ function riskCondition(
     case 'null-access':           return null  // pattern-only, no Z3
     case 'empty-array-reduce':    return null  // pattern-only, no Z3
     case 'integer-overflow':      return null  // pattern-only, no Z3
+    case 'nan-propagation':       return null  // pattern-only, no Z3
   }
 }
 

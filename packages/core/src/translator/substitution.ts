@@ -25,7 +25,7 @@ export function simplifyExpr(expr: Expr): Expr {
           return simplifyExpr(obj.elements[i]!)
         }
       }
-      return obj === expr.object && idx === expr.index ? expr : { kind: 'element-access', object: obj, index: idx }
+      return obj === expr.object && idx === expr.index ? expr : { ...expr, object: obj, index: idx }
     }
 
     case 'member': {
@@ -39,13 +39,13 @@ export function simplifyExpr(expr: Expr): Expr {
       if (obj.kind === 'array' && expr.property === 'length') {
         return { kind: 'literal', value: obj.elements.length }
       }
-      return obj === expr.object ? expr : { kind: 'member', object: obj, property: expr.property }
+      return obj === expr.object ? expr : { ...expr, object: obj }
     }
 
     case 'binary': {
       const left = simplifyExpr(expr.left)
       const right = simplifyExpr(expr.right)
-      return left === expr.left && right === expr.right ? expr : { kind: 'binary', op: expr.op, left, right }
+      return left === expr.left && right === expr.right ? expr : { ...expr, left, right }
     }
 
     case 'unary': {
@@ -54,7 +54,7 @@ export function simplifyExpr(expr: Expr): Expr {
       if (expr.op === '-' && operand.kind === 'literal' && typeof operand.value === 'number') {
         return { kind: 'literal', value: -operand.value }
       }
-      return operand === expr.operand ? expr : { kind: 'unary', op: expr.op, operand }
+      return operand === expr.operand ? expr : { ...expr, operand }
     }
 
     case 'ternary': {
@@ -62,13 +62,13 @@ export function simplifyExpr(expr: Expr): Expr {
       const then = simplifyExpr(expr.then)
       const els = simplifyExpr(expr.else)
       return cond === expr.condition && then === expr.then && els === expr.else
-        ? expr : { kind: 'ternary', condition: cond, then, else: els }
+        ? expr : { ...expr, condition: cond, then, else: els }
     }
 
     case 'call': {
       const args = expr.args.map(a => simplifyExpr(a))
       const changed = args.some((a, i) => a !== expr.args[i])
-      return changed ? { kind: 'call', callee: expr.callee, args } : expr
+      return changed ? { ...expr, args } : expr
     }
 
     default:
@@ -85,17 +85,17 @@ export function substituteOutput(expr: Expr, replacement: Expr): Expr {
   switch (expr.kind) {
     case 'call':
       if (expr.callee === 'output' && expr.args.length === 0) return replacement
-      return { kind: 'call', callee: expr.callee, args: expr.args.map(a => substituteOutput(a, replacement)) }
+      return { ...expr, args: expr.args.map(a => substituteOutput(a, replacement)) }
     case 'binary':
-      return { kind: 'binary', op: expr.op, left: substituteOutput(expr.left, replacement), right: substituteOutput(expr.right, replacement) }
+      return { ...expr, left: substituteOutput(expr.left, replacement), right: substituteOutput(expr.right, replacement) }
     case 'unary':
-      return { kind: 'unary', op: expr.op, operand: substituteOutput(expr.operand, replacement) }
+      return { ...expr, operand: substituteOutput(expr.operand, replacement) }
     case 'ternary':
-      return { kind: 'ternary', condition: substituteOutput(expr.condition, replacement), then: substituteOutput(expr.then, replacement), else: substituteOutput(expr.else, replacement) }
+      return { ...expr, condition: substituteOutput(expr.condition, replacement), then: substituteOutput(expr.then, replacement), else: substituteOutput(expr.else, replacement) }
     case 'member':
-      return { kind: 'member', object: substituteOutput(expr.object, replacement), property: expr.property }
+      return { ...expr, object: substituteOutput(expr.object, replacement) }
     case 'element-access':
-      return { kind: 'element-access', object: substituteOutput(expr.object, replacement), index: substituteOutput(expr.index, replacement) }
+      return { ...expr, object: substituteOutput(expr.object, replacement), index: substituteOutput(expr.index, replacement) }
     default:
       return expr
   }
@@ -108,30 +108,30 @@ function substituteRaw(expr: Expr, mapping: Map<string, Expr>): Expr {
 
     case 'member': {
       const obj = substituteExpr(expr.object, mapping)
-      return obj === expr.object ? expr : { kind: 'member', object: obj, property: expr.property }
+      return obj === expr.object ? expr : { ...expr, object: obj }
     }
 
     case 'element-access': {
       const obj = substituteExpr(expr.object, mapping)
       const idx = substituteExpr(expr.index, mapping)
-      return obj === expr.object && idx === expr.index ? expr : { kind: 'element-access', object: obj, index: idx }
+      return obj === expr.object && idx === expr.index ? expr : { ...expr, object: obj, index: idx }
     }
 
     case 'unary': {
       const operand = substituteExpr(expr.operand, mapping)
-      return operand === expr.operand ? expr : { kind: 'unary', op: expr.op, operand }
+      return operand === expr.operand ? expr : { ...expr, operand }
     }
 
     case 'binary': {
       const left  = substituteExpr(expr.left, mapping)
       const right = substituteExpr(expr.right, mapping)
-      return left === expr.left && right === expr.right ? expr : { kind: 'binary', op: expr.op, left, right }
+      return left === expr.left && right === expr.right ? expr : { ...expr, left, right }
     }
 
     case 'call': {
       const args = expr.args.map(a => substituteExpr(a, mapping))
       const changed = args.some((a, i) => a !== expr.args[i])
-      return changed ? { kind: 'call', callee: expr.callee, args } : expr
+      return changed ? { ...expr, args } : expr
     }
 
     case 'ternary': {
@@ -139,19 +139,19 @@ function substituteRaw(expr: Expr, mapping: Map<string, Expr>): Expr {
       const then      = substituteExpr(expr.then, mapping)
       const els       = substituteExpr(expr.else, mapping)
       return condition === expr.condition && then === expr.then && els === expr.else
-        ? expr : { kind: 'ternary', condition, then, else: els }
+        ? expr : { ...expr, condition, then, else: els }
     }
 
     case 'quantifier': {
       const inner = mapping.has(expr.param) ? new Map(mapping) : mapping
       if (inner !== mapping) inner.delete(expr.param)
       const body = substituteExpr(expr.body, inner)
-      return body === expr.body ? expr : { kind: 'quantifier', quantifier: expr.quantifier, param: expr.param, sort: expr.sort, body }
+      return body === expr.body ? expr : { ...expr, body }
     }
 
     case 'array': {
       const elements = expr.elements.map(e => substituteExpr(e, mapping))
-      return elements.some((e, i) => e !== expr.elements[i]) ? { kind: 'array', elements } : expr
+      return elements.some((e, i) => e !== expr.elements[i]) ? { ...expr, elements } : expr
     }
 
     case 'object': {

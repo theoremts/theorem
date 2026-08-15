@@ -14,6 +14,7 @@ import {
 import type { BodyStep, Contract, Expr, FunctionIR, HeapStep, LoopInfo, Param, Predicate, Sort } from './ir.js'
 import { parseExpr, parseBlockToExpr, parseBlockWithLoops, parseStmtListDirect, getResolvedPositionalContracts, getFinalSSABindings } from './expr.js'
 import { substituteExpr } from '../translator/substitution.js'
+import { prettyExpr } from './pretty.js'
 import {
   extractZodContracts,
   extractSchemaInvariantsFromFile,
@@ -349,13 +350,26 @@ function tryExtractProofFn(call: CallExpression): FunctionIR | null {
   const thunkBody = (thunk as ArrowFunction).getBody()
   let body: FunctionIR['body']
   let loops: LoopInfo[] | undefined
+  let heapSteps: HeapStep[] | undefined
+  let heapRoots: string[] | undefined
 
   if (Node.isExpression(thunkBody)) {
     body = parseExpr(thunkBody) ?? undefined
   } else if (Node.isBlock(thunkBody)) {
-    const result = parseBlockWithLoops(thunkBody)
-    body = result.body ?? undefined
-    loops = result.loops.length > 0 ? result.loops : undefined
+    // Loops route through the honest havoc machinery — the legacy loop path
+    // cannot re-execute the body and is vacuity-prone with old().
+    if (thunkBody.getDescendantsOfKind(SyntaxKind.WhileStatement).length > 0) {
+      const steps = extractHeapStmtList(thunkBody.getStatements(), 'top')
+      if (steps !== null && steps.some(st => st.kind === 'loop')) {
+        heapSteps = steps
+        heapRoots = collectAllHeapRoots(steps, contracts)
+      }
+    }
+    if (heapSteps === undefined) {
+      const result = parseBlockWithLoops(thunkBody)
+      body = result.body ?? undefined
+      loops = result.loops.length > 0 ? result.loops : undefined
+    }
   }
 
   return {
@@ -365,6 +379,8 @@ function tryExtractProofFn(call: CallExpression): FunctionIR | null {
     body,
     contracts,
     loops,
+    heapSteps,
+    heapRoots,
   }
 }
 
@@ -916,8 +932,42 @@ function tryExtractHeapSteps(
   const extracted = extractHeapStmtList(stmts, 'top')
   if (extracted === null || !hasFieldWrite(extracted)) return { unsupported: allWrites }
   const steps = extracted
+  mergeLoopContracts(steps, contracts)
 
   return { steps, roots: collectAllHeapRoots(steps, contracts) }
+}
+
+/**
+ * Inline `invariant()`/`decreases()` statements are consumed by the
+ * contract scan BEFORE heap extraction sees the statement list (they parse
+ * as contracts, not code). Reattach them to the loops here: loop(N)-indexed
+ * contracts go to the Nth loop; unindexed ones to the single loop when the
+ * function has exactly one.
+ */
+function mergeLoopContracts(steps: HeapStep[], contracts: Contract[]): void {
+  const loops: Array<Extract<HeapStep, { kind: 'loop' }>> = []
+  const collect = (list: HeapStep[]): void => {
+    for (const st of list) {
+      if (st.kind === 'loop') { loops.push(st); collect(st.body) }
+      else if (st.kind === 'branch') { collect(st.then); collect(st.else) }
+    }
+  }
+  collect(steps)
+  if (loops.length === 0) return
+  for (const c of contracts) {
+    if (c.kind === 'invariant' && typeof c.predicate === 'object' && c.predicate !== null) {
+      const target = c.loopIndex !== undefined ? loops[c.loopIndex] : (loops.length === 1 ? loops[0] : undefined)
+      if (target !== undefined && !target.invariants.some(inv => prettyExpr(inv) === prettyExpr(c.predicate as Expr))) {
+        target.invariants.push(c.predicate as Expr)
+      }
+    }
+    if (c.kind === 'decreases') {
+      const target = c.loopIndex !== undefined ? loops[c.loopIndex] : (loops.length === 1 ? loops[0] : undefined)
+      if (target !== undefined && target.decreases === undefined) {
+        target.decreases = c.expression
+      }
+    }
+  }
 }
 
 /** Roots: write bases + member objects + idents ref-compared against them. */
@@ -945,6 +995,30 @@ function extractHeapStmtList(stmts: Statement[], context: 'top' | 'loop' | 'bran
   const topLevel = context === 'top'
   const steps: HeapStep[] = []
 
+  // invariant()/decreases() statements directly BEFORE a while attach to it
+  // (Dafny-style loop header) — same semantics as writing them inside the
+  // body. Any other statement in between resets the pending block.
+  let pendingInvariants: Expr[] = []
+  let pendingDecreases: Expr | undefined
+
+  const tryPendingLoopContract = (expr: Expression): boolean => {
+    if (!Node.isCallExpression(expr)) return false
+    const callee = expr.getExpression().getText()
+    if (callee !== 'invariant' && callee !== 'decreases') return false
+    const arg = expr.getArguments()[0]
+    let pred: Expr | null = null
+    if (arg !== undefined && Node.isArrowFunction(arg)) {
+      const body = arg.getBody()
+      if (Node.isExpression(body)) pred = parseExpr(body as Expression)
+    } else if (arg !== undefined) {
+      pred = parseExpr(arg as Expression)
+    }
+    if (pred === null) return false
+    if (callee === 'invariant') pendingInvariants.push(pred)
+    else pendingDecreases = pred
+    return true
+  }
+
   for (const s of stmts) {
     if (Node.isReturnStatement(s)) {
       const returned = s.getExpression()
@@ -961,6 +1035,7 @@ function extractHeapStmtList(stmts: Statement[], context: 'top' | 'loop' | 'bran
 
     if (Node.isExpressionStatement(s)) {
       const expr = s.getExpression()
+      if (tryPendingLoopContract(expr)) continue
       if (Node.isCallExpression(expr)) {
         const sort = matchSortCall(expr)
         if (sort !== null) {
@@ -1038,15 +1113,17 @@ function extractHeapStmtList(stmts: Statement[], context: 'top' | 'loop' | 'bran
     }
 
     if (Node.isVariableStatement(s)) {
-      if (context === 'branch') return null  // branch-local consts: deferred
       const isConst = String(s.getDeclarationKind()) === 'const'
+      // Branch scope: only immutable bindings (a mutable let would need
+      // path-conditioned merging)
+      if (context === 'branch' && !isConst) return null
       for (const decl of s.getDeclarations()) {
         const init = decl.getInitializer()
         if (!init) return null
         if (Node.isIdentifier(init)) {
-          // Loop-body scope: alias resolution is static and scans only
+          // Non-top scope: alias resolution is static and scans only
           // top-level steps — bind as a local value instead
-          steps.push(context === 'loop'
+          steps.push(context !== 'top'
             ? { kind: 'local', name: decl.getName(), value: { kind: 'ident', name: init.getText() } }
             : { kind: 'alias', name: decl.getName(), of: init.getText() })
           continue
@@ -1122,7 +1199,15 @@ function extractHeapStmtList(stmts: Statement[], context: 'top' | 'loop' | 'bran
       // Zero invariants is allowed: the havoc machinery then knows nothing
       // after the loop except ¬condition — honest, and it lets Spacer-based
       // invariant INFERENCE see the loop's transition system.
-      steps.push({ kind: 'loop', condition, invariants, decreases: decreasesExpr, body })
+      steps.push({
+        kind: 'loop',
+        condition,
+        invariants: [...pendingInvariants, ...invariants],
+        decreases: decreasesExpr ?? pendingDecreases,
+        body,
+      })
+      pendingInvariants = []
+      pendingDecreases = undefined
       continue
     }
 
@@ -1318,6 +1403,30 @@ function writeBase(left: Expression): string | null {
   return null
 }
 
+/**
+ * Conditions of the if-statements enclosing `node` up to `stop`, negated
+ * for else-branch membership. Empty for top-level statements.
+ */
+function enclosingIfConditions(node: Node, stop: Node): Expr[] {
+  const out: Expr[] = []
+  let current: Node | undefined = node
+  while (current !== undefined && current !== stop) {
+    const parent: Node | undefined = current.getParent()
+    if (parent !== undefined && Node.isIfStatement(parent)) {
+      const cond = parseExpr(parent.getExpression() as Expression)
+      if (cond !== null) {
+        const inElse = parent.getElseStatement() !== undefined
+          && (current === parent.getElseStatement()
+              || parent.getElseStatement()!.containsRange?.(current.getPos(), current.getEnd()) === true
+              || (current.getPos() >= parent.getElseStatement()!.getPos()))
+        out.unshift(inElse ? { kind: 'unary', op: '!', operand: cond } : cond)
+      }
+    }
+    current = parent
+  }
+  return out
+}
+
 function memberChainBase(node: Expression): string | null {
   let current: Node = node
   while (Node.isPropertyAccessExpression(current)) {
@@ -1400,6 +1509,14 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
     }
     contracts.unshift(...schemaAssumes)
   } catch { /* schema extraction is best-effort */ }
+
+  // Branch-nested unreachable(): reachable = violation, with the guarding
+  // path conditions as the goal (top-level unreachable() is positional).
+  for (const call of fnBody.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (call.getExpression().getText() !== 'unreachable') continue
+    const conditions = enclosingIfConditions(call, fnBody)
+    if (conditions.length > 0) contracts.push({ kind: 'unreachable', conditions })
+  }
 
   if (contracts.length === 0) return null
 
@@ -1503,6 +1620,14 @@ function tryExtractInlineArrow(fn: ArrowFunction, name: string): FunctionIR | nu
     }
     contracts.unshift(...schemaAssumes)
   } catch { /* schema extraction is best-effort */ }
+
+  // Branch-nested unreachable(): reachable = violation, with the guarding
+  // path conditions as the goal (top-level unreachable() is positional).
+  for (const call of fnBody.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (call.getExpression().getText() !== 'unreachable') continue
+    const conditions = enclosingIfConditions(call, fnBody)
+    if (conditions.length > 0) contracts.push({ kind: 'unreachable', conditions })
+  }
 
   if (contracts.length === 0) return null
 

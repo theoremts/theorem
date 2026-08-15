@@ -14,10 +14,19 @@ export function prettyExpr(expr: Expr): string {
       if (expr.op === 'typeof') return `typeof ${prettyExpr(expr.operand)}`
       if (expr.op === '-') return `-${prettyExpr(expr.operand)}`
       return `!${prettyExpr(expr.operand)}`
-    case 'call':    return `${expr.callee}(${expr.args.map(prettyExpr).join(', ')})`
+    case 'call':
+      // __reTest(s, pattern, flags) prints as its source form
+      if (expr.callee === '__reTest' && expr.args.length === 3
+          && expr.args[1]!.kind === 'literal' && expr.args[2]!.kind === 'literal') {
+        return `/${String((expr.args[1] as { value: unknown }).value)}/${String((expr.args[2] as { value: unknown }).value)}.test(${prettyExpr(expr.args[0]!)})`
+      }
+      return `${expr.callee}(${expr.args.map(prettyExpr).join(', ')})`
     case 'ternary':
       return `${prettyExpr(expr.condition)} ? ${prettyExpr(expr.then)} : ${prettyExpr(expr.else)}`
     case 'quantifier':
+      // Desugared forms (sorted(arr), forall(arr, (x, i) => ...)) carry the
+      // ORIGINAL source text — solver-internal bound names are unreadable
+      if (expr.display !== undefined) return expr.display
       return `${expr.quantifier}(${expr.param} => ${prettyExpr(expr.body)})`
     case 'array':
       return `[${expr.elements.map(prettyExpr).join(', ')}]`

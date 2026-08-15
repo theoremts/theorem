@@ -175,6 +175,7 @@ const loopFactorialSource = `
       }
       return result
     },
+    requires(({ n }) => Number.isInteger(n)),
     requires(({ n }) => n >= 0),
     ensures(({ result }) => result > 0),
     )
@@ -196,11 +197,11 @@ describe('loop invariant: tasks are generated', () => {
     const results = await verifyAll(loopFactorialSource)
     // We expect: 2 invariant init + 2 invariant preservation + 1 termination + 1 ensures = 6
     assert.ok(results.length >= 4, `Expected at least 4 tasks but got ${results.length}`)
-    const initTasks = results.filter(r => r.text.includes('loop invariant init'))
-    assert.ok(initTasks.length >= 2, 'Expected at least 2 init tasks')
-    const preserveTasks = results.filter(r => r.text.includes('loop invariant preservation'))
+    const initTasks = results.filter(r => r.text.includes('loop invariant (entry)'))
+    assert.ok(initTasks.length >= 2, 'Expected at least 2 entry tasks')
+    const preserveTasks = results.filter(r => r.text.includes('loop invariant (preserved)'))
     assert.ok(preserveTasks.length >= 2, 'Expected at least 2 preservation tasks')
-    const termTasks = results.filter(r => r.text.includes('loop termination'))
+    const termTasks = results.filter(r => r.text.includes('loop bound') || r.text.includes('loop decrease'))
     assert.ok(termTasks.length >= 1, 'Expected at least 1 termination task')
   })
 })

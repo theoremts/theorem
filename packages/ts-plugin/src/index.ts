@@ -18,6 +18,9 @@ const CHILD_TIMEOUT_MS = 60_000
 interface CachedDiagnostics {
   sourceHash: string
   diagnostics: tslib.Diagnostic[]
+  /** Element accesses whose bounds Theorem PROVED — tsc's possibly-undefined
+   *  errors at these spots are suppressed (proof beats assertion). */
+  suppressions: Array<{ line: number; exprText: string }>
 }
 
 interface ChildFailure {
@@ -26,6 +29,11 @@ interface ChildFailure {
   length: number
   code: number
   severity: 'error' | 'warning'
+}
+
+interface ChildOutput {
+  failures: ChildFailure[]
+  suppressions?: Array<{ line: number; exprText: string }>
 }
 
 // ---------------------------------------------------------------------------
@@ -138,16 +146,18 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
         if (pendingVersions.get(fileName) !== hash) return
 
         let failures: ChildFailure[]
+        let suppressions: Array<{ line: number; exprText: string }>
         try {
-          const parsed = JSON.parse(Buffer.concat(stdoutChunks).toString('utf-8')) as { failures: ChildFailure[] }
+          const parsed = JSON.parse(Buffer.concat(stdoutChunks).toString('utf-8')) as ChildOutput
           failures = parsed.failures
+          suppressions = parsed.suppressions ?? []
         } catch (err) {
           log(`failed to parse verifier output for ${fileName}: ${err}`)
           return
         }
 
         const diagnostics = failures.map(f => toDiagnostic(f))
-        cache.set(fileName, { sourceHash: hash, diagnostics })
+        cache.set(fileName, { sourceHash: hash, diagnostics, suppressions })
         pendingVersions.delete(fileName)
         refreshDiags()
         dumpDebug(fileName, source, hash, failures)
@@ -195,6 +205,37 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
     // -------------------------------------------------------------------
     // Diagnostic conversion / refresh
     // -------------------------------------------------------------------
+
+    // tsc's possibly-undefined family: 2532 "Object is possibly 'undefined'",
+    // 18048 "'x' is possibly 'undefined'", 18047 possibly 'null'. When
+    // Theorem PROVED the index in bounds for that exact access, the error is
+    // refuted by theorem — suppress it. Anything unproven passes through.
+    const SUPPRESSIBLE = new Set([2532, 18048, 18047])
+
+    function filterProvenBounds(
+      diags: tslib.Diagnostic[],
+      suppressions: Array<{ line: number; exprText: string }>,
+      src: string,
+    ): tslib.Diagnostic[] {
+      if (suppressions.length === 0) return diags
+      const lineStarts: number[] = [0]
+      for (let i = 0; i < src.length; i++) if (src[i] === '\n') lineStarts.push(i + 1)
+      const lineOf = (offset: number): number => {
+        let lo = 0, hi = lineStarts.length - 1
+        while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid]! <= offset) lo = mid; else hi = mid - 1 }
+        return lo + 1
+      }
+      return diags.filter(d => {
+        if (d.code === undefined || !SUPPRESSIBLE.has(d.code) || d.start === undefined) return true
+        const diagLine = lineOf(d.start)
+        const lineEnd = src.indexOf('\n', lineStarts[diagLine - 1]!)
+        const lineText = src.slice(lineStarts[diagLine - 1]!, lineEnd === -1 ? src.length : lineEnd)
+        const hit = suppressions.some(sp =>
+          sp.line === diagLine && lineText.includes(sp.exprText.split('[')[0]!))
+        if (hit) log(`suppressed tsc ${d.code} at line ${diagLine} — bounds proved by theorem`)
+        return !hit
+      })
+    }
 
     function toDiagnostic(failure: ChildFailure): tslib.Diagnostic {
       return {
@@ -263,7 +304,8 @@ function init(modules: { typescript: typeof tslib }): tslib.server.PluginModule 
       const cached = cache.get(fileName)
       if (cached && cached.sourceHash === hash) {
         const rebound = cached.diagnostics.map(d => ({ ...d, file: sourceFile }))
-        return [...original, ...rebound]
+        const filtered = filterProvenBounds(original, cached.suppressions, source)
+        return [...filtered, ...rebound]
       }
 
       // Schedule verification (debounced, in a child process)

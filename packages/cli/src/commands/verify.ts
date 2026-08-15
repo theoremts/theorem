@@ -215,14 +215,16 @@ async function verifyFile(
       // error branch is normal — only proved dead branches are worth showing.
       if (task.informational && result.status !== 'proved') continue
 
-      // Counterexample → regression test material
+      // Counterexample → regression test material. Heap-mode tasks carry the
+      // initial field values in the trace — merged in so the object graph is
+      // reconstructible (roots sharing a ref = the same object).
       if (opts.genTests && result.status === 'disproved' && ir.name !== undefined) {
         regressionEntries.push({
           sourcePath: absPath,
           functionName: ir.name,
           params: ir.params.map(p => p.name),
           contractText: task.contractText,
-          counterexample: result.counterexample ?? {},
+          counterexample: { ...(result.trace ?? {}), ...(result.counterexample ?? {}) },
         })
       }
 

@@ -219,7 +219,7 @@ describe('sort: havoc + trusted sortedness', () => {
         data.sort((a, b) => a - b)
       }
     `)
-    const ens = results.find(r => r.text.includes('<='))
+    const ens = results.find(r => r.text.includes('sorted('))
     assert.ok(ens, 'Expected the sorted ensures task')
     assert.strictEqual(ens.status, 'proved')
   })
@@ -231,7 +231,7 @@ describe('sort: havoc + trusted sortedness', () => {
         data.sort()
       }
     `)
-    const ens = results.find(r => r.text.includes('<='))
+    const ens = results.find(r => r.text.includes('sorted('))
     assert.ok(ens, 'Expected the sorted ensures task')
     assert.strictEqual(ens.status, 'disproved')
   })
@@ -291,6 +291,82 @@ describe('sort: havoc + trusted sortedness', () => {
 // ---------------------------------------------------------------------------
 
 describe('call sites: array-literal facts', () => {
+  test('ident elements bound to fresh literals count as distinct allocations', async () => {
+    const ctx = await getContext()
+    const source = `
+      interface Account { balance: number }
+      export function payBonusSafe(users: Account[], bonus: number): void {
+        requires(users.length >= 2)
+        requires(users[0]! !== users[1]!)
+        requires(positive(bonus))
+        users[0]!.balance = users[0]!.balance + bonus
+        users[1]!.balance = users[1]!.balance + bonus
+      }
+      export function caller(amount: number): void {
+        requires(positive(amount))
+        var a = { balance: 100 }
+        let users: Account[] = [a, { balance: 200 }]
+        payBonusSafe(users, amount)
+      }
+    `
+    const registry = buildRegistry(extractFromSource(source))
+    const tasks = extractCallSiteObligations(source, 'test.ts', registry, ctx)
+    for (const t of tasks) {
+      const r = await check(t)
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${t.contractText}`)
+    }
+  })
+
+  test('the SAME ident twice is the same object — distinctness refuted', async () => {
+    const ctx = await getContext()
+    const source = `
+      interface Account { balance: number }
+      export function payBonusSafe(users: Account[], bonus: number): void {
+        requires(users.length >= 2)
+        requires(users[0]! !== users[1]!)
+        users[0]!.balance = users[0]!.balance + bonus
+      }
+      export function caller(amount: number): void {
+        var a = { balance: 100 }
+        let users: Account[] = [a, a]
+        payBonusSafe(users, amount)
+      }
+    `
+    const registry = buildRegistry(extractFromSource(source))
+    const tasks = extractCallSiteObligations(source, 'test.ts', registry, ctx)
+    const distinct = []
+    for (const t of tasks) {
+      if (!t.contractText.includes('!==')) continue
+      distinct.push({ text: t.contractText, status: (await check(t)).status })
+    }
+    assert.ok(distinct.length >= 1, 'Expected the distinctness obligation')
+    assert.strictEqual(distinct[0]!.status, 'disproved', '[a, a] aliases both slots')
+  })
+
+  test('quantified field requires checked at call sites against literal facts', async () => {
+    const ctx = await getContext()
+    const source = (bal: number) => `
+      interface Account { balance: number }
+      export function payBonusSafe(users: Account[], bonus: number): void {
+        requires(forall(users, (u) => u.balance >= 0))
+        requires(positive(bonus))
+        users[0]!.balance = users[0]!.balance + bonus
+      }
+      export function caller(amount: number): void {
+        requires(positive(amount))
+        let users: Account[] = [{ balance: 100 }, { balance: ${bal} }]
+        payBonusSafe(users, amount)
+      }
+    `
+    for (const [bal, expected] of [[-100, 'disproved'], [200, 'proved']] as const) {
+      const registry = buildRegistry(extractFromSource(source(bal)))
+      const tasks = extractCallSiteObligations(source(bal), 'test.ts', registry, ctx)
+      const quantified = tasks.find(t => t.contractText.includes('balance'))
+      assert.ok(quantified, `Expected the forall obligation (balance ${bal}) — silent drops are the enemy`)
+      assert.strictEqual((await check(quantified)).status, expected, `balance ${bal}`)
+    }
+  })
+
   test('a fresh two-object literal satisfies length and distinctness requires', async () => {
     const ctx = await getContext()
     const source = `
@@ -313,6 +389,98 @@ describe('call sites: array-literal facts', () => {
     const results = []
     for (const t of tasks) results.push({ text: t.contractText, status: (await check(t)).status })
     assert.ok(results.length >= 3, `Expected 3 obligations, got: ${results.length}`)
+    for (const r of results) {
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Monotonicity of element fields: temporal (never shrinks across the call)
+// and spatial (array sorted BY a field)
+// ---------------------------------------------------------------------------
+
+describe('ref-arrays: balance monotonicity', () => {
+  test('quantified two-state ensures: crediting never shrinks any balance', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function creditAll(users: Account[], bonus: number, n: number): void {
+        requires(positive(bonus))
+        requires(nonNegative(n))
+        ensures(forall(users, (u) => u.balance >= old(u.balance)))
+        let k = 0
+        while (k < n) {
+          invariant(() => forall(users, (u) => u.balance >= old(u.balance)))
+          decreases(() => n - k)
+          users[k]!.balance = users[k]!.balance + bonus
+          k = k + 1
+        }
+      }
+    `)
+    assert.ok(results.length >= 5, `Expected the full task set, got ${results.length}`)
+    for (const r of results) {
+      assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
+    }
+  })
+
+  test('debiting refutes the two-state invariant preservation', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function debitAll(users: Account[], fee: number, n: number): void {
+        requires(positive(fee))
+        requires(nonNegative(n))
+        ensures(forall(users, (u) => u.balance >= old(u.balance)))
+        let k = 0
+        while (k < n) {
+          invariant(() => forall(users, (u) => u.balance >= old(u.balance)))
+          decreases(() => n - k)
+          users[k]!.balance = users[k]!.balance - fee
+          k = k + 1
+        }
+      }
+    `)
+    const preserved = results.find(r => r.text.includes('preserved'))
+    assert.ok(preserved, 'Expected the preservation task — silent drops are the enemy')
+    assert.strictEqual(preserved.status, 'disproved')
+  })
+
+  test('spatial: adjacent-pairs sortedBy makes users[0] the minimum', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function poorest(users: Account[]): number {
+        requires(users.length >= 2)
+        requires(forall(users, (u, i) => i + 1 < users.length ? u.balance <= users[i + 1]!.balance : true))
+        ensures(output() <= users[1]!.balance)
+        return users[0]!.balance
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('users[1]'))?.status, 'proved')
+  })
+})
+
+describe('loop contracts: header position', () => {
+  test('invariant()/decreases() directly before the while attach to it', async () => {
+    const results = await verifyAll(`
+      interface Account { balance: number }
+      export function creditAll(users: Account[], bonus: number, n: number): void {
+        requires(positive(bonus))
+        requires(nonNegative(n))
+        requires(forall(users, (u) => u.balance >= 0))
+        ensures(forall(users, (u) => u.balance >= 0))
+        let k = 0
+        invariant(() => forall(users, (u) => u.balance >= 0))
+        decreases(() => n - k)
+        while (k < n) {
+          users[k]!.balance = users[k]!.balance + bonus
+          k = k + 1
+        }
+      }
+    `)
+    const preserved = results.find(r => r.text.includes('preserved'))
+    assert.ok(preserved, 'Header-position invariant must attach to the loop')
+    assert.strictEqual(preserved.status, 'proved')
+    const decrease = results.find(r => r.text.includes('strictly decreases'))
+    assert.ok(decrease, 'Header-position decreases must attach too')
     for (const r of results) {
       assert.strictEqual(r.status, 'proved', `Expected proved for: ${r.text}`)
     }

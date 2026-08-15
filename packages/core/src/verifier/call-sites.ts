@@ -76,8 +76,18 @@ export function extractCallSiteObligations(
       if (typeof req === 'string') continue
       const substituted = substituteExpr(req, mapping)
 
-      // Create Z3 variables for all identifiers in the substituted expression
+      // Create Z3 variables for all identifiers in the substituted expression.
+      // Arg idents are typed by the CALLEE's parameter sorts first — an
+      // Account[] argument must be an Int→Int reference array or quantified
+      // field facts (forall(users, u => u.balance >= 0)) silently drop.
       const vars = new Map<string, AnyExpr<'main'>>()
+      for (const param of contract.params) {
+        const argE = mapping.get(param.name)
+        if (argE?.kind !== 'ident' || vars.has(argE.name)) continue
+        if (param.sort === 'ref-array' || param.sort === 'array' || param.sort === 'string') {
+          vars.set(argE.name, makeConst(argE.name, param.sort, ctx))
+        }
+      }
       collectAndCreateVars(substituted, vars, ctx)
 
       // Add scope assignments as assumptions (constant propagation)
@@ -99,18 +109,44 @@ export function extractCallSiteObligations(
             left: { kind: 'member', object: varIdent, property: 'length' },
             right: { kind: 'literal', value: n },
           }]
+
+          // Element identity analysis. An element is FRESH when it is an
+          // object literal — inline, or an ident whose scope assignment is
+          // one (`var a = {...}; [a, {...}]`). A fresh allocation is distinct
+          // from every element that isn't the very same one; the SAME ident
+          // twice is the same object (an equality fact, not distinctness).
+          interface ElemInfo {
+            fresh: boolean
+            identity: string | null
+            props: Array<{ key: string; value: Expr }> | null
+          }
+          const info: ElemInfo[] = valueExpr.elements.map((el, i) => {
+            if (el.kind === 'object') return { fresh: true, identity: `#lit${i}`, props: el.properties }
+            if (el.kind === 'ident') {
+              const bound = scopeAssignments.get(el.name)
+              if (bound !== undefined && bound.kind === 'object') {
+                return { fresh: true, identity: `ident:${el.name}`, props: bound.properties }
+              }
+              return { fresh: false, identity: `ident:${el.name}`, props: null }
+            }
+            return { fresh: false, identity: null, props: null }
+          })
+
           valueExpr.elements.forEach((el, i) => {
             if (el.kind === 'literal' && typeof el.value === 'number') {
               facts.push({ kind: 'binary', op: '===', left: at(i), right: el })
             }
-            if (el.kind === 'object') {
-              // Fresh object literals are distinct references
-              for (let j = i + 1; j < n; j++) {
-                if (valueExpr.elements[j]!.kind === 'object') {
-                  facts.push({ kind: 'binary', op: '!==', left: at(i), right: at(j) })
-                }
+            const ei = info[i]!
+            for (let j = i + 1; j < n; j++) {
+              const ej = info[j]!
+              if (ei.identity !== null && ei.identity === ej.identity) {
+                facts.push({ kind: 'binary', op: '===', left: at(i), right: at(j) })
+              } else if (ei.fresh || ej.fresh) {
+                facts.push({ kind: 'binary', op: '!==', left: at(i), right: at(j) })
               }
-              for (const prop of el.properties) {
+            }
+            if (ei.props !== null) {
+              for (const prop of ei.props) {
                 if (prop.value.kind === 'literal' && typeof prop.value.value === 'number') {
                   facts.push({
                     kind: 'binary', op: '===',
@@ -258,6 +294,7 @@ export function extractCallSiteObligations(
         goal,
         domainConstraints: [],
         sourcePos: { start: node.getStart(), length: node.getWidth() },
+        callSite: { call: `${calleeName}(${argTexts})`, predicate: prettyExpr(req) },
       })
     }
   }

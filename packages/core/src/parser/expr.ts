@@ -293,6 +293,7 @@ function parseExprInner(node: Expression): Expr | null {
             }
             return {
               kind: 'quantifier', quantifier: callee, param: qi, sort: 'int',
+              display: node.getText().replace(/\s+/g, ' '),
               body: callee === 'forall'
                 ? { kind: 'binary', op: '==>', left: inRange, right: body }
                 : { kind: 'binary', op: '&&', left: inRange, right: body },
@@ -339,6 +340,7 @@ function parseExprInner(node: Expression): Expr | null {
           : { kind: 'binary', op: '!==', left: at(qi), right: at(qj) }
         return {
           kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int',
+          display: node.getText().replace(/\s+/g, ' '),
           body: {
             kind: 'quantifier', quantifier: 'forall', param: qj, sort: 'int',
             body: { kind: 'binary', op: '==>', left: hyp, right: concl },

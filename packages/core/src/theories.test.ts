@@ -222,3 +222,50 @@ describe('discriminated unions', () => {
     assert.strictEqual(results.find(r => r.text.includes('=== x'))?.status, 'proved')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Index-bounds obligations (ts-plugin fuel): PROVED licenses suppressing
+// tsc's possibly-undefined at that access; unproven changes nothing.
+// ---------------------------------------------------------------------------
+
+describe('bounds obligations (opt-in)', () => {
+  const src = (guards: string) => `
+    export function pick(arr: number[], k: number): number {
+      ${guards}
+      ensures(output() === arr[k])
+      return arr[k]
+    }
+  `
+
+  test('requires-established bounds prove, with a line anchor', async () => {
+    const ctx = await getContext()
+    const ir = extractFromSource(src(`
+      requires(Number.isInteger(k))
+      requires(k >= 0)
+      requires(k < arr.length)
+    `)).find(f => f.name === 'pick')
+    const tasks = translate(ir!, ctx, undefined, { boundsChecks: true })
+    const bounds = tasks.filter(t => t.boundsCheck !== undefined)
+    assert.ok(bounds.length >= 1, 'Expected a bounds obligation')
+    for (const t of bounds) {
+      assert.ok(t.boundsCheck!.line > 0, 'Suppressions need a line anchor')
+      assert.strictEqual((await check(t)).status, 'proved', t.contractText)
+    }
+  })
+
+  test('missing length requires: bounds refuted — no suppression license', async () => {
+    const ctx = await getContext()
+    const ir = extractFromSource(src('requires(k >= 0)')).find(f => f.name === 'pick')
+    const tasks = translate(ir!, ctx, undefined, { boundsChecks: true })
+    const bounds = tasks.filter(t => t.boundsCheck !== undefined)
+    assert.ok(bounds.length >= 1)
+    assert.strictEqual((await check(bounds[0]!)).status, 'disproved')
+  })
+
+  test('without the opt-in no bounds tasks exist (CLI behavior unchanged)', async () => {
+    const ctx = await getContext()
+    const ir = extractFromSource(src('requires(k >= 0)')).find(f => f.name === 'pick')
+    const tasks = translate(ir!, ctx)
+    assert.strictEqual(tasks.filter(t => t.boundsCheck !== undefined).length, 0)
+  })
+})

@@ -22,7 +22,11 @@ import { unfoldSpecCalls } from './spec-unfold.js'
  *
  * Level 3: a `modifies(a, b)` contract restricts writable base roots.
  */
-export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationTask[] {
+export function translateHeapMode(
+  ir: FunctionIR,
+  ctx: Z3Context,
+  opts?: { boundsChecks?: boolean },
+): VerificationTask[] {
   const steps = ir.heapSteps ?? []
   const declaredRoots = new Set(ir.heapRoots ?? [])
   const tasks: VerificationTask[] = []
@@ -167,10 +171,24 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }
   }
 
-  // Numeric parameters (non-root) as Real constants
+  // Numeric parameters (non-root) as Real constants — except params the
+  // contracts declare integral: those are Int-sorted outright, which lets
+  // them index arrays and keeps their arithmetic in pure LIA.
+  const intParams = new Set<string>()
+  for (const c of ir.contracts) {
+    if (c.kind !== 'requires' || !('predicate' in c) || typeof c.predicate !== 'object' || c.predicate === null) continue
+    const pred = c.predicate as Expr
+    if (pred.kind === 'call' && pred.callee === 'Number.isInteger'
+        && pred.args.length === 1 && pred.args[0]!.kind === 'ident') {
+      intParams.add((pred.args[0] as { name: string }).name)
+    }
+  }
   const numericVars = new Map<string, AnyExpr<'main'>>()
   for (const p of ir.params) {
-    if (!rootNames.has(p.name) && !arrayVars.has(p.name)) numericVars.set(p.name, ctx.Real.const(p.name))
+    if (rootNames.has(p.name) || arrayVars.has(p.name)) continue
+    numericVars.set(p.name, intParams.has(p.name)
+      ? (ctx.Int.const(p.name) as unknown as AnyExpr<'main'>)
+      : ctx.Real.const(p.name))
   }
 
   // Mutable numeric state (`this.x` fields, let-locals): the entry-state
@@ -223,7 +241,7 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   const isIntShaped = (e: Expr): boolean => {
     switch (e.kind) {
       case 'literal': return typeof e.value === 'number' && Number.isInteger(e.value)
-      case 'ident': return intVars.has(e.name)
+      case 'ident': return intVars.has(e.name) || intParams.has(e.name)
       case 'binary':
         // Bitwise results are int32 by construction
         if (e.op === '|' || e.op === '&' || e.op === '^' || e.op === '<<' || e.op === '>>' || e.op === '>>>') {
@@ -339,6 +357,23 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     }).join('.')
   }
 
+  // Bounds obligations (opt-in): element accesses recorded with the
+  // assumption set ACTIVE at translation time (loop iterations use the
+  // havoc+invariant set, straight-line code the global one).
+  const boundsAccesses: Array<{
+    key: string
+    line: number
+    idx: AnyExpr<'main'>
+    len: Arith<'main'>
+    assumptions: () => Bool<'main'>[]
+    labels: () => string[]
+  }> = []
+  const seenBoundsKeys = new Set<string>()
+  // eslint-disable-next-line prefer-const
+  let activeAssumptions: () => Bool<'main'>[] = () => []
+  // eslint-disable-next-line prefer-const
+  let activeLabels: () => string[] = () => []
+
   const isIntSorted = (t: AnyExpr<'main'>): boolean => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
     try { return String((t as any).sort) === 'Int' } catch { return false }
@@ -392,6 +427,23 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
         const arrState = env.arrays.get(expr.object.name) ?? av.arr
         const idx = translate(expr.index, env, oldEnv)
         if (idx === null || !isIntSorted(idx)) return null
+        if (opts?.boundsChecks === true && expr.loc !== undefined && expr.loc.line > 0) {
+          const key = `${expr.object.name}[${prettyExpr(expr.index)}]`
+          const lineKey = `${expr.loc.line}:${key}`
+          if (!seenBoundsKeys.has(lineKey)) {
+            seenBoundsKeys.add(lineKey)
+            const snapA = activeAssumptions
+            const snapL = activeLabels
+            boundsAccesses.push({
+              key,
+              line: expr.loc?.line ?? 0,
+              idx,
+              len: av.len,
+              assumptions: snapA,
+              labels: snapL,
+            })
+          }
+        }
         // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
         try { return arrState.select(idx) } catch { return null }
       }
@@ -506,9 +558,13 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           } catch { return null }
         }
 
-        // old(x.f): value in the INITIAL heap
+        // old(x.f): value in the INITIAL heap. Quantifier bound variables
+        // live in the CURRENT env's locals and are state-independent — carry
+        // them across, or forall(users, u => u.balance >= old(u.balance))
+        // loses its index inside the old().
         if (expr.callee === 'old' && expr.args.length === 1) {
-          return translate(expr.args[0]!, oldEnv, oldEnv)
+          const oldWithBindings: Env = { ...oldEnv, locals: env.locals }
+          return translate(expr.args[0]!, oldWithBindings, oldEnv)
         }
         // output(): the returned value — bound by the trailing return step
         if (expr.callee === 'output' && expr.args.length === 0) {
@@ -636,6 +692,8 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
   // ── Requires: hold in the initial state; named roots are non-null ────────
   const assumptions: Bool<'main'>[] = []
   const assumptionLabels: string[] = []
+  activeAssumptions = () => [...assumptions]
+  activeLabels = () => [...assumptionLabels]
   for (const [name, ref] of refs) {
     assumptions.push(ref.gt(NULL_REF))
     assumptionLabels.push(`${name} is a live reference`)
@@ -868,7 +926,15 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
           heap: new Map(freshEnv.heap), locals: new Map(freshEnv.locals),
           nums: new Map(freshEnv.nums), arrays: new Map(freshEnv.arrays), tag: freshEnv.tag,
         }
+        // Element accesses inside the body prove bounds from the iteration
+        // assumptions (invariants + condition), not the entry state
+        const savedA = activeAssumptions
+        const savedL = activeLabels
+        activeAssumptions = () => [...iterAssumptions]
+        activeLabels = () => [...iterLabels]
         runLoopBody(step.body, bodyEnv, null)
+        activeAssumptions = savedA
+        activeLabels = savedL
 
         // Axioms at the state AFTER one iteration, plus ownership bridges
         // across the iteration (writes outside the footprint preserve specs)
@@ -1045,6 +1111,20 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
     variables.set(`${name}.length`, av.len as unknown as AnyExpr<'main'>)
   }
 
+  // Initial field values per root, evaluated in counterexamples — this is
+  // what lets --gen-tests rebuild the exact object graph (aliasing included:
+  // two roots with the same ref value are the same object).
+  const fieldTrace = new Map<string, AnyExpr<'main'>>()
+  for (const [rootName, ref] of refs) {
+    for (const f of fields) {
+      if (refFields.has(f)) continue   // pointer fields: not a flat number
+      const heap0 = initialHeap.get(f)
+      if (heap0 === undefined) continue
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
+      try { fieldTrace.set(`${rootName}.${f}`, heap0.select(ref) as AnyExpr<'main'>) } catch { /* skip */ }
+    }
+  }
+
   for (const c of ir.contracts) {
     if (c.kind !== 'ensures' || typeof c.predicate === 'string') continue
     const z3 = translate(c.predicate, env, oldEnv)
@@ -1057,7 +1137,30 @@ export function translateHeapMode(ir: FunctionIR, ctx: Z3Context): VerificationT
       assumptionLabels: [...assumptionLabels],
       goal: ctx.Not(z3 as Bool<'main'>),
       domainConstraints: [],
+      traceExprs: fieldTrace.size > 0 ? fieldTrace : undefined,
     })
+  }
+
+  if (opts?.boundsChecks === true) {
+    for (const b of boundsAccesses) {
+      try {
+        const inBounds = ctx.And(
+          (b.idx as Arith<'main'>).ge(ctx.Int.val(0) as unknown as Arith<'main'>),
+          (b.idx as Arith<'main'>).lt(b.len),
+        )
+        tasks.push({
+          functionName: ir.name,
+          contractText: `index in bounds: ${b.key}`,
+          variables: taskVariables(),
+          assumptions: b.assumptions(),
+          assumptionLabels: b.labels(),
+          goal: ctx.Not(inBounds),
+          domainConstraints: [],
+          informational: true,
+          boundsCheck: { line: b.line, exprText: b.key },
+        })
+      } catch { /* sort mismatch — skip */ }
+    }
   }
 
   return tasks

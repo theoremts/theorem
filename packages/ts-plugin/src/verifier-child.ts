@@ -30,12 +30,13 @@ async function main(): Promise<void> {
 
   const core = await import('@theoremts/core')
   const failures: ChildFailure[] = []
+  const suppressions: Array<{ line: number; exprText: string }> = []
 
   let irList: import('@theoremts/core').FunctionIR[]
   try {
     irList = core.extractFromSource(source, fileName)
   } catch {
-    emit(failures)
+    emit(failures, suppressions)
     return
   }
 
@@ -68,7 +69,7 @@ async function main(): Promise<void> {
   }
 
   if (irList.length === 0 && registry.size === 0) {
-    emit(failures)
+    emit(failures, suppressions)
     return
   }
 
@@ -77,12 +78,25 @@ async function main(): Promise<void> {
   for (const ir of irList) {
     let tasks: import('@theoremts/core').VerificationTask[]
     try {
-      tasks = core.translate(ir, ctx, registry)
+      tasks = core.translate(ir, ctx, registry, { boundsChecks: true })
     } catch {
       continue
     }
 
     for (const task of tasks) {
+      // Bounds obligations: PROVED licenses suppressing tsc's
+      // possibly-undefined at that access; anything else changes nothing
+      // (tsc already warns there).
+      const bounds = (task as { boundsCheck?: { line: number; exprText: string } }).boundsCheck
+      if (bounds !== undefined) {
+        try {
+          const result = await core.check({ ...task, timeout: 5000 })
+          if (result.status === 'proved') {
+            suppressions.push({ line: bounds.line, exprText: bounds.exprText })
+          }
+        } catch { /* skip */ }
+        continue
+      }
       if (task.informational) continue  // dead-branch hints are CLI-only
       try {
         const result = await core.check({ ...task, timeout: 5000 })
@@ -90,8 +104,14 @@ async function main(): Promise<void> {
           const ceText = formatCounterexample(result.counterexample)
           const traceText = result.trace ? formatTrace(result.trace) : ''
           const span = findContractPosition(source, ir.name, task.contractText)
+          // Labeled, multi-line: editors show the first line in the Problems
+          // panel and the full text in the hover. The 'theorem' source tag
+          // already identifies us — no prefix needed.
+          const lines = [`Contract violated: ${task.contractText}`]
+          if (ceText) lines.push(`Counterexample: ${ceText}`)
+          if (traceText) lines.push(traceText)
           failures.push({
-            message: `Theorem: ${task.contractText} — counterexample: ${ceText}${traceText}`,
+            message: lines.join('\n'),
             start: span.start,
             length: span.length,
             code: DIAG_CODE_DISPROVED,
@@ -100,7 +120,7 @@ async function main(): Promise<void> {
         } else if (result.status === 'unknown') {
           const span = findContractPosition(source, ir.name, task.contractText)
           failures.push({
-            message: `Theorem: ${task.contractText} — could not prove (${result.reason})`,
+            message: `Could not prove: ${task.contractText}\nSolver gave up (${result.reason}) — the contract may still hold`,
             start: span.start,
             length: span.length,
             code: DIAG_CODE_UNKNOWN,
@@ -120,9 +140,14 @@ async function main(): Promise<void> {
         if (result.status === 'disproved') {
           const ceText = formatCounterexample(result.counterexample)
           const pos = (task as { sourcePos?: { start: number; length: number } }).sourcePos
+          const cs = (task as { callSite?: { call: string; predicate: string } }).callSite
           const start = pos?.start ?? findCallSitePosition(source, task.functionName ?? '', task.contractText)
+          const lines = cs !== undefined
+            ? [`Unmet requires: ${cs.predicate}`, `Call: ${cs.call}`]
+            : [`Unmet requires: ${task.contractText}`]
+          if (ceText) lines.push(`Counterexample: ${ceText}`)
           failures.push({
-            message: `Theorem: ${task.contractText}${ceText ? ` — ${ceText}` : ''}`,
+            message: lines.join('\n'),
             start,
             length: pos?.length ?? estimateCallSiteSpanLength(source, start),
             code: DIAG_CODE_CALLSITE,
@@ -133,11 +158,11 @@ async function main(): Promise<void> {
     }
   } catch { /* skip call-site extraction errors */ }
 
-  emit(failures)
+  emit(failures, suppressions)
 }
 
-function emit(failures: ChildFailure[]): void {
-  process.stdout.write(JSON.stringify({ failures }))
+function emit(failures: ChildFailure[], suppressions: Array<{ line: number; exprText: string }> = []): void {
+  process.stdout.write(JSON.stringify({ failures, suppressions }))
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +257,7 @@ function formatTrace(trace: Record<string, unknown>): string {
   const entries = Object.entries(trace)
     .filter(([, v]) => v !== '?')
     .map(([k, v]) => `${k} = ${v}`)
-  return entries.length > 0 ? ` (where ${entries.join(', ')})` : ''
+  return entries.length > 0 ? `Initial state: ${entries.join(', ')}` : ''
 }
 
 function escapeRegex(s: string): string {

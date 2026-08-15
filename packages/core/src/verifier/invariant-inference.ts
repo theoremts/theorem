@@ -33,7 +33,7 @@ export interface LoopInvariantSuggestion {
 interface NumLoop {
   preAssigns: Array<{ name: string; value: Expr }>
   condition: Expr
-  body: Array<{ name: string; value: Expr }>
+  body: HeapStep[]
   resultExpr: Expr | null
 }
 
@@ -48,7 +48,15 @@ export async function inferLoopInvariants(
   if (ensures.length === 0) return null
 
   // Mutable state: assigned in the loop body. Params: referenced anywhere.
-  const mutables = [...new Set(shape.body.map(b => b.name))]
+  const mutableSet = new Set<string>()
+  const collectMutables = (steps: HeapStep[]): void => {
+    for (const st of steps) {
+      if (st.kind === 'num-assign') mutableSet.add(st.name)
+      else if (st.kind === 'branch') { collectMutables(st.then); collectMutables(st.else) }
+    }
+  }
+  collectMutables(shape.body)
+  const mutables = [...mutableSet]
   const paramNames = ir.params.map(p => p.name)
   const referenced = new Set<string>()
   const collectIdents = (e: Expr): void => {
@@ -59,7 +67,13 @@ export async function inferLoopInvariants(
     else if (e.kind === 'call') e.args.forEach(collectIdents)
   }
   collectIdents(shape.condition)
-  shape.body.forEach(b => collectIdents(b.value))
+  const collectBodyIdents = (steps: HeapStep[]): void => {
+    for (const st of steps) {
+      if (st.kind === 'num-assign') collectIdents(st.value)
+      else if (st.kind === 'branch') { collectIdents(st.condition); collectBodyIdents(st.then); collectBodyIdents(st.else) }
+    }
+  }
+  collectBodyIdents(shape.body)
   shape.preAssigns.forEach(b => collectIdents(b.value))
   for (const c of ensures) collectIdents(c.predicate)
   if (shape.resultExpr !== null) collectIdents(shape.resultExpr)
@@ -166,11 +180,69 @@ export async function inferLoopInvariants(
   const condZ3 = toZ3(shape.condition)
   if (condZ3 === null) return null
   const stepValue = new Map<string, AnyExpr<'main'>>()
-  for (const b of shape.body) {
-    const v = substituted(b.value, stepValue, toZ3, consts)
-    if (v === null) return null
-    stepValue.set(b.name, v)
+  const toZ3Shadowed = (e: Expr, shadow: Map<string, AnyExpr<'main'>>): AnyExpr<'main'> | null => {
+    if (e.kind === 'ident' && shadow.has(e.name)) return shadow.get(e.name)!
+    if (e.kind === 'binary') {
+      const l = toZ3Shadowed(e.left, shadow), r = toZ3Shadowed(e.right, shadow)
+      if (l === null || r === null) return null
+      const a = l as Arith<'main'>, b = r as Arith<'main'>
+      try {
+        switch (e.op) {
+          case '+': return a.add(b)
+          case '-': return a.sub(b)
+          case '*': return a.mul(b)
+          case '<': return a.lt(b)
+          case '<=': return a.le(b)
+          case '>': return a.gt(b)
+          case '>=': return a.ge(b)
+          case '===': return a.eq(b)
+          case '!==': return ctx.Not(a.eq(b))
+          case '&&': return ctx.And(l as Bool<'main'>, r as Bool<'main'>)
+          case '||': return ctx.Or(l as Bool<'main'>, r as Bool<'main'>)
+          default: return null
+        }
+      } catch { return null }
+    }
+    if (e.kind === 'unary') {
+      const o = toZ3Shadowed(e.operand, shadow)
+      if (o === null) return null
+      if (e.op === '-') return (o as Arith<'main'>).neg()
+      if (e.op === '!') return ctx.Not(o as Bool<'main'>)
+      return null
+    }
+    if (e.kind === 'ternary') {
+      const c = toZ3Shadowed(e.condition, shadow)
+      const t = toZ3Shadowed(e.then, shadow)
+      const el = toZ3Shadowed(e.else, shadow)
+      if (c === null || t === null || el === null) return null
+      try { return ctx.If(c as Bool<'main'>, t, el) } catch { return null }
+    }
+    return toZ3(e)
   }
+  let stepOk = true
+  const applySteps = (steps: HeapStep[], pc: Bool<'main'> | null): void => {
+    for (const st of steps) {
+      if (!stepOk) return
+      if (st.kind === 'num-assign') {
+        const v = toZ3Shadowed(st.value, stepValue)
+        if (v === null) { stepOk = false; return }
+        const prev = stepValue.get(st.name) ?? (consts.get(st.name) as unknown as AnyExpr<'main'> | undefined)
+        if (pc !== null && prev !== undefined) {
+          try { stepValue.set(st.name, ctx.If(pc, v, prev)) } catch { stepOk = false }
+        } else {
+          stepValue.set(st.name, v)
+        }
+      } else if (st.kind === 'branch') {
+        const c = toZ3Shadowed(st.condition, stepValue)
+        if (c === null) { stepOk = false; return }
+        const cond = c as Bool<'main'>
+        applySteps(st.then, pc === null ? cond : ctx.And(pc, cond))
+        applySteps(st.else, pc === null ? ctx.Not(cond) : ctx.And(pc, ctx.Not(cond)))
+      }
+    }
+  }
+  applySteps(shape.body, null)
+  if (!stepOk) return null
   const stepArgs = stateNames.map(n => stepValue.get(n) ?? (consts.get(n) as unknown as AnyExpr<'main'>))
   try {
     fp.addRule(ctx.ForAll(boundVars, ctx.Implies(
@@ -284,12 +356,15 @@ function eligibleShape(steps: HeapStep[] | undefined): NumLoop | null {
     }
   }
   if (loop === null) return null
-  const body: Array<{ name: string; value: Expr }> = []
-  for (const b of loop.body) {
-    if (b.kind !== 'num-assign') return null
-    body.push({ name: b.name, value: b.value })
-  }
-  return { preAssigns, condition: loop.condition, body, resultExpr }
+  if (!bodyIsNumeric(loop.body)) return null
+  return { preAssigns, condition: loop.condition, body: loop.body, resultExpr }
+}
+
+/** Loop bodies may be num-assigns and branches of num-assigns. */
+function bodyIsNumeric(steps: HeapStep[]): boolean {
+  return steps.every(s =>
+    s.kind === 'num-assign' ||
+    (s.kind === 'branch' && bodyIsNumeric(s.then) && bodyIsNumeric(s.else)))
 }
 
 // ── Z3 → TypeScript predicate printing ─────────────────────────────────────

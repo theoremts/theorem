@@ -218,6 +218,60 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
     extractChainConstraints(fieldName, baseType, chainText, constraints)
   }
 
+  // Discriminated unions: z.discriminatedUnion('kind', [z.object({...}), ...])
+  // Each variant's field constraints become CONDITIONAL facts:
+  //   x.kind === 'pix'  ==>  x.amount > 0
+  // plus the domain fact: x.kind is one of the declared literals.
+  const duMatch = /z\.discriminatedUnion\(\s*['"](\w+)['"]\s*,\s*\[/.exec(schemaText)
+  if (duMatch) {
+    const key = duMatch[1]!
+    const bodyStart = duMatch.index + duMatch[0].length
+    const variants = splitBalancedItems(schemaText.slice(bodyStart))
+    const kindValues: string[] = []
+    const conditional: Array<{ value: string; cs: FieldConstraint[] }> = []
+    for (const variantText of variants) {
+      const litMatch = new RegExp(`${key}\\s*:\\s*z\\.literal\\(\\s*['"]([^'"]+)['"]`).exec(variantText)
+      if (litMatch === null) continue
+      kindValues.push(litMatch[1]!)
+      const cs: FieldConstraint[] = []
+      const fieldPattern = /(\w+)\s*:\s*z\.(number|string|array)\s*\(/g
+      let fm: RegExpExecArray | null
+      while ((fm = fieldPattern.exec(variantText)) !== null) {
+        const closeIdx2 = findBalancedParen(variantText, fm.index + fm[0].length)
+        if (closeIdx2 === -1) continue
+        const chain = /^((?:\.\w+(?:<[^>]*>)?\([^)]*\))*)/.exec(variantText.slice(closeIdx2 + 1))?.[1] ?? ''
+        extractChainConstraints(fm[1]!, fm[2]!, chain, cs)
+      }
+      conditional.push({ value: litMatch[1]!, cs })
+    }
+    if (kindValues.length >= 2) {
+      const out: InferredContract[] = []
+      const kindExpr: Expr = { kind: 'member', object: { kind: 'ident', name: varName }, property: key }
+      // domain: kind ∈ {values}
+      const eqs: Expr[] = kindValues.map(v => ({ kind: 'binary', op: '===', left: kindExpr, right: { kind: 'literal', value: v } }))
+      out.push({
+        kind: 'requires',
+        text: `${varName}.${key} in {${kindValues.join(', ')}}`,
+        predicate: eqs.reduce((a, b) => ({ kind: 'binary', op: '||', left: a, right: b })),
+        confidence: 'guard',
+        source: `from Zod schema: z.discriminatedUnion('${key}', ...)`,
+      })
+      // conditional per-variant field facts
+      for (const { value, cs } of conditional) {
+        const guard: Expr = { kind: 'binary', op: '===', left: kindExpr, right: { kind: 'literal', value } }
+        for (const contract of constraintsToContracts(cs, varName)) {
+          if (typeof contract.predicate === 'string') continue
+          out.push({
+            ...contract,
+            text: `${varName}.${key} === '${value}' ==> ${contract.text}`,
+            predicate: { kind: 'binary', op: '==>', left: guard, right: contract.predicate },
+          })
+        }
+      }
+      return out
+    }
+  }
+
   // Also handle top-level (non-object) schemas: z.number().positive().parse(x)
   // In this case the schema itself is the chain with no field name.
   if (constraints.length === 0) {
@@ -232,6 +286,10 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
   }
 
   // Convert field constraints to InferredContracts
+  return constraintsToContracts(constraints, varName)
+}
+
+function constraintsToContracts(constraints: FieldConstraint[], varName: string): InferredContract[] {
   return constraints.map(c => {
     if (c.regex !== undefined) {
       const strExpr = buildFieldExpr(varName, c.field, false)
@@ -339,6 +397,23 @@ function extractChainConstraints(
     }
     if (/\.nonempty\(\)/.test(chainText)) {
       out.push({ field, op: '>', value: 0, isLength: true, source: 'z.string().nonempty()' })
+    }
+    // .email(): SOUND superset of Zod's validation — nonempty local@domain,
+    // no spaces/extra @. Every Zod-valid email is in this language.
+    if (/\.email\(\)/.test(chainText)) {
+      out.push({
+        field, op: '>=', value: 0, isLength: false,
+        regex: { pattern: '^[^@\\s]+@[^@\\s]+$', flags: '' },
+        source: 'z.string().email()',
+      })
+    }
+    // .uuid(): the exact shape (both hex cases allowed)
+    if (/\.uuid\(\)/.test(chainText)) {
+      out.push({
+        field, op: '>=', value: 0, isLength: false,
+        regex: { pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', flags: '' },
+        source: 'z.string().uuid()',
+      })
     }
     // .regex(/pattern/flags) — becomes a Z3 regular-expression membership fact
     const regexMatch = /\.regex\(\s*\/((?:[^/\\\n]|\\.)*)\/([a-z]*)\s*\)/.exec(chainText)
@@ -546,4 +621,27 @@ export function extractSchemaInvariantsFromFile(file: SourceFile): FileSchemaInv
   }
 
   return { schemas, aliases }
+}
+
+/**
+ * Splits the items of an array literal text (starting after '[') at top-level
+ * commas, stopping at the matching ']'. Paren/brace/bracket aware.
+ */
+function splitBalancedItems(s: string): string[] {
+  const items: string[] = []
+  let depth = 0
+  let start = 0
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (ch === '(' || ch === '{' || ch === '[') depth++
+    else if (ch === ')' || ch === '}') depth--
+    else if (ch === ']') {
+      if (depth === 0) { items.push(s.slice(start, i).trim()); break }
+      depth--
+    } else if (ch === ',' && depth === 0) {
+      items.push(s.slice(start, i).trim())
+      start = i + 1
+    }
+  }
+  return items.filter(t => t.length > 0)
 }

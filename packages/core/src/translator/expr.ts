@@ -392,8 +392,23 @@ function coerceArithPair(left: Z3Expr, right: Z3Expr, ctx: Z3Context): [Z3Expr, 
     const lIsReal = ctx.isReal(left)
     const rIsReal = ctx.isReal(right)
 
-    if (lIsInt && rIsReal) return [ctx.ToReal(left as Z3Arith), right]
-    if (lIsReal && rIsInt) return [left, ctx.ToReal(right as Z3Arith)]
+    // An INTEGRAL literal next to an Int stays Int — promoting to Real
+    // would poison index arithmetic (`users[i + 1]` needs an Int index).
+    const asIntLiteral = (e: Z3Expr): Z3Expr | null => {
+      const t = String(e)
+      const m = /^(-?\d+)(?:\.0)?$/.exec(t)   // Real numerals print as "1.0"
+      return m !== null ? (ctx.Int.val(parseInt(m[1]!, 10)) as unknown as Z3Expr) : null
+    }
+    if (lIsInt && rIsReal) {
+      const rInt = asIntLiteral(right)
+      if (rInt !== null) return [left, rInt]
+      return [ctx.ToReal(left as Z3Arith), right]
+    }
+    if (lIsReal && rIsInt) {
+      const lInt = asIntLiteral(left)
+      if (lInt !== null) return [lInt, right]
+      return [left, ctx.ToReal(right as Z3Arith)]
+    }
   } catch { /* not arithmetic sorts — return as-is */ }
   return [left, right]
 }
@@ -435,6 +450,29 @@ function applyBinaryOp(
     case '&&':  return ctx.And(l as Z3Bool, r as Z3Bool)
     case '||':  return ctx.Or(l as Z3Bool, r as Z3Bool)
     case '==>': return ctx.Implies(l as Z3Bool, r as Z3Bool)
+    // Bitwise — only over Int-sorted operands (ToInt32 → BV32 → back)
+    case '|': case '&': case '^': case '<<': case '>>': case '>>>': {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+      const bothInt = String((l as any).sort) === 'Int' && String((r as any).sort) === 'Int'
+      if (!bothInt) return null
+      try {
+        /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any */
+        const bvA = ctx.Int2BV(l as Z3Arith, 32)
+        const bvB = ctx.Int2BV(r as Z3Arith, 32)
+        const count = (bvB as any).and(31)
+        let bvR
+        switch (op) {
+          case '|': bvR = (bvA as any).or(bvB); break
+          case '&': bvR = (bvA as any).and(bvB); break
+          case '^': bvR = (bvA as any).xor(bvB); break
+          case '<<': bvR = (bvA as any).shl(count); break
+          case '>>': bvR = (bvA as any).ashr(count); break
+          default: bvR = (bvA as any).lshr(count); break
+        }
+        return ctx.BV2Int(bvR, op !== '>>>') as unknown as Z3Expr
+        /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any */
+      } catch { return null }
+    }
     // Nullish coalesce handled above in toZ3
     case '??':  return null
     // 'in' handled above in toZ3

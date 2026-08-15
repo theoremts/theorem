@@ -17,22 +17,39 @@ import type { Z3Context } from '../solver/context.js'
  * unicode alphabet, not an ASCII enumeration.
  *
  * Unsupported constructs (backreferences, lookaround, unicode property
- * escapes, mid-pattern anchors, the i/m/s flags) return null — the caller
- * must DROP the constraint, never approximate it.
+ * escapes, mid-pattern anchors, the m/s/u flags) return null — the caller
+ * must DROP the constraint, never approximate it. The i flag is supported
+ * via case unions on literals and letter ranges.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Re = any
 
 export function jsRegexToRe(pattern: string, flags: string, ctx: Z3Context): Re | null {
   // Flags that change matching semantics in ways we don't model
-  if (/[imsuy]/.test(flags)) return null
+  // (i is supported: literals become case unions; ranges stay exact-case)
+  if (/[msuy]/.test(flags)) return null
+  const caseInsensitive = flags.includes('i')
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const anyCtx = ctx as any
   /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return */
   const reSort = anyCtx.Re.sort(anyCtx.String.sort())
-  const lit = (s: string): Re => anyCtx.Re.toRe(s)
-  const range = (lo: string, hi: string): Re => anyCtx.Range(lo, hi)
+  const lit = (s: string): Re => {
+    if (caseInsensitive && /[a-zA-Z]/.test(s)) {
+      const lower = s.toLowerCase()
+      const upper = s.toUpperCase()
+      if (lower !== upper) return anyCtx.Re.toRe(lower).union(anyCtx.Re.toRe(upper))
+    }
+    return anyCtx.Re.toRe(s)
+  }
+  const range = caseInsensitive
+    ? (lo: string, hi: string): Re => {
+        // [a-z] under /i covers both cases when the range is a letter range
+        if (/[a-z]/.test(lo) && /[a-z]/.test(hi)) return anyCtx.Range(lo, hi).union(anyCtx.Range(lo.toUpperCase(), hi.toUpperCase()))
+        if (/[A-Z]/.test(lo) && /[A-Z]/.test(hi)) return anyCtx.Range(lo, hi).union(anyCtx.Range(lo.toLowerCase(), hi.toLowerCase()))
+        return anyCtx.Range(lo, hi)
+      }
+    : (lo: string, hi: string): Re => anyCtx.Range(lo, hi)
   const allChar = (): Re => anyCtx.AllChar(reSort)
   const full = (): Re => anyCtx.Full(reSort)
   const union = (rs: Re[]): Re => rs.reduce((a: Re, b: Re) => a.union(b))

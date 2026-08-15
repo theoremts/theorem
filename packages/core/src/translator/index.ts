@@ -31,6 +31,12 @@ export interface VerificationTask {
   /** Exact source span of the offending node (call sites) — beats text search,
    *  which anchors to the FIRST occurrence when two calls read identically. */
   sourcePos?: { start: number; length: number } | undefined
+  /** Structured call-site info: the call text and the unmet predicate,
+   *  separated — so reporters can label them instead of joining with dashes. */
+  callSite?: { call: string; predicate: string } | undefined
+  /** Index-bounds obligation for one element access — PROVED lets the
+   *  ts-plugin suppress tsc's possibly-undefined error at that access. */
+  boundsCheck?: { line: number; exprText: string } | undefined
   /**
    * Informational task: proved is worth reporting (e.g. "error branch
    * unreachable"), but disproved is NORMAL and must not count as a failure.
@@ -42,17 +48,23 @@ export interface VerificationTask {
 // Main entry point
 // ---------------------------------------------------------------------------
 
+export interface TranslateOptions {
+  /** Emit index-bounds obligations per element access (ts-plugin fuel). */
+  boundsChecks?: boolean
+}
+
 export function translate(
   ir: FunctionIR,
   ctx: Z3Context,
   registry?: ContractRegistry,
+  opts?: TranslateOptions,
 ): VerificationTask[] {
   // Heap mode runs FIRST and owns its own spec-unfolding pipeline: axioms
   // must be instantiated PER HEAP VERSION (@pre/@post), and heap-mode null
   // is already a value (NULL_REF) — the general preprocessing below would
   // convert calls prematurely and rewrite null into an unresolvable ident.
   if (ir.heapSteps !== undefined && ir.heapSteps.length > 0) {
-    return translateHeapMode(ir, ctx)
+    return translateHeapMode(ir, ctx, opts)
   }
 
   // Spec functions: calls in contract predicates become uninterpreted
@@ -121,16 +133,24 @@ export function translate(
   // implies string-ness, and the body may read `x.length` BEFORE the
   // assume that would otherwise create x — a late String would leave the
   // body's length variable untied to the sequence.
+  const preCreateString = (t: Expr): void => {
+    const name = t.kind === 'ident' ? t.name : t.kind === 'member' ? flattenMemberName(t) : null
+    if (name !== null && !vars.has(name)) vars.set(name, makeConst(name, 'string', ctx))
+  }
   const preCreateRegexTargets = (e: Expr): void => {
     if (e.kind === 'call') {
-      if (e.callee === '__reTest' && e.args.length >= 1) {
-        const t = e.args[0]!
-        const name = t.kind === 'ident' ? t.name : t.kind === 'member' ? flattenMemberName(t) : null
-        if (name !== null && !vars.has(name)) vars.set(name, makeConst(name, 'string', ctx))
-      }
+      if (e.callee === '__reTest' && e.args.length >= 1) preCreateString(e.args[0]!)
       for (const a of e.args) preCreateRegexTargets(a)
     }
-    else if (e.kind === 'binary') { preCreateRegexTargets(e.left); preCreateRegexTargets(e.right) }
+    else if (e.kind === 'binary') {
+      // String-literal comparisons type their other side: p.kind === 'pix'
+      // means p.kind is a STRING (discriminants, enums-as-literals)
+      if ((e.op === '===' || e.op === '!==')) {
+        if (e.right.kind === 'literal' && typeof e.right.value === 'string') preCreateString(e.left)
+        if (e.left.kind === 'literal' && typeof e.left.value === 'string') preCreateString(e.right)
+      }
+      preCreateRegexTargets(e.left); preCreateRegexTargets(e.right)
+    }
     else if (e.kind === 'unary') preCreateRegexTargets(e.operand)
     else if (e.kind === 'ternary') { preCreateRegexTargets(e.condition); preCreateRegexTargets(e.then); preCreateRegexTargets(e.else) }
     else if (e.kind === 'quantifier') preCreateRegexTargets(e.body)
@@ -449,14 +469,29 @@ export function translate(
     }
 
     if (contract.kind === 'unreachable') {
-      // Goal is `false` — if UNSAT, the point is truly unreachable
+      // Goal: can execution REACH this point? For branch-nested marks the
+      // path conditions are the goal — SAT means reachable (counterexample
+      // shows the inputs); UNSAT proves the mark truly dead.
+      let goal: Bool<'main'> = ctx.Bool.val(true)
+      let text = 'unreachable'
+      if (contract.conditions !== undefined && contract.conditions.length > 0) {
+        const condZ3 = contract.conditions
+          .map(c => toZ3(c, vars, ctx))
+          .filter((z): z is AnyExpr<'main'> => z !== null)
+        if (condZ3.length > 0) {
+          goal = condZ3.length === 1
+            ? condZ3[0] as Bool<'main'>
+            : ctx.And(...(condZ3 as Bool<'main'>[]))
+        }
+        text = `unreachable under ${contract.conditions.map(prettyExpr).join(' && ')}`
+      }
       tasks.push({
         functionName: ir.name,
-        contractText: 'unreachable',
+        contractText: text,
         variables: vars,
         assumptions: [...assumptions],
         assumptionLabels: [...assumptionLabels],
-        goal: ctx.Bool.val(true),   // negated goal: NOT false = true; solver checks SAT of (assumptions AND true)
+        goal,
         domainConstraints,
       traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
       traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
@@ -525,6 +560,67 @@ export function translate(
       traceExprs: traceExprs.size > 0 ? new Map(traceExprs) : undefined,
       traceLocs: traceLocs.size > 0 ? new Map(traceLocs) : undefined,
     })
+  }
+
+  // 7b. Index-bounds obligations (opt-in): for each element access on an
+  //     array, prove 0 <= idx < arr.length under requires + path conditions.
+  //     PROVED is the interesting verdict — it licenses the ts-plugin to
+  //     suppress tsc's possibly-undefined error at that access. Unproved is
+  //     normal (tsc already warns) — hence informational.
+  if (opts?.boundsChecks === true) {
+    const boundsOut: Array<{ arr: string; idx: Expr; loc?: { line: number } | undefined; pathConditions: Expr[] }> = []
+    if (ir.body !== undefined) collectBoundsAccesses(ir.body, boundsOut, [])
+    // Contract predicates too: tsc flags `arr[k]` inside ensures callbacks
+    // just the same, and the proof covers them identically
+    for (const c of ir.contracts) {
+      if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) {
+        collectBoundsAccesses(c.predicate as Expr, boundsOut, [])
+      }
+    }
+    const seenBounds = new Set<string>()
+    for (const b of boundsOut) {
+      if (b.loc === undefined || b.loc.line <= 0) continue  // can't anchor a suppression
+      const key = `${b.arr}[${prettyExpr(b.idx)}]`
+      const lineKey = `${b.loc.line}:${key}`
+      if (seenBounds.has(lineKey)) continue
+      seenBounds.add(lineKey)
+      const arrVar = vars.get(b.arr)
+      if (arrVar === undefined || !isArrayLike(arrVar)) continue
+      const idxZ3 = toZ3(b.idx, vars, ctx)
+      const lenZ3 = toZ3({ kind: 'member', object: { kind: 'ident', name: b.arr }, property: 'length' }, vars, ctx)
+      if (idxZ3 === null || lenZ3 === null) continue
+      let inBounds: Bool<'main'>
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+        const idxIsInt = String((idxZ3 as any).sort) === 'Int'
+        const zero = idxIsInt ? (ctx.Int.val(0) as unknown as Arith<'main'>) : (ctx.Real.val(0) as Arith<'main'>)
+        const lenCmp = idxIsInt ? (lenZ3 as Arith<'main'>) : (ctx.ToReal(lenZ3 as Arith<'main'>) as Arith<'main'>)
+        inBounds = ctx.And(
+          (idxZ3 as Arith<'main'>).ge(zero),
+          (idxZ3 as Arith<'main'>).lt(lenCmp),
+        )
+      } catch { continue }
+      const oblAssumptions = [...assumptions]
+      const oblLabels = [...assumptionLabels]
+      for (const pathCond of b.pathConditions) {
+        const pathZ3 = toZ3(pathCond, vars, ctx)
+        if (pathZ3 !== null) {
+          oblAssumptions.push(pathZ3 as Bool<'main'>)
+          oblLabels.push(`path: ${prettyExpr(pathCond)}`)
+        }
+      }
+      tasks.push({
+        functionName: ir.name,
+        contractText: `index in bounds: ${key}`,
+        variables: vars,
+        assumptions: oblAssumptions,
+        assumptionLabels: oblLabels,
+        goal: ctx.Not(inBounds),
+        domainConstraints,
+        informational: true,
+        boundsCheck: { line: b.loc?.line ?? 0, exprText: key },
+      })
+    }
   }
 
   // 8. Dead error branches: prove the path conditions guarding a typed-error
@@ -1532,5 +1628,54 @@ function exprUsesOld(expr: Expr): boolean {
     case 'spread':         return exprUsesOld(expr.operand)
     case 'template':       return expr.parts.some(p => typeof p !== 'string' && exprUsesOld(p))
     default:               return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Index-bounds access collection
+// ---------------------------------------------------------------------------
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function isArrayLike(v: any): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+  try { return String(v.sort).startsWith('Array') || v.sort.domain !== undefined } catch { return false }
+}
+
+function collectBoundsAccesses(
+  expr: Expr,
+  out: Array<{ arr: string; idx: Expr; loc?: { line: number } | undefined; pathConditions: Expr[] }>,
+  pathConditions: Expr[],
+): void {
+  switch (expr.kind) {
+    case 'element-access':
+      if (expr.object.kind === 'ident') {
+        out.push({ arr: expr.object.name, idx: expr.index, loc: expr.loc, pathConditions: [...pathConditions] })
+      }
+      collectBoundsAccesses(expr.object, out, pathConditions)
+      collectBoundsAccesses(expr.index, out, pathConditions)
+      break
+    case 'ternary':
+      collectBoundsAccesses(expr.condition, out, pathConditions)
+      collectBoundsAccesses(expr.then, out, [...pathConditions, expr.condition])
+      collectBoundsAccesses(expr.else, out, [...pathConditions, { kind: 'unary', op: '!', operand: expr.condition }])
+      break
+    case 'binary':
+      collectBoundsAccesses(expr.left, out, pathConditions)
+      collectBoundsAccesses(expr.right, out, pathConditions)
+      break
+    case 'unary':
+      collectBoundsAccesses(expr.operand, out, pathConditions)
+      break
+    case 'call':
+      for (const a of expr.args) collectBoundsAccesses(a, out, pathConditions)
+      break
+    case 'member':
+      collectBoundsAccesses(expr.object, out, pathConditions)
+      break
+    case 'array':
+      for (const e of expr.elements) collectBoundsAccesses(e, out, pathConditions)
+      break
+    default:
+      break
   }
 }

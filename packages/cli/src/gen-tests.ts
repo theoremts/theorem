@@ -117,24 +117,57 @@ function usesDeclareOnlyGlobal(source: string): boolean {
 }
 
 function buildTestCase(e: RegressionEntry): { code: string } | null {
-  // Reconstructible only when every parameter has a concrete value
+  // Reconstructible only when every parameter has a concrete value.
+  // Object params sharing a REFERENCE value are the SAME object — the
+  // aliasing counterexamples depend on it, so each param becomes a named
+  // const and later params with the same ref alias the first.
+  const pre: string[] = []
   const args: string[] = []
+  const paramByRef = new Map<string, string>()
+
+  const fieldsOf = (p: string): string[] =>
+    Object.entries(e.counterexample)
+      .filter(([k, val]) => k.startsWith(`${p}.`) && !k.slice(p.length + 1).includes('.') &&
+        (typeof val === 'number' || typeof val === 'boolean'))
+      .map(([k, val]) => `${k.slice(p.length + 1)}: ${String(val)}`)
+
   for (const p of e.params) {
     const v = e.counterexample[p]
+    const fields = fieldsOf(p)
+    if (fields.length > 0 && typeof v === 'number') {
+      // Heap root: dedupe by reference value
+      const owner = paramByRef.get(String(v))
+      if (owner === undefined) {
+        paramByRef.set(String(v), p)
+        pre.push(`const ${p} = { ${fields.join(', ')} }`)
+      } else {
+        pre.push(`const ${p} = ${owner}  // same reference — aliased!`)
+      }
+      args.push(p)
+      continue
+    }
     if (typeof v === 'number' || typeof v === 'boolean') {
       args.push(String(v))
       continue
     }
-    // Object parameter: rebuild from flattened fields `p.field`
-    const fields = Object.entries(e.counterexample)
-      .filter(([k, val]) => k.startsWith(`${p}.`) && !k.slice(p.length + 1).includes('.') &&
-        (typeof val === 'number' || typeof val === 'boolean'))
-      .map(([k, val]) => `${k.slice(p.length + 1)}: ${String(val)}`)
     if (fields.length === 0) return null
     args.push(`{ ${fields.join(', ')} }`)
   }
 
-  const assertion = buildAssertion(e.contractText)
+  // old(x.f): capture the pre-state before the call, then assert with it
+  let contractExpr = e.contractText
+  const oldCaptures = new Map<string, string>()
+  contractExpr = contractExpr.replace(/old\(([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+)\)/g, (_m, path: string) => {
+    let captured = oldCaptures.get(path)
+    if (captured === undefined) {
+      captured = `__old_${path.replace(/\./g, '_')}`
+      oldCaptures.set(path, captured)
+      pre.push(`const ${captured} = ${path}`)
+    }
+    return captured
+  })
+
+  const assertion = buildAssertion(contractExpr)
   if (assertion === null) return null
 
   const ceText = Object.entries(e.counterexample)
@@ -146,6 +179,7 @@ function buildTestCase(e: RegressionEntry): { code: string } | null {
     `// Contract: ${e.contractText}`,
     `// Counterexample: ${ceText}`,
     `test('${e.functionName}: ${escapeQuotes(e.contractText)}', () => {`,
+    ...pre.map(l => `  ${l}`),
     `  const __r = ${e.functionName}(${args.join(', ')})`,
     `  ${assertion}`,
     `})`,
@@ -171,6 +205,7 @@ function buildAssertion(contractText: string): string | null {
 
   let expr = contractText
   if (/\b(?:old|conserved|forall|exists)\s*\(/.test(expr)) return null
+  // __old_* captures from the caller are plain variables — fine
   if (expr.includes('unreachable') || expr.includes('modifies')) return null
 
   // output() → result variable

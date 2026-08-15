@@ -45,7 +45,7 @@ export type Expr =
   | { kind: 'binary';         op: BinaryOp; left: Expr; right: Expr; loc?: Loc | undefined }
   | { kind: 'call';           callee: string; args: Expr[]; loc?: Loc | undefined }
   | { kind: 'ternary';        condition: Expr; then: Expr; else: Expr; loc?: Loc | undefined }
-  | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr; sort?: 'int' | 'real' | undefined; loc?: Loc | undefined }
+  | { kind: 'quantifier';     quantifier: 'forall' | 'exists'; param: string; body: Expr; sort?: 'int' | 'real' | undefined; display?: string | undefined; loc?: Loc | undefined }
   | { kind: 'array';          elements: Expr[]; loc?: Loc | undefined }
   | { kind: 'object';         properties: Array<{ key: string; value: Expr }>; loc?: Loc | undefined }
   | { kind: 'spread';         operand: Expr; loc?: Loc | undefined }
@@ -64,7 +64,11 @@ export interface DecreasesContract { kind: 'decreases'; expression: Expr; loopIn
 export interface ModifiesContract  { kind: 'modifies';  refs: string[] }
 export interface CheckContract     { kind: 'check';     predicate: Predicate }
 export interface AssumeContract    { kind: 'assume';    predicate: Predicate }
-export interface UnreachableContract { kind: 'unreachable' }
+export interface UnreachableContract {
+  kind: 'unreachable'
+  /** Path conditions guarding the unreachable() point (branch-nested). */
+  conditions?: Expr[] | undefined
+}
 
 export type Contract =
   | RequiresContract
