@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { Command } from 'commander'
 import { loadConfig, resolveConfig } from '@theoremts/core'
 import type { ResolvedConfig } from '@theoremts/core'
@@ -19,10 +21,16 @@ async function getConfig(): Promise<ResolvedConfig> {
   return resolvedConfig
 }
 
+// Single source of truth for the version — a hardcoded string shipped 0.8.1
+// binaries that reported 0.8.0. CJS output: __dirname is dist/.
+const pkg = JSON.parse(
+  readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'),
+) as { version: string }
+
 const program = new Command()
   .name('theorem')
   .description('Formal verification for TypeScript')
-  .version('0.8.0')
+  .version(pkg.version)
 
 program
   .command('verify <paths...>')

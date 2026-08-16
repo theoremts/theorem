@@ -318,8 +318,15 @@ export function toZ3(
     }
 
     // ── Function calls ────────────────────────────────────────────
-    case 'call':
+    case 'call': {
+      // Plain-path fold symbol: reduce-desugared (or explicit) sumBy over an
+      // array reads the pre-created fold constant (see collectPlainFolds).
+      if (expr.callee === '__sumBy') {
+        const foldName = plainFoldName(expr)
+        if (foldName !== null && vars.has(foldName)) return vars.get(foldName)!
+      }
       try { return translateCall(expr.callee, expr.args, vars, ctx) } catch { return null }
+    }
 
     // ── Quantifiers: forall/exists ─────────────────────────────────
     case 'quantifier': {
@@ -1029,6 +1036,41 @@ function translateSetMethod(
  * variable name.  Supports identifiers (`old(x)` → `__old_x`) and member access
  * (`old(a.b)` → `__old_a.b`).  Returns null for unsupported expression kinds.
  */
+/** Flattens a fold target to a dotted name: ident `items` or member `this.items`. */
+function foldTargetName(e: Expr): string | null {
+  if (e.kind === 'ident') return e.name
+  if (e.kind === 'member') {
+    const base = foldTargetName(e.object)
+    return base === null ? null : `${base}.${e.property}`
+  }
+  return null
+}
+
+/**
+ * Canonical identity of a plain-path `__sumBy(arr, 'field', display, guarded?)`
+ * fold. Shared between pre-creation (translate's fold pass) and toZ3's call case.
+ */
+export function plainFoldParts(
+  e: Extract<Expr, { kind: 'call' }>,
+): { name: string; arrFlat: string; field: string; mode: number } | null {
+  const arr = e.args[0]
+  const field = e.args[1]
+  if (arr === undefined || field === undefined || field.kind !== 'literal') return null
+  const base = foldTargetName(arr)
+  if (base === null) return null
+  const modeArg = e.args[3]
+  return {
+    name: `__sumBy_${base.replace(/\./g, '_')}_${String(field.value)}`,
+    arrFlat: base,
+    field: String(field.value),
+    mode: modeArg?.kind === 'literal' && typeof modeArg.value === 'number' ? modeArg.value : 0,
+  }
+}
+
+export function plainFoldName(e: Extract<Expr, { kind: 'call' }>): string | null {
+  return plainFoldParts(e)?.name ?? null
+}
+
 function oldVarName(expr: Expr): string | null {
   if (expr.kind === 'ident') return `__old_${expr.name}`
   if (expr.kind === 'member') {

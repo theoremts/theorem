@@ -4,7 +4,7 @@ import type { Contract, Expr, FunctionIR, Loc, LoopInfo, Param, Predicate } from
 import type { ContractRegistry } from '../registry/index.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { createVariables, makeConst } from './variables.js'
-import { toZ3 } from './expr.js'
+import { toZ3, plainFoldParts } from './expr.js'
 import { translateStringContract } from './string-contracts.js'
 import { substituteExpr, substituteOutput } from './substitution.js'
 import { translateHeapMode } from './heap.js'
@@ -253,6 +253,72 @@ export function translate(
   if (ir.unmodeledWrites !== undefined) {
     for (const w of ir.unmodeledWrites) {
       assumptionLabels.push(`WARNING unmodeled field mutation: ${w} (body shape unsupported for heap mode)`)
+    }
+  }
+
+  // Plain-path folds: reduce-desugared (or explicit) __sumBy terms become
+  // fold constants with boundary axioms — `len === 0 ⟹ sum === 0`, plus
+  // bounds derived from quantified element facts in requires/assume
+  // (forall proj >= c ⟹ sum >= c·len). This is what lets
+  // `ensures(output() >= 0)` prove on `arr.reduce((a, x) => a + x.f, 0)`.
+  {
+    const plainFolds = new Map<string, { arrFlat: string; field: string; mode: number }>()
+    const walkFolds = (e: Expr | undefined): void => {
+      if (e === undefined || typeof e !== 'object') return
+      switch (e.kind) {
+        case 'call': {
+          if (e.callee === '__sumBy') {
+            const parts = plainFoldParts(e)
+            if (parts !== null && !plainFolds.has(parts.name)) {
+              plainFolds.set(parts.name, parts)
+            }
+          }
+          e.args.forEach(walkFolds)
+          walkFolds(e.recv)
+          break
+        }
+        case 'binary':         walkFolds(e.left); walkFolds(e.right); break
+        case 'unary':          walkFolds(e.operand); break
+        case 'ternary':        walkFolds(e.condition); walkFolds(e.then); walkFolds(e.else); break
+        case 'member':         walkFolds(e.object); break
+        case 'element-access': walkFolds(e.object); walkFolds(e.index); break
+        case 'quantifier':     walkFolds(e.body); break
+        case 'array':          e.elements.forEach(walkFolds); break
+        case 'object':         e.properties.forEach(p => walkFolds(p.value)); break
+        default: break
+      }
+    }
+    if (ir.body !== undefined) walkFolds(ir.body)
+    for (const c of ir.contracts) {
+      if ('predicate' in c && typeof c.predicate === 'object' && c.predicate !== null) walkFolds(c.predicate as Expr)
+    }
+
+    for (const [foldName, f] of plainFolds) {
+      if (!vars.has(foldName)) vars.set(foldName, makeConst(foldName, 'real', ctx))
+      const lenName = `${f.arrFlat}.length`
+      if (!vars.has(lenName)) vars.set(lenName, makeConst(lenName, 'real', ctx))
+      /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any */
+      const sumV = vars.get(foldName)! as any
+      const lenV = vars.get(lenName)! as any
+      try {
+        assumptions.push(ctx.Implies(lenV.eq(0), sumV.eq(0)))
+        assumptionLabels.push(`fold: ${foldName} = 0 when ${lenName} = 0`)
+      } catch { /* sort mismatch — skip */ }
+
+      for (const c of ir.contracts) {
+        if ((c.kind !== 'requires' && c.kind !== 'assume') ||
+            typeof c.predicate !== 'object' || c.predicate === null) continue
+        let pred = c.predicate as Expr
+        if (registry !== undefined) pred = inlinePureMethodCalls(pred, registry)
+        const bound = foldBoundFromForall(pred, f.arrFlat, f.field, f.mode)
+        if (bound === null) continue
+        try {
+          const rhs = lenV.mul(bound.c)
+          assumptions.push(bound.op === '>=' ? sumV.ge(rhs) : sumV.le(rhs))
+          assumptionLabels.push(`fold bound: ${foldName} ${bound.op} ${bound.c} * ${lenName}`)
+        } catch { /* skip */ }
+      }
+      /* eslint-enable */
     }
   }
 
@@ -814,6 +880,59 @@ function translateBody(
  * Handles dotted names: `this.payments.calculateFee` → `calculateFee`
  *                       `service.applyDiscount` → `applyDiscount`
  */
+/**
+ * Derives a linear bound for a fold from a quantified element fact:
+ * `forall qi: (0 <= qi < arr.length) ==> arr[qi].field >= c` yields
+ * `sum >= c·len`. The conditional form `!arr[qi].field || arr[qi].field >= c`
+ * (nullable field) is only sound for GUARDED folds (`x.f || 0` projections):
+ * each term is then either bounded by c or exactly 0, so the bound constant
+ * is clamped through zero.
+ */
+function foldBoundFromForall(
+  pred: Expr,
+  arrFlat: string,
+  field: string,
+  mode: number,
+): { op: '>=' | '<='; c: number } | null {
+  // Mode 4: subset with an unknown fallback — no bound is derivable.
+  if (mode >= 4) return null
+  const clampDirect = mode === 2 || mode === 3   // continue-guard: terms may be 0
+  const condOk = mode === 1 || mode === 2        // zero-fallback: conditional facts usable
+  const clamp = (b: { op: '>=' | '<='; c: number }): { op: '>=' | '<='; c: number } =>
+    b.op === '>=' ? { op: '>=', c: Math.min(b.c, 0) } : { op: '<=', c: Math.max(b.c, 0) }
+
+  if (pred.kind !== 'quantifier' || pred.quantifier !== 'forall') return null
+  const body = pred.body
+  if (body.kind !== 'binary' || body.op !== '==>') return null
+  const flat = (e: Expr): string | null => {
+    if (e.kind === 'ident') return e.name
+    if (e.kind === 'member') {
+      const base = flat(e.object)
+      return base === null ? null : `${base}.${e.property}`
+    }
+    return null
+  }
+  const isProj = (x: Expr): boolean =>
+    x.kind === 'member' && x.property === field &&
+    x.object.kind === 'element-access' && flat(x.object.object) === arrFlat
+  const cmp = (e: Expr): { op: '>=' | '<='; c: number } | null => {
+    if (e.kind !== 'binary') return null
+    if (!isProj(e.left) || e.right.kind !== 'literal' || typeof e.right.value !== 'number') return null
+    if (e.op === '>=' || e.op === '>') return { op: '>=', c: e.right.value }
+    if (e.op === '<=' || e.op === '<') return { op: '<=', c: e.right.value }
+    return null
+  }
+  const concl = body.right
+  const direct = cmp(concl)
+  if (direct !== null) return clampDirect ? clamp(direct) : direct
+  if (condOk && concl.kind === 'binary' && concl.op === '||' &&
+      concl.left.kind === 'unary' && concl.left.op === '!' && isProj(concl.left.operand)) {
+    const inner = cmp(concl.right)
+    if (inner !== null) return clamp(inner)
+  }
+  return null
+}
+
 /** Globals whose methods toZ3 models natively — never hijack them with
  *  `Type.prototype.*` method contracts (Math.abs is exact; a declared
  *  Decimal.prototype.abs envelope would only weaken it). */

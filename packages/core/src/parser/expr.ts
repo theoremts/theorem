@@ -352,6 +352,71 @@ function parseExprInner(node: Expression): Expr | null {
       }
     }
 
+    // Array.prototype.reduce as a fold — `arr.reduce((acc, x) => acc + x.f, 0)`
+    // and the Decimal variant `arr.reduce((acc, x) => acc.add(x.f || 0), new Decimal(0))`
+    // desugar to the __sumBy fold symbol. A `|| 0` / `?? 0` projection guard is
+    // recorded (4th arg) — bound derivation from CONDITIONAL element facts is
+    // only sound for guarded folds (an unguarded nullish field is NaN poison).
+    if (Node.isPropertyAccessExpression(calleeExpr) && calleeExpr.getName() === 'reduce'
+        && node.getArguments().length === 2) {
+      const [arrowArg, initArg] = node.getArguments()
+      const arrRecv = parseExpr(calleeExpr.getExpression())
+      if (arrRecv !== null && arrowArg !== undefined && Node.isArrowFunction(arrowArg)) {
+        const rParams = arrowArg.getParameters()
+        // Expression body, or a block whose single statement is `return <expr>`
+        let rBody: Node | undefined = arrowArg.getBody()
+        if (rBody !== undefined && Node.isBlock(rBody)) {
+          const stmts = rBody.getStatements()
+          rBody = stmts.length === 1 && Node.isReturnStatement(stmts[0]!)
+            ? stmts[0]!.getExpression()
+            : undefined
+        }
+        if (rParams.length >= 2 && rBody !== undefined && Node.isExpression(rBody)) {
+          const accName = rParams[0]!.getName()
+          const elemName = rParams[1]!.getName()
+          const init = parseExpr(initArg as Expression)
+          const zeroInit = init !== null && (
+            (init.kind === 'literal' && init.value === 0) ||
+            (init.kind === 'call' && init.callee === 'new Decimal' && init.args.length === 1
+              && init.args[0]!.kind === 'literal' && (init.args[0] as { value: unknown }).value === 0))
+          if (zeroInit) {
+            const rParsed = parseExpr(rBody)
+            let proj: Expr | null = null
+            if (rParsed !== null) {
+              if (rParsed.kind === 'binary' && rParsed.op === '+'
+                  && rParsed.left.kind === 'ident' && rParsed.left.name === accName) {
+                proj = rParsed.right
+              } else if (rParsed.kind === 'call' && rParsed.args.length === 1
+                  && rParsed.recv?.kind === 'ident' && rParsed.recv.name === accName
+                  && (rParsed.callee === `${accName}.add` || rParsed.callee === `${accName}.plus`)) {
+                proj = rParsed.args[0]!
+              }
+            }
+            if (proj !== null) {
+              let guarded = false
+              if (proj.kind === 'binary' && (proj.op === '||' || proj.op === '??')
+                  && proj.right.kind === 'literal' && proj.right.value === 0) {
+                proj = proj.left
+                guarded = true
+              }
+              if (proj.kind === 'member' && proj.object.kind === 'ident' && proj.object.name === elemName) {
+                const display = node.getText().replace(/\s+/g, ' ')
+                return {
+                  kind: 'call', callee: '__sumBy',
+                  args: [
+                    arrRecv,
+                    { kind: 'literal', value: proj.property },
+                    { kind: 'literal', value: display },
+                    { kind: 'literal', value: guarded ? 1 : 0 },
+                  ],
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     // sortedBy(arr, (x) => x.field) — ∀ i: 0 ≤ i ∧ i+1 < len ⟹ proj(arr[i]) <= proj(arr[i+1])
     // (adjacent pairs: the form that composes well with the solver)
     if (callee === 'sortedBy' && node.getArguments().length === 2) {
@@ -869,6 +934,18 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
     return parseWithBindings(rest, bindings)
   }
 
+  // ── for-of accumulation: `for (const x of arr) acc = acc.add(x.f ?? 0)` ──
+  // Recognized loops become SSA fold bindings (acc := init + Σ). Anything
+  // outside the shape keeps today's behavior (body unextracted).
+  if (Node.isForOfStatement(first)) {
+    const folds = tryFoldForOf(first, bindings)
+    if (folds !== null) {
+      for (const [name, boundExpr] of folds) bindings.set(name, boundExpr)
+      return parseWithBindings(rest, bindings)
+    }
+    return null
+  }
+
   // ── while / for — skip for expression body (loops handled separately) ─────
   if (Node.isWhileStatement(first) || Node.isForStatement(first)) {
     return parseWithBindings(rest, bindings)
@@ -880,6 +957,120 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
   }
 
   return null
+}
+
+// ── for-of fold recognition ─────────────────────────────────────────────────
+
+/**
+ * Recognizes `for (const x of arr) { [if (cond) continue;]* acc = acc + x.f; ... }`
+ * and returns SSA bindings mapping each accumulator to `init + __sumBy(arr, f)`.
+ *
+ * The fold's 4th argument encodes the soundness mode for bound derivation:
+ *   0 — exact terms (bare `x.f`, or `?? IDENT` fallback that a direct fact
+ *       makes unreachable): unconditional facts apply unclamped.
+ *   1 — zero-guarded (`x.f ?? 0` / `|| 0`): conditional facts apply, clamped.
+ *   2 — subset (continue-guard) + zero-guarded: everything clamped.
+ *   3 — subset, bare projection: unconditional facts only, clamped.
+ *   4 — subset with unknown fallback: no bounds (only the empty-array axiom).
+ */
+function tryFoldForOf(stmt: Statement, bindings: Map<string, Expr>): Map<string, Expr> | null {
+  if (!Node.isForOfStatement(stmt)) return null
+  const init = stmt.getInitializer()
+  if (!Node.isVariableDeclarationList(init)) return null
+  const decls = init.getDeclarations()
+  if (decls.length !== 1) return null
+  const elemNode = decls[0]!.getNameNode()
+  if (!Node.isIdentifier(elemNode)) return null
+  const elemName = elemNode.getText()
+
+  const arrRaw = parseExpr(stmt.getExpression())
+  if (arrRaw === null) return null
+  const arrExpr = bindings.size > 0 ? substituteIdents(arrRaw, bindings) : arrRaw
+
+  const bodyNode = stmt.getStatement()
+  const stmts: Statement[] = Node.isBlock(bodyNode) ? [...bodyNode.getStatements()] : [bodyNode as Statement]
+
+  // Leading `if (cond) continue;` guards — the fold sums a SUBSET
+  let hasContinue = false
+  while (stmts.length > 0 && Node.isIfStatement(stmts[0]!)) {
+    const ifs = stmts[0]!
+    if (ifs.getElseStatement() !== undefined) return null
+    const then = ifs.getThenStatement()
+    const thenStmts = Node.isBlock(then) ? then.getStatements() : [then]
+    if (thenStmts.length !== 1 || !Node.isContinueStatement(thenStmts[0]!)) return null
+    hasContinue = true
+    stmts.shift()
+  }
+  if (stmts.length === 0) return null
+
+  const display = stmt.getText().replace(/\s+/g, ' ').slice(0, 80)
+  const out = new Map<string, Expr>()
+
+  for (const s of stmts) {
+    if (!Node.isExpressionStatement(s)) return null
+    const e = s.getExpression()
+    if (!Node.isBinaryExpression(e)) return null
+    const lhs = e.getLeft()
+    if (!Node.isIdentifier(lhs)) return null
+    const accName = lhs.getText()
+    const opKind = e.getOperatorToken().getKind()
+
+    let addend: Expr | null = null
+    if (opKind === SyntaxKind.PlusEqualsToken) {
+      addend = parseExpr(e.getRight())
+    } else if (opKind === SyntaxKind.EqualsToken) {
+      const rhs = parseExpr(e.getRight())
+      if (rhs === null) return null
+      if (rhs.kind === 'binary' && rhs.op === '+' && rhs.left.kind === 'ident' && rhs.left.name === accName) {
+        addend = rhs.right
+      } else if (rhs.kind === 'call' && rhs.args.length === 1
+          && rhs.recv?.kind === 'ident' && rhs.recv.name === accName
+          && (rhs.callee === `${accName}.add` || rhs.callee === `${accName}.plus`)) {
+        addend = rhs.args[0]!
+      } else {
+        return null
+      }
+    } else {
+      return null
+    }
+    if (addend === null) return null
+
+    // Classify the projection and its fallback
+    let proj = addend
+    let zeroFallback = false
+    let identFallback = false
+    if (proj.kind === 'binary' && (proj.op === '??' || proj.op === '||')) {
+      const fb = proj.right
+      if (fb.kind === 'literal' && fb.value === 0) zeroFallback = true
+      else if (fb.kind === 'call' && fb.callee === 'new Decimal' && fb.args.length === 1
+          && fb.args[0]!.kind === 'literal' && (fb.args[0] as { value: unknown }).value === 0) zeroFallback = true
+      else if (fb.kind === 'ident') identFallback = true
+      else return null
+      proj = proj.left
+    }
+    if (!(proj.kind === 'member' && proj.object.kind === 'ident' && proj.object.name === elemName)) return null
+
+    const mode = identFallback
+      ? (hasContinue ? 4 : 0)
+      : zeroFallback
+        ? (hasContinue ? 2 : 1)
+        : (hasContinue ? 3 : 0)
+
+    const fold: Expr = {
+      kind: 'call', callee: '__sumBy',
+      args: [
+        arrExpr,
+        { kind: 'literal', value: proj.property },
+        { kind: 'literal', value: display },
+        { kind: 'literal', value: mode },
+      ],
+    }
+    const prev = out.get(accName) ?? bindings.get(accName) ?? { kind: 'ident' as const, name: accName }
+    const isZeroInit = prev.kind === 'literal' && prev.value === 0
+    out.set(accName, isZeroInit ? fold : { kind: 'binary', op: '+', left: prev, right: fold })
+  }
+
+  return out
 }
 
 // ── Assignment helpers ───────────────────────────────────────────────────────
