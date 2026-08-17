@@ -9,24 +9,78 @@ export function output(): any {
   return undefined
 }
 
-export function positive(value: number): boolean {
-  return value > 0
+// Numeric domain helpers accept nullable values AND Decimal-like objects
+// (anything with toNumber()) by TYPE, so contracts over optional or Decimal
+// parameters read as one word — `requires(gte(rate, 0))` — with the
+// semantics "present AND in the domain". At runtime a nullish value fails
+// the check; the engine translates the plain numeric comparison.
+
+/** A contract-comparable value: number, Decimal-like, or absent. */
+export type ComparableValue = number | { toNumber(): number } | null | undefined
+
+function numValue(v: ComparableValue): number | null {
+  if (v == null) return null
+  return typeof v === 'number' ? v : v.toNumber()
 }
 
-export function nonNegative(value: number): boolean {
-  return value >= 0
+export function gt(value: ComparableValue, bound: ComparableValue): boolean {
+  const a = numValue(value); const b = numValue(bound)
+  return a != null && b != null && a > b
 }
 
-export function negative(value: number): boolean {
-  return value < 0
+export function gte(value: ComparableValue, bound: ComparableValue): boolean {
+  const a = numValue(value); const b = numValue(bound)
+  return a != null && b != null && a >= b
 }
 
-export function finite(value: number): boolean {
-  return Number.isFinite(value)
+export function lt(value: ComparableValue, bound: ComparableValue): boolean {
+  const a = numValue(value); const b = numValue(bound)
+  return a != null && b != null && a < b
 }
 
-export function between(value: number, min: number, max: number): boolean {
-  return value >= min && value <= max
+export function lte(value: ComparableValue, bound: ComparableValue): boolean {
+  const a = numValue(value); const b = numValue(bound)
+  return a != null && b != null && a <= b
+}
+
+export function eq(value: ComparableValue, bound: ComparableValue): boolean {
+  const a = numValue(value); const b = numValue(bound)
+  return a != null && b != null && a === b
+}
+
+export function neq(value: ComparableValue, bound: ComparableValue): boolean {
+  const a = numValue(value); const b = numValue(bound)
+  return a != null && b != null && a !== b
+}
+
+export function positive(value: ComparableValue): boolean {
+  return gt(value, 0)
+}
+
+export function nonNegative(value: ComparableValue): boolean {
+  return gte(value, 0)
+}
+
+export function negative(value: ComparableValue): boolean {
+  return lt(value, 0)
+}
+
+export function finite(value: ComparableValue): boolean {
+  const n = numValue(value)
+  return n != null && Number.isFinite(n)
+}
+
+export function between(value: ComparableValue, min: ComparableValue, max: ComparableValue): boolean {
+  return gte(value, min) && lte(value, max)
+}
+
+/**
+ * Presence assertion usable as a TypeScript type guard: after
+ * `requires(defined(x) && x.balance >= 0)` the `&&` narrows `x` for the rest
+ * of the predicate. The engine translates it to `x !== null`.
+ */
+export function defined<T>(value: T | null | undefined): value is T {
+  return value != null
 }
 
 export function sorted(arr: number[]): boolean {

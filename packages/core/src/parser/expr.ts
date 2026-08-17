@@ -499,6 +499,33 @@ function parseExprInner(node: Expression): Expr | null {
       }
     }
 
+    // defined(x) — presence assertion (TS type guard in the runtime typing);
+    // desugars to x !== null so the existing null machinery applies.
+    if (callee === 'defined' && node.getArguments().length === 1) {
+      const inner = parseExpr(node.getArguments()[0] as Expression)
+      if (inner !== null) {
+        return { kind: 'binary', op: '!==', left: inner, right: { kind: 'literal', value: null } }
+      }
+    }
+
+    // Comparison vocabulary — gt/gte/lt/lte/eq/neq(a, b) desugar to plain
+    // binary comparisons. The runtime typing accepts nullable and Decimal-like
+    // values, so `gte(rate, 0)` covers number AND Decimal parameters without
+    // the method-contract machinery.
+    {
+      const CMP_HELPERS: Record<string, BinaryOp> = {
+        gt: '>', gte: '>=', lt: '<', lte: '<=', eq: '===', neq: '!==',
+      }
+      const cmpOp = CMP_HELPERS[callee]
+      if (cmpOp !== undefined && node.getArguments().length === 2) {
+        const a = parseExpr(node.getArguments()[0] as Expression)
+        const b = parseExpr(node.getArguments()[1] as Expression)
+        if (a !== null && b !== null) {
+          return { kind: 'binary', op: cmpOp, left: a, right: b }
+        }
+      }
+    }
+
     // sorted(arr) — ∀ i j: 0 ≤ i ≤ j < len ⟹ arr[i] <= arr[j]
     // unique(arr) — ∀ i j: in-range ∧ i ≠ j ⟹ arr[i] !== arr[j]
     if ((callee === 'sorted' || callee === 'unique') && node.getArguments().length === 1) {

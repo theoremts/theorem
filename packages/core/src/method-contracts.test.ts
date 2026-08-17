@@ -110,6 +110,41 @@ describe('method contracts: Decimal chains', () => {
     assert.strictEqual(results.find(r => r.text.includes('>= 100'))?.status, 'proved')
   })
 
+  test('comparison vocabulary covers Decimal parameters without the method bridge', async () => {
+    const results = await verifyWithDeclares(`
+      export function convertRateToShare(ratePercent: Decimal): Decimal {
+        requires(gte(ratePercent, 0))
+        ensures(gte(output(), 0) && lt(output(), 100))
+        return ratePercent.div(ratePercent.add(100)).mul(100)
+      }
+    `)
+    assert.strictEqual(results.find(r => r.text.includes('output() >= 0'))?.status, 'proved')
+    assert.strictEqual(results.find(r => r.text.includes('!== 0'))?.status, 'proved')
+  })
+
+  test('nullable-tolerant helpers: defined narrows, nonNegative implies presence', async () => {
+    const results = await verifyWithDeclares(`
+      export function pay(minutes: number | null): number {
+        requires(nonNegative(minutes))
+        ensures(output() >= 0)
+        return minutes === null ? 0 : minutes * 2
+      }
+      export function guard(x: number | null): number {
+        requires(defined(x) && x >= 1)
+        ensures(output() >= 1)
+        return x === null ? 0 : x
+      }
+      export function tooStrong(x: number | null): number {
+        requires(nonNegative(x))
+        ensures(output() >= 1)
+        return x === null ? 0 : x
+      }
+    `)
+    assert.strictEqual(results.find(r => r.fn === 'pay')?.status, 'proved')
+    assert.strictEqual(results.find(r => r.fn === 'guard')?.status, 'proved')
+    assert.strictEqual(results.find(r => r.fn === 'tooStrong')?.status, 'disproved')
+  })
+
   test('a wrong postcondition on a chain is refuted, not skipped', async () => {
     const results = await verifyWithDeclares(`
       export function addTen(x: Decimal): number {
