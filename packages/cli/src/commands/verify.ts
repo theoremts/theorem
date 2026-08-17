@@ -196,7 +196,15 @@ async function verifyFile(
   for (const ir of irs) {
     // Houdini: uninvarianted loops get requires/ensures conjuncts as
     // guess-and-check invariant candidates — survivors show as (auto)
-    const tasks = await translateWithAutoInvariants(ir, ctx, registry)
+    // Translation failures are isolated PER FUNCTION: one untranslatable
+    // shape must never take down the file (or, sharded, five sibling files).
+    let tasks: VerificationTask[]
+    try {
+      tasks = await translateWithAutoInvariants(ir, ctx, registry)
+    } catch (err) {
+      process.stderr.write(`${dim}skipped ${ir.name ?? '(anonymous)'} in ${displayPath}: ${err instanceof Error ? err.message : String(err)}${reset}\n`)
+      continue
+    }
     if (tasks.length === 0) continue
 
     if (opts.debug) debugTranslator(tasks)
@@ -480,9 +488,11 @@ function runSharded(
         THEOREM_TOTALS_FILE: totalsFile,
       },
     })
-    if (res.error !== undefined || (res.status !== 0 && res.status !== 1)) {
-      process.stderr.write(`${red}shard ${i / SHARD_SIZE + 1}/${shards} crashed${reset} (${res.error?.message ?? `exit ${res.status}`}) — its files were skipped\n`)
-    }
+    // A healthy child ALWAYS writes its totals file — a missing one means the
+    // child died mid-run (uncaught error exits 1, indistinguishable from
+    // --strict failures by status alone). Recover by re-running the shard's
+    // files ONE BY ONE so a single bad file costs itself, not its siblings.
+    let gotTotals = false
     try {
       const t = JSON.parse(readFileSync(totalsFile, 'utf-8')) as { proved: number; failed: number; unknown: number; filesWithContracts: number }
       proved += t.proved
@@ -490,7 +500,33 @@ function runSharded(
       unknown += t.unknown
       filesWithContracts += t.filesWithContracts
       unlinkSync(totalsFile)
+      gotTotals = true
     } catch { /* shard produced no totals */ }
+
+    if (!gotTotals || res.error !== undefined) {
+      process.stderr.write(`${red}shard ${i / SHARD_SIZE + 1}/${shards} died${reset} (${res.error?.message ?? `exit ${res.status}`}) — retrying its files individually\n`)
+      for (const file of chunk) {
+        const soloTotals = join(tmpdir(), `theorem-totals-${process.pid}-${i}-${chunk.indexOf(file)}.json`)
+        const soloArgs = [process.argv[1]!, 'verify', file]
+        if (opts.debug) soloArgs.push('--debug')
+        if (opts.timeout !== undefined) soloArgs.push('--timeout', opts.timeout)
+        const solo = spawnSync(process.execPath, soloArgs, {
+          cwd,
+          stdio: ['ignore', 'inherit', 'inherit'],
+          env: { ...process.env, THEOREM_SHARD_CHILD: '1', THEOREM_REGISTRY_FILE: regFile, THEOREM_TOTALS_FILE: soloTotals },
+        })
+        try {
+          const t = JSON.parse(readFileSync(soloTotals, 'utf-8')) as { proved: number; failed: number; unknown: number; filesWithContracts: number }
+          proved += t.proved
+          failed += t.failed
+          unknown += t.unknown
+          filesWithContracts += t.filesWithContracts
+          unlinkSync(soloTotals)
+        } catch {
+          process.stderr.write(`${red}  ${relative(cwd, file)} could not be verified${reset} (${solo.error?.message ?? `exit ${solo.status}`})\n`)
+        }
+      }
+    }
   }
   try { unlinkSync(regFile) } catch { /* already gone */ }
 

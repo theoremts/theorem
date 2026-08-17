@@ -190,6 +190,18 @@ export function toZ3(
         vars.set(havocName, b as unknown as Z3Expr)
         cond = b as unknown as Z3Expr
       }
+      // Truthiness guard: a numeric/reference condition (`end ? a : b`) is not
+      // a Bool — Not/If on it THROWS out of the try-less null-branch path and
+      // killed whole shards. Havoc it like an untranslatable guard.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+        if (String((cond as any).sort) !== 'Bool') {
+          const havocName = `__havocb_${havocCondCounter++}`
+          const b = ctx.Bool.const(havocName)
+          vars.set(havocName, b as unknown as Z3Expr)
+          cond = b as unknown as Z3Expr
+        }
+      } catch { /* sort probe failed — leave as-is */ }
 
       const thenIsNull = expr.then.kind === 'literal' && expr.then.value === null
       const elseIsNull = expr.else.kind === 'literal' && expr.else.value === null
