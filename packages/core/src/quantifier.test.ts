@@ -326,6 +326,34 @@ describe('call sites: enclosing requires through callbacks', () => {
     assert.strictEqual(req.status, 'disproved')
   })
 
+  test('dedup idiom inside an if-branch grants uniqueBy at the nested call site', async () => {
+    const ctx = await getContext()
+    const source = `
+      declare(FeeCalculator, (ruleSet: FeeRule[], _item: unknown): number => {
+        requires(uniqueBy(ruleSet, (m) => m.key));
+        return 0;
+      });
+      export function calc(item: Item, projectRules: FeeRule[]): number {
+        const overrides = item.rateOverrides;
+        if (overrides) {
+          const rulesDeduped = [...new Map(projectRules.map((m) => [m.key, m])).values()];
+          const c = new FeeCalculator(rulesDeduped, { baseCost: item.cost, rateOverrides: overrides });
+          return c;
+        }
+        return 0;
+      }
+    `
+    const { extractDeclareContracts } = await import('./parser/index.js')
+    const registry = buildRegistry([
+      ...extractDeclareContracts(source, 'd.contracts.ts'),
+      ...extractFromSource(source),
+    ])
+    const tasks = extractCallSiteObligations(source, 'test.ts', registry, ctx)
+    const obligation = tasks.find(t => t.contractText.includes('FeeCalculator'))
+    assert.ok(obligation, 'Expected the nested constructor obligation')
+    assert.strictEqual((await check(obligation)).status, 'proved')
+  })
+
   test('a callback parameter shadowing the name drops the outer fact', async () => {
     // The callback rebinds `taxRate` — the outer requires is about a
     // DIFFERENT variable and must not discharge this obligation.

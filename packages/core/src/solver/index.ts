@@ -54,20 +54,31 @@ export async function check(input: CheckInput): Promise<SolverResult> {
   solver.set('timeout', timeout)
 
   // ── Domain constraints (always asserted, not tracked) ────────────────────
-  for (const dc of domainConstraints) solver.add(dc)
+  // Asserting a malformed expression (wrong sort reaching the solver) must
+  // degrade to an unknown result, never crash the process — in sharded runs
+  // an uncaught throw here used to kill six sibling files.
+  try {
+    for (const dc of domainConstraints) solver.add(dc)
+  } catch (err) {
+    return { status: 'unknown', reason: `assertion rejected: ${err instanceof Error ? err.message : String(err)}` }
+  }
 
   // ── Assumptions — optionally tracked for unsat cores ─────────────────────
   const tracked = assumptionLabels !== undefined && assumptionLabels.length === assumptions.length
   const trackingLabels: Z3Bool[] = []
 
-  if (tracked) {
-    for (let i = 0; i < assumptions.length; i++) {
-      const label = Z3.Bool.const(`__req_${i}`)
-      solver.addAndTrack(assumptions[i]!, label)
-      trackingLabels.push(label)
+  try {
+    if (tracked) {
+      for (let i = 0; i < assumptions.length; i++) {
+        const label = Z3.Bool.const(`__req_${i}`)
+        solver.addAndTrack(assumptions[i]!, label)
+        trackingLabels.push(label)
+      }
+    } else {
+      for (const a of assumptions) solver.add(a)
     }
-  } else {
-    for (const a of assumptions) solver.add(a)
+  } catch (err) {
+    return { status: 'unknown', reason: `assertion rejected: ${err instanceof Error ? err.message : String(err)}` }
   }
 
   // ── Check — goal passed as temporary assumption (not permanently added) ──

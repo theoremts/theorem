@@ -254,11 +254,13 @@ export function extractCallSiteObligations(
         }
       }
 
-      // Add path conditions as assumptions (if-guards enclosing the call)
+      // Add path conditions as assumptions (if-guards enclosing the call).
+      // A truthiness guard (`if (overrides)`) translates as a non-Bool — it
+      // would pass construction and explode inside the solver; drop it.
       for (const { expr: condExpr, negated } of pathConditions) {
         collectAndCreateVars(condExpr, vars, ctx)
         const condZ3 = toZ3(condExpr, vars, ctx)
-        if (condZ3) {
+        if (condZ3 && isBoolSorted(condZ3)) {
           try {
             const assumption = negated ? ctx.Not(condZ3 as Bool<'main'>) : condZ3 as Bool<'main'>
             assumptions.push(assumption)
@@ -272,7 +274,7 @@ export function extractCallSiteObligations(
         const reqExpr = inlinePureMethodCalls(rawReqExpr, registry)
         collectAndCreateVars(reqExpr, vars, ctx)
         const reqZ3 = toZ3(reqExpr, vars, ctx)
-        if (reqZ3) {
+        if (reqZ3 && isBoolSorted(reqZ3)) {
           try {
             assumptions.push(reqZ3 as Bool<'main'>)
             assumptionLabels.push(`enclosing requires: ${prettyExpr(reqExpr)}`)
@@ -324,6 +326,12 @@ export function extractCallSiteObligations(
  * Resolves a callee name against the registry: tries the full text first,
  * then the last segment of a dotted name (e.g. `utils.safeAdd` → `safeAdd`).
  */
+/** True when a Z3 expression is Bool-sorted — the only sort assertable as an assumption. */
+function isBoolSorted(e: AnyExpr<'main'>): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+  try { return String((e as any).sort) === 'Bool' } catch { return false }
+}
+
 function resolveContract(calleeName: string, registry: ContractRegistry, argCount?: number) {
   if (registry.has(calleeName)) return registry.get(calleeName)
   if (calleeName.includes('.')) {
@@ -616,8 +624,16 @@ function collectEnclosingDedupFacts(callNode: Node): Expr[] {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
       const body = (parent as any).getBody()
       if (body && Node.isBlock(body)) {
-        for (const stmt of body.getStatements()) {
-          if (!Node.isVariableStatement(stmt)) continue
+        // ALL declarations in the function, nested blocks included — the
+        // dedup const usually lives inside an if-branch right before the
+        // call. Block scoping makes the per-name grant safe: a reference
+        // outside the variable's scope would not compile. Declarations in
+        // NESTED functions are excluded — their scope doesn't reach here.
+        for (const stmt of (body as Node).getDescendantsOfKind(SyntaxKind.VariableStatement)) {
+          const owner = stmt.getFirstAncestor(a =>
+            Node.isFunctionDeclaration(a) || Node.isArrowFunction(a) ||
+            Node.isFunctionExpression(a) || Node.isMethodDeclaration(a))
+          if (owner !== parent) continue
           for (const decl of stmt.getDeclarations()) {
             const init = decl.getInitializer()
             if (init === undefined) continue
