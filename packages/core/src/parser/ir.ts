@@ -107,6 +107,14 @@ export interface Param {
   /** Discriminated-union metadata: `p.kind` ranges over these string
    *  literals — exhaustiveness becomes a provable fact. */
   discriminant?: { property: string; values: string[] } | undefined
+  /** Default value (`precision = 2`) — applied for missing call-site args. */
+  defaultValue?: Expr | undefined
+  /** Declared optional (`x?: number`). */
+  optional?: boolean | undefined
+  /** Source parameter position (several expanded params share one when destructured). */
+  argPos?: number | undefined
+  /** Property name inside a destructured object parameter (accounts renames). */
+  patternProp?: string | undefined
 }
 
 /**

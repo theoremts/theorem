@@ -98,3 +98,46 @@ describe('zod schemas as out-of-the-box contracts', () => {
     assert.strictEqual(results.length, 0, 'no contracts and no schema → no verification tasks')
   })
 })
+
+describe('zod dedup transforms as uniqueness guarantees', () => {
+  test('.transform Map-dedup grants uniqueBy on the parsed value', async () => {
+    const results = await verifyAll(`
+      const RulesSchema = z.array(z.object({ key: z.string() }))
+        .transform((arr) => [...new Map(arr.map((m) => [m.key, m])).values()])
+      export function useRules(input: unknown): number {
+        const rules = RulesSchema.parse(input)
+        check(uniqueBy(rules, (m) => m.key))
+        return 0
+      }
+    `)
+    const target = results.find(r => r.text.includes('uniqueBy') && !r.text.includes('forall'))
+    assert.ok(target, `Expected the uniqueBy check, got: ${results.map(r => r.text).join('; ')}`)
+    assert.strictEqual(target.status, 'proved', 'the schema transform guarantees deduplication')
+  })
+
+  test('.transform Set-dedup grants unique() — and refine-less schema does NOT', async () => {
+    const granted = await verifyAll(`
+      const IdsSchema = z.array(z.number()).transform((ids) => [...new Set(ids)])
+      export function useIds(input: unknown): number {
+        const ids = IdsSchema.parse(input)
+        check(unique(ids))
+        return 0
+      }
+    `)
+    const g = granted.find(r => r.text.includes('unique'))
+    assert.ok(g, 'Expected the unique check')
+    assert.strictEqual(g.status, 'proved')
+
+    const bare = await verifyAll(`
+      const IdsSchema = z.array(z.number())
+      export function useIds(input: unknown): number {
+        const ids = IdsSchema.parse(input)
+        check(unique(ids))
+        return 0
+      }
+    `)
+    const b = bare.find(r => r.text.includes('unique'))
+    assert.ok(b, 'Expected the unique check')
+    assert.strictEqual(b.status, 'disproved', 'no transform, no uniqueness')
+  })
+})

@@ -21,10 +21,20 @@ let havocCondCounter = 0
  * The `vars` map is mutated lazily: member-access expressions like
  * `from.balance` introduce a new flat Real variable on first use.
  */
+/**
+ * Sort context for a subexpression: 'string' when compared against a string
+ * literal (or a field already known to be string-valued), 'bool' when used
+ * for its truthiness (`!m.isEnabled`, `&& d.isEnabled`). Fields get separate
+ * Int→String (__sfield_) / Int→Bool (__bfield_) views of the heap; consistency
+ * across contracts holds because Z3 consts are global by name.
+ */
+export type SortContext = 'string' | 'bool' | undefined
+
 export function toZ3(
   expr: Expr,
   vars: Map<string, Z3Expr>,
   ctx: Z3Context,
+  want?: SortContext,
 ): Z3Expr | null {
   switch (expr.kind) {
     // ── Literals ──────────────────────────────────────────────────
@@ -45,6 +55,14 @@ export function toZ3(
         const thisVar = makeConst('this', 'real', ctx)
         vars.set('this', thisVar)
         return thisVar
+      }
+      // In string context (compared against a string literal) a fresh ident
+      // is a String — `status === "paid"` must not sort-mismatch. In bool
+      // context (truthiness operand) it is a free Bool.
+      if (want === 'string' || want === 'bool') {
+        const sv = makeConst(expr.name, want === 'string' ? 'string' : 'bool', ctx)
+        vars.set(expr.name, sv)
+        return sv
       }
       return null
     }
@@ -75,9 +93,16 @@ export function toZ3(
         const elem = toZ3(expr.object, vars, ctx)
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
         if (elem !== null && String((elem as any).sort) === 'Int') {
-          const fieldArrName = `__field_${expr.property}`
+          // String/bool context gets its own typed view of the field:
+          // `m.appliesTo === "baseCost"` reads Int→String __sfield_appliesTo,
+          // `!m.isEnabled` reads Int→Bool __bfield_isEnabled — instead of
+          // sort-mismatching against the Real field heap.
+          const fieldArrName = want === 'string' ? `__sfield_${expr.property}`
+            : want === 'bool' ? `__bfield_${expr.property}`
+            : `__field_${expr.property}`
           if (!vars.has(fieldArrName)) {
-            vars.set(fieldArrName, ctx.Array.const(fieldArrName, ctx.Int.sort(), ctx.Real.sort()) as unknown as Z3Expr)
+            const range = want === 'string' ? ctx.String.sort() : want === 'bool' ? ctx.Bool.sort() : ctx.Real.sort()
+            vars.set(fieldArrName, ctx.Array.const(fieldArrName, ctx.Int.sort(), range) as unknown as Z3Expr)
           }
           try {
             return ctx.Select(vars.get(fieldArrName)! as Z3Array, elem as Z3Arith) as unknown as Z3Expr
@@ -108,7 +133,8 @@ export function toZ3(
       const flatName = flattenMember(expr)
       if (flatName === null) return null
       if (!vars.has(flatName)) {
-        vars.set(flatName, makeConst(flatName, 'real', ctx))
+        const sort = want === 'string' ? 'string' : want === 'bool' ? 'bool' : 'real'
+        vars.set(flatName, makeConst(flatName, sort, ctx))
       }
       return vars.get(flatName)!
     }
@@ -165,13 +191,19 @@ export function toZ3(
     case 'unary': {
       if (expr.op === 'typeof') return null
 
-      const operand = toZ3(expr.operand, vars, ctx)
-      if (operand === null) return null
-
       if (expr.op === '-') {
+        const operand = toZ3(expr.operand, vars, ctx)
+        if (operand === null) return null
         try { return (operand as Z3Arith).neg() } catch { return null }
       }
-      // op === '!' — only works on Bool sort, not String/Real
+
+      // op === '!' — truthiness. Ident/member operands translate bool-first:
+      // an existing Bool var comes back unchanged, a fresh field routes
+      // through the Int→Bool view (`!m.isEnabled` inside a forall) instead
+      // of eagerly minting a Real that Not() then rejects.
+      const boolFirst = expr.operand.kind === 'ident' || expr.operand.kind === 'member'
+      const operand = toZ3(expr.operand, vars, ctx, boolFirst ? 'bool' : undefined)
+      if (operand === null) return null
       try { return ctx.Not(operand as Z3Bool) } catch { return null }
     }
 
@@ -337,8 +369,43 @@ export function toZ3(
         return null
       }
 
-      const left  = toZ3(expr.left,  vars, ctx)
-      const right = toZ3(expr.right, vars, ctx)
+      // String-literal comparisons put the other side in string context:
+      // fresh idents/members come out String-sorted, and element fields
+      // route through the Int→String field view (__sfield_). Field-vs-field
+      // comparisons (`d.key === m.appliesTo`) go string too once EITHER field
+      // already has a string view — the literal comparison in the same
+      // predicate typed it (left-to-right, so `m.appliesTo === "baseCost"`
+      // registers the view before the exists needs it).
+      if (expr.op === '===' || expr.op === '!==') {
+        const isStrLit = (e: Expr): boolean => e.kind === 'literal' && typeof e.value === 'string'
+        const elemFieldProp = (e: Expr): string | null =>
+          e.kind === 'member' && e.object.kind === 'element-access' ? e.property : null
+        const hasStringView = (e: Expr): boolean => {
+          const p = elemFieldProp(e)
+          return p !== null && vars.has(`__sfield_${p}`)
+        }
+        if (isStrLit(expr.left) !== isStrLit(expr.right)) {
+          const l = toZ3(expr.left, vars, ctx, isStrLit(expr.right) ? 'string' : undefined)
+          const r = toZ3(expr.right, vars, ctx, isStrLit(expr.left) ? 'string' : undefined)
+          if (l === null || r === null) return null
+          try { return applyBinaryOp(expr.op, l, r, ctx) } catch { return null }
+        }
+        if (hasStringView(expr.left) || hasStringView(expr.right)) {
+          const l = toZ3(expr.left, vars, ctx, 'string')
+          const r = toZ3(expr.right, vars, ctx, 'string')
+          if (l === null || r === null) return null
+          try { return applyBinaryOp(expr.op, l, r, ctx) } catch { return null }
+        }
+      }
+
+      // Truthiness operands of && / || translate bool-first, mirroring `!`:
+      // `d.key === m.appliesTo && d.isEnabled` reads the Int→Bool field view.
+      const operandWant = (e: Expr): SortContext =>
+        (expr.op === '&&' || expr.op === '||') && (e.kind === 'ident' || e.kind === 'member')
+          ? 'bool' : undefined
+
+      const left  = toZ3(expr.left,  vars, ctx, operandWant(expr.left))
+      const right = toZ3(expr.right, vars, ctx, operandWant(expr.right))
       if (left === null || right === null) return null
       try { return applyBinaryOp(expr.op, left, right, ctx) } catch { return null }
     }

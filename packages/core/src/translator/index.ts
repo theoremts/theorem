@@ -983,6 +983,70 @@ function resolveCallee(callee: string, registry: ContractRegistry, allowProtoSuf
   return null
 }
 
+type MappableParam = {
+  name: string
+  defaultValue?: Expr | undefined
+  optional?: boolean | undefined
+  argPos?: number | undefined
+  patternProp?: string | undefined
+}
+
+/**
+ * Builds the param-name → argument-expression substitution for a call.
+ * Position-aware: several DESTRUCTURED params may share one argument slot —
+ * an object-literal argument maps each param to its property value, a plain
+ * expression maps it to `arg.prop`. Missing arguments take their declared
+ * DEFAULTS (`setPrecision(x)` binds precision := 2, so the callee's
+ * requires is checked against the value the call actually runs with).
+ */
+export function buildCallMapping(params: MappableParam[], argExprs: Expr[]): Map<string, Expr> {
+  const mapping = new Map<string, Expr>()
+  params.forEach((p, i) => {
+    const pos = p.argPos ?? i
+    const arg = argExprs[pos]
+    if (arg !== undefined) {
+      if (p.patternProp !== undefined) {
+        if (arg.kind === 'object') {
+          const prop = arg.properties.find(pr => pr.key === p.patternProp)
+          if (prop !== undefined) mapping.set(p.name, prop.value)
+          else if (p.defaultValue !== undefined) mapping.set(p.name, p.defaultValue)
+        } else {
+          mapping.set(p.name, { kind: 'member', object: arg, property: p.patternProp })
+        }
+      } else {
+        mapping.set(p.name, arg)
+      }
+    } else if (p.defaultValue !== undefined) {
+      mapping.set(p.name, p.defaultValue)
+    }
+  })
+  return mapping
+}
+
+/** Number of ARGUMENT POSITIONS a call may supply (destructured params share one). */
+export function paramPositionCount(params: MappableParam[]): number {
+  const positions = new Set<number>()
+  params.forEach((p, i) => positions.add(p.argPos ?? i))
+  return positions.size
+}
+
+/** Number of argument positions a call MUST supply (no default, not optional). */
+export function requiredParamCount(params: MappableParam[]): number {
+  const skippable = new Map<number, boolean>()
+  params.forEach((p, i) => {
+    const pos = p.argPos ?? i
+    const ok = p.defaultValue !== undefined || p.optional === true
+    skippable.set(pos, (skippable.get(pos) ?? true) && ok)
+  })
+  const sorted = [...skippable.keys()].sort((a, b) => a - b)
+  let required = sorted.length
+  for (let k = sorted.length - 1; k >= 0; k--) {
+    if (skippable.get(sorted[k]!) === true) required = k
+    else break
+  }
+  return required
+}
+
 /** Prototype-method matching is off for calls whose receiver is a native
  *  namespace ident (Math.round must stay Math.round). */
 function protoSuffixAllowed(expr: Extract<Expr, { kind: 'call' }>): boolean {
@@ -1010,10 +1074,7 @@ export function inlinePureMethodCalls(expr: Expr, registry: ContractRegistry, de
             const ens = contract.ensures[0]!
             if (typeof ens !== 'string' && ens.kind === 'binary' && ens.op === '===' &&
                 ens.left.kind === 'call' && ens.left.callee === 'output' && ens.left.args.length === 0) {
-              const mapping = new Map<string, Expr>()
-              for (let i = 0; i < Math.min(contract.params.length, callArgs.length); i++) {
-                mapping.set(contract.params[i]!.name, callArgs[i]!)
-              }
+              const mapping = buildCallMapping(contract.params, callArgs)
               return inlinePureMethodCalls(substituteExpr(ens.right, mapping), registry, depth + 1)
             }
           }
@@ -1048,10 +1109,7 @@ function translateModularCall(
   if (!contract) return null
 
   // Build a substitution: callee param names → actual argument expressions
-  const mapping = new Map<string, Expr>()
-  for (let i = 0; i < Math.min(contract.params.length, argExprs.length); i++) {
-    mapping.set(contract.params[i]!.name, argExprs[i]!)
-  }
+  const mapping = buildCallMapping(contract.params, argExprs)
 
   // Create a fresh variable for the return value
   const retName = `__ret_${callee}_${callCounter++}`
@@ -1120,9 +1178,12 @@ function rewriteRegisteredCalls(
       // only with matching arity — `calculator.total()` must not inherit the
       // contract of `total(lineItems, taxRate, rules)`.
       if (resolved !== null && resolved !== expr.callee && !resolved.includes('.prototype.') &&
-          !expr.callee.startsWith('new ') &&
-          registry.get(resolved) !== undefined && registry.get(resolved)!.params.length !== args.length) {
-        resolved = null
+          !expr.callee.startsWith('new ')) {
+        const lastSegContract = registry.get(resolved)
+        if (lastSegContract !== undefined &&
+            (args.length < requiredParamCount(lastSegContract.params) || args.length > paramPositionCount(lastSegContract.params))) {
+          resolved = null
+        }
       }
       if (resolved !== null) {
         // A `Type.prototype.method` contract takes the receiver as its first
@@ -1137,10 +1198,7 @@ function rewriteRegisteredCalls(
           const ens = contract.ensures[0]!
           if (typeof ens !== 'string' && ens.kind === 'binary' && ens.op === '===' &&
               ens.left.kind === 'call' && ens.left.callee === 'output' && ens.left.args.length === 0) {
-            const mapping = new Map<string, Expr>()
-            for (let i = 0; i < Math.min(contract.params.length, callArgs.length); i++) {
-              mapping.set(contract.params[i]!.name, callArgs[i]!)
-            }
+            const mapping = buildCallMapping(contract.params, callArgs)
             return substituteExpr(ens.right, mapping)
           }
         }

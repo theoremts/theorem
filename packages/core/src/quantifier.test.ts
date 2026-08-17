@@ -326,6 +326,30 @@ describe('call sites: enclosing requires through callbacks', () => {
     assert.strictEqual(req.status, 'disproved')
   })
 
+  test('missing args take their declared defaults at call sites', async () => {
+    const ctx = await getContext()
+    const source = `
+      export function setPrecision(value: number, precision: number = 2): number {
+        requires(Number.isInteger(precision) && precision >= 0)
+        return value
+      }
+      export function caller(x: number): number {
+        const a = setPrecision(x)        // default 2 — must PROVE
+        const b = setPrecision(x, -1)    // explicit violation — must REFUTE
+        return a + b
+      }
+    `
+    const registry = buildRegistry(extractFromSource(source))
+    const tasks = extractCallSiteObligations(source, 'test.ts', registry, ctx)
+    const results = []
+    for (const t of tasks) results.push({ text: t.contractText, status: (await check(t)).status })
+    const defaulted = results.find(r => r.text.includes('setPrecision(x)'))
+    const explicit = results.find(r => r.text.includes('setPrecision(x, -1)'))
+    assert.ok(defaulted && explicit, `Expected both obligations, got: ${results.map(r => r.text).join('; ')}`)
+    assert.strictEqual(defaulted.status, 'proved')
+    assert.strictEqual(explicit.status, 'disproved')
+  })
+
   test('dedup idiom inside an if-branch grants uniqueBy at the nested call site', async () => {
     const ctx = await getContext()
     const source = `

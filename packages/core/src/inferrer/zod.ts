@@ -224,6 +224,7 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
       const innerText = schemaText.slice(afterOpen, closeIdx)
       quantified.push(...extractArrayElementFacts(target, `${varName}.${fieldName}`, innerText))
       quantified.push(...extractUniquenessRefine(target, `${varName}.${fieldName}`, rest))
+      quantified.push(...extractDedupTransform(target, `${varName}.${fieldName}`, rest))
     }
   }
 
@@ -237,6 +238,7 @@ export function extractConstraintsFromSchemaText(schemaText: string, varName: st
       const target: Expr = { kind: 'ident', name: varName }
       quantified.push(...extractArrayElementFacts(target, varName, trimmed.slice(openAt, closeAt)))
       quantified.push(...extractUniquenessRefine(target, varName, trimmed.slice(closeAt + 1)))
+      quantified.push(...extractDedupTransform(target, varName, trimmed.slice(closeAt + 1)))
     }
   }
 
@@ -745,7 +747,25 @@ function extractArrayElementFacts(target: Expr, targetText: string, innerText: s
 export function extractUniquenessRefine(target: Expr, targetText: string, rest: string, keyword = 'refine'): InferredContract[] {
   const m = new RegExp(String.raw`(?:\.pipe\(\s*)?(?:\w+\.)?${keyword}\(\s*\(?(\w+)\)?\s*=>\s*new Set\(\s*\1\s*(?:\.map\(\s*\(?(\w+)\)?\s*=>\s*\2\.(\w+)\s*\)\s*)?\)\.size\s*===?\s*\1\.length\s*\)`).exec(rest)
   if (m === null) return []
-  const prop = m[3]
+  return uniquenessFact(target, targetText, m[3], `from schema: Set-size uniqueness ${keyword}`)
+}
+
+/**
+ * Dedup TRANSFORMS — a schema whose output is deduplicated by construction:
+ *   .transform(a => [...new Map(a.map(x => [x.key, x])).values()])  → uniqueBy(arr, x => x.key)
+ *   .transform(a => [...new Set(a)])                                → unique(arr)
+ * Stronger than a refine (the parse GUARANTEES uniqueness instead of
+ * rejecting duplicates), but yields the same fact on the parsed value.
+ */
+export function extractDedupTransform(target: Expr, targetText: string, rest: string): InferredContract[] {
+  const byKey = new RegExp(String.raw`\.transform\(\s*\(?(\w+)\)?\s*=>\s*\[\s*\.\.\.new Map\(\s*\1\s*\.map\(\s*\(?(\w+)\)?\s*=>\s*\[\s*\2\.(\w+)\s*,\s*\2\s*,?\s*\]\s*,?\s*\)\s*,?\s*\)\.values\(\)\s*,?\s*\]\s*,?\s*\)`).exec(rest)
+  if (byKey !== null) return uniquenessFact(target, targetText, byKey[3], 'from schema: dedup transform')
+  const plain = new RegExp(String.raw`\.transform\(\s*\(?(\w+)\)?\s*=>\s*\[\s*\.\.\.new Set\(\s*\1\s*\)\s*,?\s*\]\s*,?\s*\)`).exec(rest)
+  if (plain !== null) return uniquenessFact(target, targetText, undefined, 'from schema: dedup transform')
+  return []
+}
+
+function uniquenessFact(target: Expr, targetText: string, prop: string | undefined, source: string): InferredContract[] {
   const qi = qz()
   const qj = qz()
   const at = (name: string): Expr => {
@@ -771,5 +791,5 @@ export function extractUniquenessRefine(target: Expr, targetText: string, rest: 
       },
     },
   }
-  return [{ kind: 'requires', text: display, predicate: pred, confidence: 'guard', source: `from schema: Set-size uniqueness ${keyword}` }]
+  return [{ kind: 'requires', text: display, predicate: pred, confidence: 'guard', source }]
 }

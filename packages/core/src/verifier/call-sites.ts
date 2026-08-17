@@ -9,7 +9,7 @@ import type { Z3Context } from '../solver/context.js'
 import type { Expr, Predicate } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
 import type { VerificationTask } from '../translator/index.js'
-import { inlinePureMethodCalls } from '../translator/index.js'
+import { inlinePureMethodCalls, buildCallMapping, requiredParamCount, paramPositionCount } from '../translator/index.js'
 import { parseExpr, tryDedupIdiom, buildPairwiseDistinctFact } from '../parser/expr.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { substituteExpr, substituteOutput } from '../translator/substitution.js'
@@ -56,14 +56,16 @@ export function extractCallSiteObligations(
 
     const args = node.getArguments()
 
-    // Build substitution: callee param names → argument expressions
-    const mapping = new Map<string, Expr>()
-    for (let i = 0; i < Math.min(contract.params.length, args.length); i++) {
-      const parsed = parseExpr(args[i]! as Expression)
-      if (parsed !== null) {
-        mapping.set(contract.params[i]!.name, parsed)
-      }
+    // Build substitution: callee param names → argument expressions.
+    // Position-aware (destructured params share one slot, object-literal
+    // args map per property) and default-aware (setPrecision(x) binds
+    // precision := 2, so its requires is checked against the real value).
+    const argExprs: Expr[] = []
+    for (const a of args) {
+      const parsed = parseExpr(a as Expression)
+      argExprs.push(parsed ?? { kind: 'ident', name: `__unparsed_arg_${argExprs.length}` })
     }
+    const mapping = buildCallMapping(contract.params, argExprs)
 
     // Collect variable assignments in scope before the call site (constant propagation)
     const { assignments: scopeAssignments, sorts: scopeSorts } = collectScopeAssignments(node)
@@ -164,11 +166,40 @@ export function extractCallSiteObligations(
             }
             if (ei.props !== null) {
               for (const prop of ei.props) {
-                if (prop.value.kind === 'literal' && typeof prop.value.value === 'number') {
+                const propAt: Expr = { kind: 'member', object: at(i), property: prop.key }
+                // String literals participate too — `appliesTo: "baseCost"`
+                // discharges string-valued quantified requires via __sfield_.
+                if (prop.value.kind === 'literal' &&
+                    (typeof prop.value.value === 'number' || typeof prop.value.value === 'string')) {
+                  facts.push({ kind: 'binary', op: '===', left: propAt, right: prop.value })
+                }
+                // Truthiness in the Int→Bool field view: `isEnabled: true`
+                // discharges `!m.isEnabled ||` guards; a numeric/string/null
+                // literal fixes the same view by its JS truthiness.
+                if (prop.value.kind === 'literal') {
+                  const v = prop.value.value
+                  const truthy = typeof v === 'boolean' ? v
+                    : v === null ? false
+                    : typeof v === 'number' ? v !== 0
+                    : v !== ''
+                  const negated: Expr = { kind: 'unary', op: '!', operand: propAt }
+                  facts.push(truthy ? { kind: 'unary', op: '!', operand: negated } : negated)
+                }
+              }
+              // Pairwise string-prop facts: distinct literal keys make
+              // uniqueBy(arr, m => m.key) provable at the call site.
+              for (let j = i + 1; j < n; j++) {
+                const pj = info[j]!.props
+                if (pj === null) continue
+                for (const prop of ei.props) {
+                  if (prop.value.kind !== 'literal' || typeof prop.value.value !== 'string') continue
+                  const other = pj.find(p => p.key === prop.key)
+                  if (other === undefined || other.value.kind !== 'literal' || typeof other.value.value !== 'string') continue
                   facts.push({
-                    kind: 'binary', op: '===',
+                    kind: 'binary',
+                    op: prop.value.value === other.value.value ? '===' : '!==',
                     left: { kind: 'member', object: at(i), property: prop.key },
-                    right: prop.value,
+                    right: { kind: 'member', object: at(j), property: prop.key },
                   })
                 }
               }
@@ -337,9 +368,10 @@ function resolveContract(calleeName: string, registry: ContractRegistry, argCoun
   if (calleeName.includes('.')) {
     const contract = registry.get(calleeName.slice(calleeName.lastIndexOf('.') + 1))
     // A method-shaped call matching a free function by name only is accepted
-    // only when the arity agrees — `calculator.total()` must not inherit the
-    // contract of `total(lineItems, taxRate, rules)`.
-    if (contract !== undefined && argCount !== undefined && contract.params.length !== argCount) return undefined
+    // only when the arity agrees (defaults/optionals relax the lower bound) —
+    // `calculator.total()` must not inherit `total(lineItems, taxRate, rules)`.
+    if (contract !== undefined && argCount !== undefined &&
+        (argCount < requiredParamCount(contract.params) || argCount > paramPositionCount(contract.params))) return undefined
     return contract
   }
   return undefined
@@ -369,10 +401,7 @@ function instantiateContractCalls(
           return args.some((a, i) => a !== e.args[i]) ? { kind: 'call', callee: e.callee, args } : e
         }
         const fresh: Expr = { kind: 'ident', name: `__ret_${contract.name}_${freshCallCounter++}` }
-        const mapping = new Map<string, Expr>()
-        for (let i = 0; i < Math.min(contract.params.length, args.length); i++) {
-          mapping.set(contract.params[i]!.name, args[i]!)
-        }
+        const mapping = buildCallMapping(contract.params, args)
         mapping.set('result', fresh)
         for (const ens of contract.ensures) {
           if (typeof ens === 'string') continue

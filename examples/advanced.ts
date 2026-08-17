@@ -142,6 +142,25 @@ export function stringLength(s: string): number {
 
 // ── Set: add then has ────────────────────────────────────────────────────────
 
+export function compareByName(a: any, b: any): number {
+  // Comparator contract: result is exactly -1, 0, or 1.
+  ensures(between(output(), -1, 1));
+  const lastNameA = a?.lastName?.toLowerCase() || "";
+  const lastNameB = b?.lastName?.toLowerCase() || "";
+
+  if (lastNameA < lastNameB) return -1;
+  if (lastNameA > lastNameB) return 1;
+
+  // Secondary sort by first name for deterministic ordering
+  const firstNameA = a?.firstName?.toLowerCase() || "";
+  const firstNameB = b?.firstName?.toLowerCase() || "";
+
+  if (firstNameA < firstNameB) return -1;
+  if (firstNameA > firstNameB) return 1;
+
+  return 0;
+}
+
 export function addThenHas(s: Set<number>, x: number): boolean {
   ensures(output() === true)
   return s.add(x).has(x)

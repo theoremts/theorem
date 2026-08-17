@@ -221,10 +221,19 @@ function parseExprInner(node: Expression): Expr | null {
   // ── Conditional / ternary: condition ? then : else ─────────────────────────
 
   if (Node.isConditionalExpression(node)) {
-    const condition = parseExpr(node.getCondition())
+    const condNode = node.getCondition()
+    let condition = parseExpr(condNode)
     const then = parseExpr(node.getWhenTrue())
     const els  = parseExpr(node.getWhenFalse())
     if (condition === null || then === null || els === null) return null
+    // Truthiness of a nullable OBJECT is exactly a null check — Decimal (and
+    // any object/array) instances are always truthy, so `value ? value : ZERO`
+    // means `value !== null`. Without this the guard gets havoc'd and the
+    // null linkage is lost. Number/string/boolean stay untouched (0/""/false
+    // are falsy).
+    if ((condition.kind === 'ident' || condition.kind === 'member') && isNullableObjectExpr(condNode)) {
+      condition = { kind: 'binary', op: '!==', left: condition, right: { kind: 'literal', value: null } }
+    }
     return { kind: 'ternary', condition, then, else: els }
   }
 
@@ -1429,6 +1438,35 @@ const OPS: Record<string, BinaryOp> = {
   'in': 'in',
   // Also accept loose equality for convenience
   '==': '===', '!=': '!==',
+}
+
+/**
+ * True when the expression's DECLARED type is a nullable object/array union
+ * (`Decimal | undefined | null`, `Item[] | null`, optional params/props).
+ * Objects and arrays are always truthy in JS, so truthiness of such a value
+ * is exactly a null/undefined check. Primitive unions return false (0, "",
+ * and false are falsy). Resolution is same-file syntactic — unresolvable
+ * symbols conservatively return false.
+ */
+function isNullableObjectExpr(node: Node): boolean {
+  const PRIMITIVES = new Set(['number', 'string', 'boolean', 'bigint', 'any', 'unknown', 'never', 'object'])
+  try {
+    for (const d of node.getSymbol()?.getDeclarations() ?? []) {
+      if (!Node.isParameterDeclaration(d) && !Node.isVariableDeclaration(d) &&
+          !Node.isPropertySignature(d) && !Node.isPropertyDeclaration(d)) continue
+      const typeNode = d.getTypeNode()
+      if (typeNode === undefined) continue
+      const parts = typeNode.getText().split('|').map(s => s.trim()).filter(s => s.length > 0)
+      const optional = (Node.isParameterDeclaration(d) || Node.isPropertySignature(d) || Node.isPropertyDeclaration(d)) && d.hasQuestionToken()
+      const nullish = parts.some(p => p === 'null' || p === 'undefined') || optional
+      const rest = parts.filter(p => p !== 'null' && p !== 'undefined')
+      if (!nullish || rest.length === 0) return false
+      // Every non-nullish member must be a named object type or an array —
+      // literal types, primitives, and anything syntactically odd bail out.
+      return rest.every(p => /^[A-Za-z_$][\w$.<>,\s[\]]*$/.test(p) && !PRIMITIVES.has(p))
+    }
+  } catch { /* symbol resolution failed — no desugar */ }
+  return false
 }
 
 function binaryOp(text: string): BinaryOp | null {

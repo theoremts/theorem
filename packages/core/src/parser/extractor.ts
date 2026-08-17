@@ -13,6 +13,7 @@ import {
 } from 'ts-morph'
 import type { BodyStep, Contract, Expr, FunctionIR, HeapStep, LoopInfo, Param, Predicate, Sort } from './ir.js'
 import { parseExpr, parseBlockToExpr, parseBlockWithLoops, parseStmtListDirect, getResolvedPositionalContracts, getFinalSSABindings } from './expr.js'
+import { injectModuleConstFacts } from './module-consts.js'
 import { substituteExpr } from '../translator/substitution.js'
 import { prettyExpr } from './pretty.js'
 import {
@@ -184,6 +185,11 @@ export function extractFromSource(source: string, fileName = 'input.ts', registr
       })
     }
   }
+
+  // Module constants (ZERO, PERCENTAGE_SCALE, MS_PER_HOUR…) become assume
+  // facts in every function that references them — same-file consts and
+  // one-hop imports through relative/alias specifiers.
+  try { injectModuleConstFacts(file, fileName, results) } catch { /* best-effort */ }
 
   return results
 }
@@ -1505,12 +1511,12 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
   // throws on invalid data, so the schema's refinements hold for x afterwards.
   // Inject them as assume contracts — this alone makes the function verifiable
   // (division safety etc.) with zero annotations.
+  const schemaAssumes: Contract[] = []
   try {
     // PREPEND: schema facts are entry-level assumptions, and the translator's
     // sequential pass snapshots each ensures' assumptions in contract order —
     // appended assumes would arrive after the ensures already closed over
     // them (the F2 axioms lesson).
-    const schemaAssumes: Contract[] = []
     for (const zc of extractZodContracts(fnBody)) {
       schemaAssumes.push({ kind: 'assume', predicate: zc.predicate })
     }
@@ -1540,6 +1546,14 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
   // on their presence, not on literal check/assume statements in the source.
   const finalBodySteps: BodyStep[] = []
   if (resolvedContracts.length > 0) {
+    // Schema facts lead the steps: when bodySteps exist, the translator skips
+    // top-level assume contracts as "already processed positionally" — an
+    // injected schema assume without a step twin would silently vanish, and
+    // a check at position 0 snapshots its assumptions before the contract
+    // loop ever runs.
+    for (const c of schemaAssumes) {
+      if (c.kind === 'assume') finalBodySteps.push({ kind: 'assume', predicate: c.predicate })
+    }
     for (const rc of resolvedContracts) {
       finalBodySteps.push({ kind: rc.kind, predicate: rc.predicate })
     }
@@ -1812,23 +1826,91 @@ function findEnclosingFunctionDecl(
 // Params
 // ---------------------------------------------------------------------------
 
-function extractParams(fn: ArrowFunction): Param[] {
-  return fn.getParameters().map((p) => {
-    const name = p.getName()
-    const typeNode = p.getTypeNode()
-    const sort = typeNode ? tsTypeToSort(typeNode.getText()) : 'real'
-    return { name, sort }
-  })
+/** Default value and optionality of a parameter declaration. */
+function paramExtras(p: import('ts-morph').ParameterDeclaration): { defaultValue?: Expr; optional?: boolean } {
+  const extras: { defaultValue?: Expr; optional?: boolean } = {}
+  const init = p.getInitializer()
+  if (init !== undefined) {
+    const parsed = parseExpr(init)
+    if (parsed !== null) extras.defaultValue = parsed
+  }
+  if (p.hasQuestionToken()) extras.optional = true
+  return extras
 }
 
-function extractFunctionDeclParams(fn: FunctionDeclaration | MethodDeclaration): Param[] {
-  return fn.getParameters().map((p) => {
-    const name = p.getName()
+/** Member name → type text of an object type: inline literal or same-file interface/alias. */
+function objectTypeMembers(typeNode: import('ts-morph').TypeNode | undefined, file: import('ts-morph').SourceFile): Map<string, string> {
+  const members = new Map<string, string>()
+  if (typeNode === undefined) return members
+  let literal: import('ts-morph').Node | undefined
+  if (Node.isTypeLiteral(typeNode)) {
+    literal = typeNode
+  } else if (Node.isTypeReference(typeNode)) {
+    const refName = typeNode.getTypeName().getText()
+    literal = file.getInterface(refName) ?? (() => {
+      const alias = file.getTypeAlias(refName)?.getTypeNode()
+      return alias !== undefined && Node.isTypeLiteral(alias) ? alias : undefined
+    })()
+  }
+  if (literal === undefined) return members
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+  for (const m of ((literal as any).getProperties?.() ?? (literal as any).getMembers?.() ?? []) as Array<import('ts-morph').Node>) {
+    if (!Node.isPropertySignature(m)) continue
+    const t = m.getTypeNode()?.getText()
+    if (t !== undefined) members.set(m.getName(), t)
+  }
+  return members
+}
+
+/**
+ * Expands one parameter declaration into Param entries. A destructured
+ * object parameter (`{ lineItem, rules }: Input`) becomes one Param PER
+ * BINDING — names honor renames, sorts resolve through the inline type
+ * literal or a same-file interface/alias, binding defaults carry over, and
+ * argPos/patternProp let call sites map an object-literal (or a plain
+ * `payload` ident → `payload.prop`) onto each expanded param.
+ */
+function expandParam(p: import('ts-morph').ParameterDeclaration, argPos: number): Param[] {
+  const nameNode = p.getNameNode()
+  if (!Node.isObjectBindingPattern(nameNode)) {
     const typeNode = p.getTypeNode()
     const sort = typeNode ? tsTypeToSort(typeNode.getText()) : 'real'
     const discriminant = sort === 'unknown' ? detectDiscriminatedUnion(p) : undefined
-    return { name, sort, discriminant }
-  })
+    return [{ name: p.getName(), sort, ...(discriminant !== undefined ? { discriminant } : {}), ...paramExtras(p), argPos }]
+  }
+
+  const memberTypes = objectTypeMembers(p.getTypeNode(), p.getSourceFile())
+  const wholeDefault = p.getInitializer() !== undefined  // ({...} = {}) — object itself optional
+  const out: Param[] = []
+  for (const el of nameNode.getElements()) {
+    const elName = el.getNameNode()
+    if (!Node.isIdentifier(elName)) continue  // nested patterns — skip binding
+    const localName = elName.getText()
+    const propName = el.getPropertyNameNode()?.getText() ?? localName
+    const typeText = memberTypes.get(propName)
+    const entry: Param = {
+      name: localName,
+      sort: typeText !== undefined ? tsTypeToSort(typeText) : 'unknown',
+      argPos,
+      patternProp: propName,
+    }
+    const elInit = el.getInitializer()
+    if (elInit !== undefined) {
+      const parsed = parseExpr(elInit)
+      if (parsed !== null) entry.defaultValue = parsed
+    }
+    if (wholeDefault) entry.optional = true
+    out.push(entry)
+  }
+  return out
+}
+
+function extractParams(fn: ArrowFunction): Param[] {
+  return fn.getParameters().flatMap((p, i) => expandParam(p, i))
+}
+
+function extractFunctionDeclParams(fn: FunctionDeclaration | MethodDeclaration): Param[] {
+  return fn.getParameters().flatMap((p, i) => expandParam(p, i))
 }
 
 /**
