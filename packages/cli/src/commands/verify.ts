@@ -339,7 +339,31 @@ async function runVerify(
   }
 
   if (!isShardChild && files.length > SHARD_THRESHOLD && opts.format !== 'sarif' && !opts.watch) {
-    return runSharded(files, cwd, opts, registry)
+    // Pre-filter: only files that can produce verification tasks reach the
+    // solver — ones carrying contracts/schema parses, or mentioning a
+    // registered function (call-site obligations). On a 2k-file app this
+    // collapses hundreds of Z3 boot-ups into a handful.
+    const CONTRACT_RE = /requires\(|ensures\(|invariant\(|declare\(|proof\.|proof\(|\.parse\(|decodeUnknownSync|decodeSync|@invariant/
+    const hintNames = [...registry.keys()].filter(k => !k.includes('.prototype.') && !k.startsWith('new '))
+    const nameRe = hintNames.length > 0
+      ? new RegExp(`\\b(${hintNames.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`)
+      : null
+    const relevant = files.filter(f => {
+      try {
+        const src = readFileSync(f, 'utf-8')
+        return CONTRACT_RE.test(src) || (nameRe !== null && nameRe.test(src))
+      } catch { return false }
+    })
+    process.stdout.write(`${dim}${files.length} files scanned → ${relevant.length} with contracts or registered calls${reset}\n`)
+    if (relevant.length === 0) {
+      process.stdout.write(`${dim}No contracts found. Add requires()/ensures(), or run 'theorem infer'.${reset}\n`)
+      return { totalFailed: 0 }
+    }
+    if (relevant.length > SHARD_THRESHOLD) {
+      return runSharded(relevant, cwd, opts, registry)
+    }
+    // Few enough to verify in-process with the global registry
+    files = relevant
   }
 
   // Pass 2: verify each file with the registry

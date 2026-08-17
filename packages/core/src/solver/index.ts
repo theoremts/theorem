@@ -201,7 +201,7 @@ function extractModelFrom(
   const ce: Record<string, unknown> = {}
   for (const [name, expr] of variables) {
     // Internal machinery — noise in a counterexample
-    if (name.startsWith('__field_') || name === '__fn__' || name.startsWith('__chc_') || name.startsWith('__qs') || name.startsWith('__qi') || name === '__cell') continue
+    if (name.startsWith('__field_') || name === '__fn__' || name.startsWith('__chc_') || name.startsWith('__qs') || name.startsWith('__qi') || name === '__cell' || name.startsWith('__havocb_')) continue
     const displayName = name.startsWith('__old_') ? `old(${name.slice(6)})` : name
     try {
       ce[displayName] = parseZ3Value(model.eval(expr, true).toString())
@@ -225,6 +225,19 @@ function extractModelFrom(
     const fieldArrays = [...variables].filter(([n]) => n.startsWith('__field_'))
     for (const [name, expr] of variables) {
       if (name.startsWith('__') || name.includes('.')) continue
+      // No field heap in this query means the task never reads array
+      // elements — slot identities are arbitrary model choices, and an
+      // aliasing note ("same object as") would be pure noise. Hide the raw
+      // ref map too; the refs mean nothing to a reader.
+      if (fieldArrays.length === 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
+        const s = (expr as any).sort
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+          if (String(s.domain()) === 'Int' && String(s.range()) === 'Int') delete ce[name]
+        } catch { /* not an array */ }
+        continue
+      }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const anyExpr = expr as any
       let isRefArray = false

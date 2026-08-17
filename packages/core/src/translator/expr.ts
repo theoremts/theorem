@@ -11,6 +11,9 @@ type Z3Seq = Seq<'main'>
 type Z3Array = SMTArray<'main'>
 type Z3Set = SMTSet<'main'>
 
+/** Fresh names for havoc'd (untranslatable) ternary guards — see the ternary case. */
+let havocCondCounter = 0
+
 /**
  * Converts an Expr IR node to a Z3 expression.
  * Returns null when the node cannot be represented (unsupported syntax).
@@ -174,8 +177,19 @@ export function toZ3(
 
     // ── Ternary: condition ? then : else → Z3 ITE ────────────────
     case 'ternary': {
-      const cond = toZ3(expr.condition, vars, ctx)
-      if (cond === null) return null
+      let cond = toZ3(expr.condition, vars, ctx)
+      if (cond === null) {
+        // Untranslatable guard (optional chains, string methods, unknown
+        // calls) — model it as a FREE boolean instead of dropping the whole
+        // body. Sound overapproximation for proofs: both branches stay
+        // reachable, so branch-structure properties (a comparator returning
+        // only -1|0|1) still prove. Refutations under a havoc guard may pick
+        // an infeasible branch — strictly better than a free result.
+        const havocName = `__havocb_${havocCondCounter++}`
+        const b = ctx.Bool.const(havocName)
+        vars.set(havocName, b as unknown as Z3Expr)
+        cond = b as unknown as Z3Expr
+      }
 
       const thenIsNull = expr.then.kind === 'literal' && expr.then.value === null
       const elseIsNull = expr.else.kind === 'literal' && expr.else.value === null
