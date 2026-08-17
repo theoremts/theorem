@@ -36,8 +36,9 @@ const DECIMAL_DECLARES = `
 async function verifyWithDeclares(source: string) {
   const ctx = await getContext()
   const declares = extractDeclareContracts(DECIMAL_DECLARES, 'decimal.contracts.ts')
+  const inlineDeclares = extractDeclareContracts(source, 'input.ts')
   const fns = extractFromSource(source)
-  const registry = buildRegistry([...declares, ...fns])
+  const registry = buildRegistry([...declares, ...inlineDeclares, ...fns])
   const results: Array<{ fn: string; text: string; status: string }> = []
   for (const ir of fns) {
     for (const task of translate(ir, ctx, registry)) {
@@ -143,6 +144,41 @@ describe('method contracts: Decimal chains', () => {
     assert.strictEqual(results.find(r => r.fn === 'pay')?.status, 'proved')
     assert.strictEqual(results.find(r => r.fn === 'guard')?.status, 'proved')
     assert.strictEqual(results.find(r => r.fn === 'tooStrong')?.status, 'disproved')
+  })
+
+  test('Map-dedup idiom grants uniqueBy — the constructor obligation proves', async () => {
+    const results = await verifyWithDeclares(`
+      declare(FeeCalculator, (ruleSet: FeeRule[], _item: unknown): number => {
+        requires(uniqueBy(ruleSet, (m) => m.key));
+        return 0;
+      });
+      export function calc(rules: FeeRule[], cost: Decimal): number {
+        requires(cost.greaterThanOrEqualTo(0))
+        const deduped = [...new Map(rules.map((m) => [m.key, m])).values()]
+        const c = new FeeCalculator(deduped, { baseCost: cost })
+        return c
+      }
+    `)
+    const obligation = results.find(r => r.text.includes('uniqueBy'))
+    assert.ok(obligation, `Expected the constructor obligation, got: ${results.map(r => r.text).join('; ')}`)
+    assert.strictEqual(obligation.status, 'proved')
+  })
+
+  test('without the dedup the constructor obligation is refuted', async () => {
+    const results = await verifyWithDeclares(`
+      declare(FeeCalculator, (ruleSet: FeeRule[], _item: unknown): number => {
+        requires(uniqueBy(ruleSet, (m) => m.key));
+        return 0;
+      });
+      export function calc(rules: FeeRule[], cost: Decimal): number {
+        requires(cost.greaterThanOrEqualTo(0))
+        const c = new FeeCalculator(rules, { baseCost: cost })
+        return c
+      }
+    `)
+    const obligation = results.find(r => r.text.includes('uniqueBy'))
+    assert.ok(obligation, 'Expected the constructor obligation')
+    assert.notStrictEqual(obligation.status, 'proved')
   })
 
   test('a wrong postcondition on a chain is refuted, not skipped', async () => {

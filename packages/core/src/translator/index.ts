@@ -201,6 +201,18 @@ export function translate(
       preCreateRegexTargets(c.predicate as Expr)
     }
   }
+  // Positional check/assume predicates (incl. synthesized dedup-idiom grants)
+  // shape variable sorts too — a quantified uniqueBy over a local must
+  // pre-create it as a ref-array or both the assume and any obligation over
+  // it silently fail translation.
+  if (ir.bodySteps !== undefined) {
+    for (const s of ir.bodySteps) {
+      if ((s.kind === 'check' || s.kind === 'assume') &&
+          typeof s.predicate === 'object' && s.predicate !== null) {
+        preCreateRegexTargets(s.predicate)
+      }
+    }
+  }
 
   // Discriminated unions: p.kind is a STRING over a finite set of literals.
   // Pre-create it as a String variable so comparisons against 'pix' etc.

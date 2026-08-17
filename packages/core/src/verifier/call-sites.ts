@@ -10,7 +10,7 @@ import type { Expr, Predicate } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
 import type { VerificationTask } from '../translator/index.js'
 import { inlinePureMethodCalls } from '../translator/index.js'
-import { parseExpr } from '../parser/expr.js'
+import { parseExpr, tryDedupIdiom, buildPairwiseDistinctFact } from '../parser/expr.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { substituteExpr, substituteOutput } from '../translator/substitution.js'
 import { makeConst, isArrayExpr } from '../translator/variables.js'
@@ -73,6 +73,13 @@ export function extractCallSiteObligations(
 
     // Collect enclosing function's inline requires as assumptions
     const enclosingRequires = collectEnclosingRequires(node)
+
+    // Dedup idioms in the enclosing function grant distinctness facts:
+    // `const v = [...new Map(arr.map(x => [x.key, x])).values()]` means
+    // uniqueBy(v, key) holds at every later call site in that function.
+    for (const fact of collectEnclosingDedupFacts(node)) {
+      enclosingRequires.push(fact)
+    }
 
     // Collect enclosing function's decreases() expressions — recursion counters
     // are integers, mirroring the translator's "decreases integer" assumption
@@ -547,7 +554,10 @@ function collectEnclosingRequires(callNode: Node): Expr[] {
           const expr = stmt.getExpression()
           if (!Node.isCallExpression(expr)) continue
           const callee = expr.getExpression().getText()
-          if (callee !== 'requires') continue
+          // assume() statements are facts in scope, same as requires —
+          // dedup-idiom grants and trusted DB facts must discharge
+          // obligations at call sites inside the same function.
+          if (callee !== 'requires' && callee !== 'assume') continue
           const args = expr.getArguments()
           if (args.length === 0) continue
           const firstArg = args[0]!
@@ -588,6 +598,41 @@ function collectEnclosingRequires(callNode: Node): Expr[] {
   }
 
   return requires
+}
+
+/**
+ * Scans the enclosing function's body for dedup-idiom const declarations
+ * (`const v = [...new Map(arr.map(x => [x.key, x])).values()]` etc.) and
+ * returns the granted distinctness facts over the declared variables.
+ */
+function collectEnclosingDedupFacts(callNode: Node): Expr[] {
+  const facts: Expr[] = []
+  let current: Node | undefined = callNode
+  while (current) {
+    const parent = current.getParent()
+    if (!parent) break
+    if (Node.isFunctionDeclaration(parent) || Node.isArrowFunction(parent) ||
+        Node.isFunctionExpression(parent) || Node.isMethodDeclaration(parent)) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      const body = (parent as any).getBody()
+      if (body && Node.isBlock(body)) {
+        for (const stmt of body.getStatements()) {
+          if (!Node.isVariableStatement(stmt)) continue
+          for (const decl of stmt.getDeclarations()) {
+            const init = decl.getInitializer()
+            if (init === undefined) continue
+            const dedup = tryDedupIdiom(init)
+            if (dedup === null) continue
+            const varIdent: Expr = { kind: 'ident', name: decl.getName() }
+            facts.push(buildPairwiseDistinctFact(varIdent, dedup.field, `dedup(${decl.getName()})`))
+          }
+        }
+      }
+      break  // immediate enclosing function only — dedup vars are locals
+    }
+    current = parent
+  }
+  return facts
 }
 
 /** True if the expression mentions any of the given identifier names

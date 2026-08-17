@@ -838,6 +838,32 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
       // and the schema constraints on x.* are injected as assume contracts.
       if (init && isSchemaParseCall(init)) continue
 
+      // Dedup idioms as TRUSTED contracts (like Array.prototype.sort):
+      //   [...new Map(arr.map(x => [x.key, x])).values()]  → uniqueBy(v, key)
+      //   [...new Set(arr)] / Array.from(new Set(arr))     → unique(v)
+      // The variable stays FREE (content havoc'd) and the distinctness fact
+      // plus `v.length <= arr.length` are granted as positional assumes —
+      // the JS semantics of Map/Set collapsing duplicate keys, stated once.
+      if (init) {
+        const dedup = tryDedupIdiom(init as Expression)
+        if (dedup !== null) {
+          const varIdent: Expr = { kind: 'ident', name: varName }
+          const srcExpr = newBindings.size > 0 ? substituteIdents(dedup.src, newBindings) : dedup.src
+          const facts: Expr[] = [
+            buildPairwiseDistinctFact(varIdent, dedup.field, `dedup(${varName})`),
+            {
+              kind: 'binary', op: '<=',
+              left: { kind: 'member', object: varIdent, property: 'length' },
+              right: { kind: 'member', object: srcExpr, property: 'length' },
+            },
+          ]
+          for (const p of facts) {
+            _resolvedPositionalContracts.push({ kind: 'assume', predicate: p })
+          }
+          continue  // variable deliberately left unbound (havoc)
+        }
+      }
+
       if (init) {
         let parsed = parseExpr(init as Expression)
         if (parsed !== null) {
@@ -984,6 +1010,102 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
   }
 
   return null
+}
+
+// ── Dedup idiom recognition ─────────────────────────────────────────────────
+
+/**
+ * Recognizes JS dedup idioms whose RESULT is pairwise-distinct by
+ * construction: `[...new Map(src.map(x => [x.key, x])).values()]` (distinct
+ * by key) and `[...new Set(src)]` / `Array.from(new Set(src))` (distinct
+ * elements). Returns the source array and the projected field (null = whole
+ * element).
+ */
+export function tryDedupIdiom(init: Expression): { src: Expr; field: string | null } | null {
+  let inner: Expression | undefined
+  if (Node.isArrayLiteralExpression(init)) {
+    const els = init.getElements()
+    if (els.length === 1 && Node.isSpreadElement(els[0]!)) {
+      inner = els[0]!.getExpression()
+    }
+  } else if (Node.isCallExpression(init) && init.getExpression().getText() === 'Array.from'
+      && init.getArguments().length === 1) {
+    inner = init.getArguments()[0] as Expression
+  }
+  if (inner === undefined) return null
+
+  // new Set(src)
+  if (Node.isNewExpression(inner) && inner.getExpression().getText() === 'Set'
+      && (inner.getArguments() ?? []).length === 1) {
+    const src = parseExpr(inner.getArguments()![0] as Expression)
+    return src === null ? null : { src, field: null }
+  }
+
+  // new Map(src.map(x => [x.key, x])).values()
+  if (Node.isCallExpression(inner)) {
+    const ce = inner.getExpression()
+    if (Node.isPropertyAccessExpression(ce) && ce.getName() === 'values') {
+      const mapNew = ce.getExpression()
+      if (Node.isNewExpression(mapNew) && mapNew.getExpression().getText() === 'Map'
+          && (mapNew.getArguments() ?? []).length === 1) {
+        const mapArg = mapNew.getArguments()![0]!
+        if (Node.isCallExpression(mapArg)) {
+          const mc = mapArg.getExpression()
+          if (Node.isPropertyAccessExpression(mc) && mc.getName() === 'map' && mapArg.getArguments().length === 1) {
+            const src = parseExpr(mc.getExpression())
+            const arrow = mapArg.getArguments()[0]!
+            if (src !== null && Node.isArrowFunction(arrow)) {
+              const b = arrow.getBody()
+              const p0 = arrow.getParameters()[0]?.getName()
+              if (p0 !== undefined && Node.isArrayLiteralExpression(b) && b.getElements().length === 2) {
+                const keyEl = parseExpr(b.getElements()[0] as Expression)
+                if (keyEl !== null && keyEl.kind === 'member'
+                    && keyEl.object.kind === 'ident' && keyEl.object.name === p0) {
+                  return { src, field: keyEl.property }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Builds the pairwise-distinct forall over `arr` — by a projected field
+ * (uniqueBy shape) or over the elements themselves (unique shape).
+ */
+export function buildPairwiseDistinctFact(arrExpr: Expr, field: string | null, display: string): Expr {
+  const qi = nextQuantifierIndexName()
+  const qj = nextQuantifierIndexName()
+  const len: Expr = { kind: 'member', object: arrExpr, property: 'length' }
+  const at = (name: string): Expr => {
+    const elem: Expr = { kind: 'element-access', object: arrExpr, index: { kind: 'ident', name } }
+    return field === null ? elem : { kind: 'member', object: elem, property: field }
+  }
+  const inRange = (name: string): Expr => ({
+    kind: 'binary', op: '&&',
+    left: { kind: 'binary', op: '>=', left: { kind: 'ident', name }, right: { kind: 'literal', value: 0 } },
+    right: { kind: 'binary', op: '<', left: { kind: 'ident', name }, right: len },
+  })
+  return {
+    kind: 'quantifier', quantifier: 'forall', param: qi, sort: 'int',
+    display,
+    body: {
+      kind: 'quantifier', quantifier: 'forall', param: qj, sort: 'int',
+      body: {
+        kind: 'binary', op: '==>',
+        left: {
+          kind: 'binary', op: '&&',
+          left: { kind: 'binary', op: '&&', left: inRange(qi), right: inRange(qj) },
+          right: { kind: 'binary', op: '!==', left: { kind: 'ident', name: qi }, right: { kind: 'ident', name: qj } },
+        },
+        right: { kind: 'binary', op: '!==', left: at(qi), right: at(qj) },
+      },
+    },
+  }
 }
 
 // ── for-of fold recognition ─────────────────────────────────────────────────

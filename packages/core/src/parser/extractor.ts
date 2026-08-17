@@ -825,6 +825,16 @@ function extractTrpcProcedures(file: SourceFile): FunctionIR[] {
     }
     if (schemaArg === undefined) continue
 
+    // Unwrap adapter calls: `.input(Schema.standardSchemaV1(RealSchema))`
+    // (Effect's Standard Schema bridge) — the constraints live on the inner
+    // schema, the wrapper is transport.
+    if (Node.isCallExpression(schemaArg)) {
+      const wrapCallee = schemaArg.getExpression().getText()
+      if (wrapCallee.endsWith('standardSchemaV1') && schemaArg.getArguments().length === 1) {
+        schemaArg = schemaArg.getArguments()[0] as Expression
+      }
+    }
+
     // Resolve the schema text (identifier → declaration, possibly imported)
     let schemaText = schemaArg.getText().trim()
     if (Node.isIdentifier(schemaArg)) {
@@ -1525,9 +1535,11 @@ function tryExtractInline(fn: FunctionDeclaration): FunctionIR | null {
   const finalBindings = getFinalSSABindings()
   const loops = extractLoopsFromStmts(codeStmts)
 
-  // Replace check/assume predicates with SSA-resolved versions from the parser
+  // Replace check/assume predicates with SSA-resolved versions from the parser.
+  // Resolved contracts may also be SYNTHESIZED (dedup-idiom grants), so gate
+  // on their presence, not on literal check/assume statements in the source.
   const finalBodySteps: BodyStep[] = []
-  if (hasPositionalContracts && resolvedContracts.length > 0) {
+  if (resolvedContracts.length > 0) {
     for (const rc of resolvedContracts) {
       finalBodySteps.push({ kind: rc.kind, predicate: rc.predicate })
     }
