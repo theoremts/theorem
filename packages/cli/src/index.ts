@@ -33,8 +33,8 @@ const program = new Command()
   .version(pkg.version)
 
 program
-  .command('verify <paths...>')
-  .description('Prove annotated contracts — accepts files, directories, or multiple paths')
+  .command('verify [paths...]')
+  .description('Prove annotated contracts — files, directories, or nothing (whole project, honoring theorem.config.ts)')
   .option('--strict', 'exit 1 if any proof fails (CI mode)')
   .option('--debug', 'show parser → translator → solver internals')
   .option('--watch', 'watch for file changes and re-verify')
@@ -44,7 +44,8 @@ program
   .option('--timeout <ms>', 'Z3 solver timeout in milliseconds')
   .action(async (paths: string[], opts: Record<string, unknown>) => {
     const config = await getConfig()
-    return verifyCommand(paths, opts, config)
+    // Bare `theorem verify` sweeps the whole project from the cwd
+    return verifyCommand(paths.length > 0 ? paths : ['.'], opts, config)
   })
 
 program

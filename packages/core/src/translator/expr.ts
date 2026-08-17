@@ -699,6 +699,17 @@ function translateCall(
       return (ctx.ToInt((x as Z3Arith).neg()) as Z3Arith).neg()
     }
 
+    case 'Math.round': {
+      const [x] = args
+      if (!x) return null
+      // JS half-up semantics exactly: round(x) = floor(x + 0.5)
+      // (Math.round(-0.5) === -0 and floor(0) === 0; Math.round(-1.5) === -1
+      // and floor(-1) === -1 — the encoding matches the negative halves too)
+      try {
+        return ctx.ToInt((x as Z3Arith).add(ctx.Real.val(0.5)))
+      } catch { return null }
+    }
+
     case 'Math.sign': {
       const [x] = args
       if (!x) return null

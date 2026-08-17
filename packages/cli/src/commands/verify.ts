@@ -1,4 +1,6 @@
-import { readFileSync, statSync, readdirSync, watch } from 'node:fs'
+import { readFileSync, statSync, readdirSync, watch, writeFileSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import { resolve, join, relative } from 'node:path'
 import {
   extractFromSource,
@@ -318,6 +320,28 @@ async function runVerify(
 
   const registry = buildRegistry(allIRs)
 
+  // ── Sharding ──────────────────────────────────────────────────────────────
+  // The Z3 WASM heap degrades past ~15-20 files in one process. Above the
+  // threshold the parent becomes an ORCHESTRATOR: the registry above — built
+  // from ALL files, so cross-file call-site checks see the whole project —
+  // is serialized and handed to child processes that each verify one chunk.
+  const isShardChild = process.env['THEOREM_SHARD_CHILD'] === '1'
+  const SHARD_THRESHOLD = 12
+  const SHARD_SIZE = 6
+
+  if (isShardChild && process.env['THEOREM_REGISTRY_FILE'] !== undefined) {
+    try {
+      const entries = JSON.parse(readFileSync(process.env['THEOREM_REGISTRY_FILE'], 'utf-8')) as Array<[string, Parameters<ContractRegistry['set']>[1]]>
+      for (const [name, contract] of entries) {
+        if (!registry.has(name)) registry.set(name, contract)
+      }
+    } catch { /* registry handoff is best-effort */ }
+  }
+
+  if (!isShardChild && files.length > SHARD_THRESHOLD && opts.format !== 'sarif' && !opts.watch) {
+    return runSharded(files, cwd, opts, registry)
+  }
+
   // Pass 2: verify each file with the registry
   let totalProved = 0
   let totalFailed = 0
@@ -340,6 +364,18 @@ async function runVerify(
   // SARIF output
   if (opts.format === 'sarif') {
     process.stdout.write(verifyToSarif(allReports) + '\n')
+    return { totalFailed }
+  }
+
+  // Shard children report machine-readable totals and stay quiet otherwise —
+  // the orchestrator prints the single grand total for the whole project.
+  if (isShardChild) {
+    const totalsFile = process.env['THEOREM_TOTALS_FILE']
+    if (totalsFile !== undefined) {
+      try {
+        writeFileSync(totalsFile, JSON.stringify({ proved: totalProved, failed: totalFailed, unknown: totalUnknown, filesWithContracts }))
+      } catch { /* parent falls back to zero */ }
+    }
     return { totalFailed }
   }
 
@@ -375,6 +411,76 @@ async function runVerify(
   }
 
   return { totalFailed }
+}
+
+/**
+ * Whole-project verification: the global registry (built from every file, so
+ * cross-file call-site checks span the project) is serialized to disk and
+ * chunks of files are verified in CHILD processes — each gets a fresh Z3 WASM
+ * heap, which degrades past ~15-20 files in a single process. Children stream
+ * their per-file output directly; the parent prints one grand total.
+ */
+function runSharded(
+  files: string[],
+  cwd: string,
+  opts: VerifyOptions,
+  registry: ContractRegistry,
+): { totalFailed: number } {
+  const SHARD_SIZE = 6
+  const regFile = join(tmpdir(), `theorem-registry-${process.pid}.json`)
+  writeFileSync(regFile, JSON.stringify([...registry.entries()]))
+
+  let proved = 0
+  let failed = 0
+  let unknown = 0
+  let filesWithContracts = 0
+  const shards = Math.ceil(files.length / SHARD_SIZE)
+  process.stdout.write(`${dim}Verifying ${files.length} files in ${shards} shards (registry: ${registry.size} contracts)…${reset}\n\n`)
+
+  for (let i = 0; i < files.length; i += SHARD_SIZE) {
+    const chunk = files.slice(i, i + SHARD_SIZE)
+    const totalsFile = join(tmpdir(), `theorem-totals-${process.pid}-${i}.json`)
+    const args = [process.argv[1]!, 'verify', ...chunk]
+    if (opts.debug) args.push('--debug')
+    if (opts.timeout !== undefined) args.push('--timeout', opts.timeout)
+    if (opts.genTests) args.push('--gen-tests')
+    if (opts.testsDir !== undefined) args.push('--tests-dir', opts.testsDir)
+
+    const res = spawnSync(process.execPath, args, {
+      cwd,
+      stdio: ['ignore', 'inherit', 'inherit'],
+      env: {
+        ...process.env,
+        THEOREM_SHARD_CHILD: '1',
+        THEOREM_REGISTRY_FILE: regFile,
+        THEOREM_TOTALS_FILE: totalsFile,
+      },
+    })
+    if (res.error !== undefined || (res.status !== 0 && res.status !== 1)) {
+      process.stderr.write(`${red}shard ${i / SHARD_SIZE + 1}/${shards} crashed${reset} (${res.error?.message ?? `exit ${res.status}`}) — its files were skipped\n`)
+    }
+    try {
+      const t = JSON.parse(readFileSync(totalsFile, 'utf-8')) as { proved: number; failed: number; unknown: number; filesWithContracts: number }
+      proved += t.proved
+      failed += t.failed
+      unknown += t.unknown
+      filesWithContracts += t.filesWithContracts
+      unlinkSync(totalsFile)
+    } catch { /* shard produced no totals */ }
+  }
+  try { unlinkSync(regFile) } catch { /* already gone */ }
+
+  if (filesWithContracts > 0) {
+    const parts: string[] = []
+    if (proved  > 0) parts.push(`${green}${proved} proved${reset}`)
+    if (failed  > 0) parts.push(`${red}${failed} failed${reset}`)
+    if (unknown > 0) parts.push(`${yellow}${unknown} unknown${reset}`)
+    process.stdout.write(`${bold}Total${reset}  ${parts.join(`  ${dim}·${reset}  `)}  ${dim}(${filesWithContracts} files with contracts of ${files.length} scanned)${reset}\n\n`)
+  } else {
+    process.stdout.write(`${dim}No contracts found in ${files.length} files. Add requires()/ensures(), or run 'theorem infer'.${reset}\n`)
+  }
+
+  return { totalFailed: failed }
 }
 
 export async function verifyCommand(
