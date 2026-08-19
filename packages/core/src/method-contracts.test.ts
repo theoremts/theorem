@@ -192,3 +192,57 @@ describe('method contracts: Decimal chains', () => {
     assert.strictEqual(results.find(r => r.text.includes('>= 11'))?.status, 'disproved')
   })
 })
+
+describe('call sites: module consts and method-call early-exit guards', () => {
+  const LTE_DECLARE = `
+    declare(Decimal.prototype.lte, (a: number, b: number): boolean => {
+      ensures(output() === (a <= b))
+    })
+  `
+
+  async function checkCallSitesWithDeclares(source: string) {
+    const ctx = await getContext()
+    const { extractCallSiteObligations } = await import('./verifier/call-sites.js')
+    const declares = extractDeclareContracts(LTE_DECLARE, 'decimal.contracts.ts')
+    const registry = buildRegistry([...declares, ...extractFromSource(source)])
+    const results = []
+    for (const task of extractCallSiteObligations(source, 'test.ts', registry, ctx)) {
+      results.push({ text: task.contractText, status: (await check(task)).status, labels: task.assumptionLabels })
+    }
+    return results
+  }
+
+  test('a Decimal method early-exit guard discharges the callee requires', async () => {
+    const results = await checkCallSitesWithDeclares(`
+      function scale(amount: Decimal): Decimal {
+        requires(!(amount.lte(0)))
+        return amount
+      }
+      export function caller(value: Decimal): Decimal {
+        if (value.lte(0)) return value
+        return scale(value)
+      }
+    `)
+    const target = results.find(r => r.text.includes('lte'))
+    assert.ok(target, `Expected the guard obligation, got: ${results.map(r => r.text).join('; ')}`)
+    assert.strictEqual(target.status, 'proved',
+      `early-return guard must inline and prove (assumptions: ${target.labels.join(', ')})`)
+  })
+
+  test('module constants are facts at call sites', async () => {
+    const results = await checkCallSitesWithDeclares(`
+      const MIN_QTY = 10;
+      function order(qty: number): number {
+        requires(qty >= 10)
+        return qty
+      }
+      export function good(): number { return order(MIN_QTY) }
+      export function bad(): number { return order(MIN_QTY - 5) }
+    `)
+    assert.strictEqual(results.length, 2, `Expected 2 obligations, got: ${results.map(r => r.text).join('; ')}`)
+    const good = results.find(r => r.text.includes('order(MIN_QTY)'))
+    const bad = results.find(r => r.text.includes('MIN_QTY - 5'))
+    assert.strictEqual(good?.status, 'proved', 'MIN_QTY === 10 discharges qty >= 10')
+    assert.strictEqual(bad?.status, 'disproved', 'MIN_QTY - 5 === 5 violates qty >= 10')
+  })
+})

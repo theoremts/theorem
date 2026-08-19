@@ -11,6 +11,7 @@ import type { ContractRegistry } from '../registry/index.js'
 import type { VerificationTask } from '../translator/index.js'
 import { inlinePureMethodCalls, buildCallMapping, requiredParamCount, paramPositionCount } from '../translator/index.js'
 import { parseExpr, tryDedupIdiom, buildPairwiseDistinctFact } from '../parser/expr.js'
+import { collectModuleConstFacts } from '../parser/module-consts.js'
 import { prettyExpr } from '../parser/pretty.js'
 import { substituteExpr, substituteOutput } from '../translator/substitution.js'
 import { makeConst, isArrayExpr } from '../translator/variables.js'
@@ -37,6 +38,11 @@ export function extractCallSiteObligations(
     compilerOptions: { strict: false, skipLibCheck: true },
   })
   const file = project.createSourceFile(fileName, source, { overwrite: true })
+
+  // Module constants are facts at call sites too — an argument or guard
+  // mentioning MAX_PERCENTAGE means MAX_PERCENTAGE === 100, not a free var.
+  let moduleConstFacts = new Map<string, number>()
+  try { moduleConstFacts = collectModuleConstFacts(file, fileName) } catch { /* best-effort */ }
 
   const tasks: VerificationTask[] = []
 
@@ -71,6 +77,7 @@ export function extractCallSiteObligations(
     const { assignments: scopeAssignments, sorts: scopeSorts } = collectScopeAssignments(node)
 
     // Collect path conditions — if-statement guards enclosing the call site
+    // and early-exit guards (`if (x.lte(0)) return ...; f(x)` ⟹ !(x <= 0))
     const pathConditions = collectPathConditions(node)
 
     // Collect enclosing function's inline requires as assumptions
@@ -288,7 +295,10 @@ export function extractCallSiteObligations(
       // Add path conditions as assumptions (if-guards enclosing the call).
       // A truthiness guard (`if (overrides)`) translates as a non-Bool — it
       // would pass construction and explode inside the solver; drop it.
-      for (const { expr: condExpr, negated } of pathConditions) {
+      for (const { expr: rawCondExpr, negated } of pathConditions) {
+        // Method-call guards (`x.lte(0)`) inline to plain comparisons —
+        // without this, Decimal guards silently drop from path conditions.
+        const condExpr = inlinePureMethodCalls(rawCondExpr, registry)
         collectAndCreateVars(condExpr, vars, ctx)
         const condZ3 = toZ3(condExpr, vars, ctx)
         if (condZ3 && isBoolSorted(condZ3)) {
@@ -323,6 +333,18 @@ export function extractCallSiteObligations(
             assumptionLabels.push(`decreases integer: ${prettyExpr(decExpr)} is integer`)
           } catch { /* not arithmetic */ }
         }
+      }
+
+      // Module constants referenced by this task are pinned to their values.
+      // Skipped when a scope assignment shadows the name (local wins).
+      for (const [constName, constValue] of moduleConstFacts) {
+        const constVar = vars.get(constName)
+        if (constVar === undefined || scopeAssignments.has(constName)) continue
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
+          assumptions.push((constVar as any).eq(ctx.Real.val(constValue)) as Bool<'main'>)
+          assumptionLabels.push(`module const: ${constName} === ${constValue}`)
+        } catch { /* non-numeric sort — skip */ }
       }
 
       const z3 = toZ3(substituted, vars, ctx)
