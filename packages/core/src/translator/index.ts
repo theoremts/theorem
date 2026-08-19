@@ -1176,7 +1176,7 @@ function rewriteRegisteredCalls(
       let resolved = resolveCallee(expr.callee, registry, protoSuffixAllowed(expr))
       // Last-segment fallback (x.method → free function `method`) is accepted
       // only with matching arity — `calculator.total()` must not inherit the
-      // contract of `total(lineItems, taxRate, rules)`.
+      // contract of `total(lineItems, taxRate, extras)`.
       if (resolved !== null && resolved !== expr.callee && !resolved.includes('.prototype.') &&
           !expr.callee.startsWith('new ')) {
         const lastSegContract = registry.get(resolved)
