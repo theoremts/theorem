@@ -598,6 +598,18 @@ export function translateHeapMode(
           const x = translate(argE, env, oldEnv)
           return x !== null && isIntSorted(x) ? x : null
         }
+        // seqEq(a, b): extensional equality. Over versioned heap arrays,
+        // seqEq(xs, old(xs)) is "the array content is unchanged" — the
+        // in-place .sort() havoc refutes it, sorting a copy proves it.
+        // (Lengths are shared per root and preserved by array-sort, so
+        // content equality is the whole story.)
+        if (expr.callee === 'seqEq' && expr.args.length === 2) {
+          const a = translate(expr.args[0]!, env, oldEnv)
+          const b = translate(expr.args[1]!, env, oldEnv)
+          if (a === null || b === null) return null
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+          try { return (a as any).eq(b) } catch { return null }
+        }
         const arg0 = expr.args[0] !== undefined ? translate(expr.args[0]!, env, oldEnv) : null
         if (expr.callee === 'Number.isInteger' && arg0 !== null) {
           if (isIntSorted(arg0)) return ctx.Bool.val(true)  // Int-sorted IS integral

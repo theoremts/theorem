@@ -830,3 +830,27 @@ describe('class-method loops: heap-mode routing', () => {
     assert.strictEqual(preserved.status, 'disproved', 'the +1 drift breaks the invariant')
   })
 })
+
+describe('array immutability via seqEq(arr, old(arr))', () => {
+  test('in-place .sort() refutes, sorting a copy proves', async () => {
+    const results = await verifyAll(`
+      export function inPlace(xs: number[]): number[] {
+        ensures(seqEq(xs, old(xs)))
+        xs.sort((a, b) => a - b)
+        return xs
+      }
+      export function onCopy(xs: number[]): number[] {
+        ensures(seqEq(xs, old(xs)))
+        const copy = [...xs]
+        copy.sort((a, b) => a - b)
+        return copy
+      }
+    `)
+    const bad = results.find(r => r.fn === 'inPlace' && r.text.includes('seqEq'))
+    const good = results.find(r => r.fn === 'onCopy' && r.text.includes('seqEq'))
+    assert.ok(bad, `Expected the inPlace obligation, got: ${results.map(r => `${r.fn}: ${r.text}`).join('; ')}`)
+    assert.ok(good, 'Expected the onCopy obligation')
+    assert.strictEqual(bad.status, 'disproved', 'in-place sort mutates the argument')
+    assert.strictEqual(good.status, 'proved', 'sorting a copy leaves the argument untouched')
+  })
+})
