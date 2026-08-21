@@ -446,7 +446,39 @@ export function drainUnsafe(from: Account, to: Account): void {
 //   Add requires(from !== to) and it proves.
 ```
 
-`old(x.f)` reads the pre-state heap; `modifies(a, b)` declares which objects may be written — an undeclared write is a violation.
+`old(x.f)` reads the pre-state heap.
+
+### Frame conditions with `modifies`
+
+`modifies(...objs)` declares which objects a function is allowed to write. Any write outside the declared frame is reported as a **modifies violation** — the function's signature stops lying about its side effects:
+
+```typescript
+interface Account { value: number }
+
+export function settle(a: Account, b: Account): void {
+  modifies(a)                      // "I only touch a"
+  requires(a !== b)
+  ensures(a.value === 1)
+  a.value = 1
+  b.value = 2                      // ✗ modifies violation: wrote b.value
+}
+```
+
+Declare the full frame and the same body verifies clean:
+
+```typescript
+export function settle(a: Account, b: Account): void {
+  modifies(a, b)
+  requires(a !== b)
+  ensures(a.value === 1)
+  a.value = 1
+  b.value = 2                      // ✓ declared
+}
+```
+
+Without a `modifies` clause, writes are unrestricted — the clause is opt-in, but once present it is enforced exhaustively. This is the same framing discipline as Dafny's `modifies` / SPARK's `Global`: callers can rely on everything **outside** the frame being untouched, which is what makes modular reasoning about mutation sound.
+
+A related pattern: to prove a function *doesn't* reorder or rewrite an array it receives (e.g. it sorts a copy instead of calling `.sort()` in place), assert `ensures(seqEq(arr, old(arr)))` — Theorem models in-place `.sort()` as a havoc of the array, so the ensures refutes on the mutating version and proves once the copy is sorted instead.
 
 ### Recursive invariants over linked structures
 
