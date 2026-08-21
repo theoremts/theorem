@@ -70,6 +70,27 @@ export function translate(
   // Fresh per-function memo for modular-call rewrites (see rewriteRegisteredCalls)
   callRewriteMemo = new Map()
 
+  // Pure method contracts inline into the BODY too, not just predicates and
+  // call sites: `const d = a.sub(b); const e = d;` must keep `d === e` in the
+  // returned object's prop equations — an untranslatable initializer used to
+  // silently drop BOTH bindings, refuting tautological ensures with free vars.
+  if (registry !== undefined && registry.size > 0) {
+    ir = {
+      ...ir,
+      body: ir.body !== undefined ? inlinePureMethodCalls(ir.body, registry) : undefined,
+      bodySteps: ir.bodySteps?.map(s => {
+        if (s.kind === 'assign') return { ...s, value: inlinePureMethodCalls(s.value, registry) }
+        if (s.kind === 'if-assign') return {
+          ...s,
+          condition: inlinePureMethodCalls(s.condition, registry),
+          value: inlinePureMethodCalls(s.value, registry),
+          defaultValue: inlinePureMethodCalls(s.defaultValue, registry),
+        }
+        return s
+      }),
+    }
+  }
+
   // Spec functions: calls in contract predicates become uninterpreted
   // applications (congruence!), with ground definitional axioms emitted per
   // call instance up to the fuel bound (see translator/spec-unfold.ts)
@@ -364,7 +385,14 @@ export function translate(
         if (isNullProp && !vars.has('__nullref')) {
           vars.set('__nullref', makeConst('__nullref', 'real', ctx))
         }
-        const propZ3 = isNullProp ? vars.get('__nullref')! : toZ3(prop.value, vars, ctx)
+        // Route through the SAME machinery as the main body equation:
+        // registered calls (valueOrDefault-style multi-ensures contracts) become
+        // memoized __ret vars — two props built from identical call trees
+        // share one __ret, so alias equalities survive even when the call's
+        // arguments are untranslatable.
+        const propZ3 = isNullProp
+          ? vars.get('__nullref')!
+          : translateBody(prop.value, vars, ctx, registry, callObligations, callAssumptions)
         const propVar = vars.get(propName)
         if (propZ3 !== null && propVar !== undefined) {
           try {
@@ -388,8 +416,8 @@ export function translate(
           if (elseVal === undefined || key === '...') continue
           const propName = `result.${key}`
           if (!vars.has(propName)) vars.set(propName, makeConst(propName, 'real', ctx))
-          const thenZ3 = toZ3(thenVal, vars, ctx)
-          const elseZ3 = toZ3(elseVal, vars, ctx)
+          const thenZ3 = translateBody(thenVal, vars, ctx, registry, callObligations, callAssumptions)
+          const elseZ3 = translateBody(elseVal, vars, ctx, registry, callObligations, callAssumptions)
           const propVar = vars.get(propName)
           if (thenZ3 !== null && elseZ3 !== null && propVar !== undefined) {
             try {

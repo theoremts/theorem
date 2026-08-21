@@ -28,6 +28,12 @@ const DECIMAL_DECLARES = `
   declare(Decimal.prototype.toNumber, (a: number): number => {
     ensures(output() === a)
   })
+  declare(Decimal.prototype.sub, (a: number, b: number): number => {
+    ensures(output() === a - b)
+  })
+  declare(Decimal.prototype.equals, (a: number, b: number): boolean => {
+    ensures(output() === (a === b))
+  })
   declare(Decimal, (a: number): number => {
     ensures(output() === a)
   })
@@ -244,5 +250,79 @@ describe('call sites: module consts and method-call early-exit guards', () => {
     const bad = results.find(r => r.text.includes('MIN_QTY - 5'))
     assert.strictEqual(good?.status, 'proved', 'MIN_QTY === 10 discharges qty >= 10')
     assert.strictEqual(bad?.status, 'disproved', 'MIN_QTY - 5 === 5 violates qty >= 10')
+  })
+})
+
+describe('method contracts: object-literal returns keep body equations', () => {
+  test('an alias of a method-computed local proves the tautological ensures', async () => {
+    // The classic false positive: `second` IS `first`, but an untranslatable
+    // initializer used to drop BOTH prop equations, leaving two free vars.
+    const results = await verifyWithDeclares(`
+      export function delta(a: Decimal, b: Decimal) {
+        ensures(output().locked === true);
+        ensures(output().second.equals(output().first));
+        const first: Decimal = a.sub(b);
+        const second: Decimal = first;
+        return { locked: true, first, second };
+      }
+    `)
+    const target = results.find(r => r.text.includes('second'))
+    assert.ok(target, `Expected the equality ensures, got: ${results.map(r => r.text).join('; ')}`)
+    assert.strictEqual(target.status, 'proved', 'second === first by construction')
+  })
+
+  test('the method-computed prop value itself is provable', async () => {
+    const results = await verifyWithDeclares(`
+      export function delta(a: Decimal, b: Decimal) {
+        ensures(output().first.equals(a.sub(b)));
+        const first: Decimal = a.sub(b);
+        return { locked: true, first };
+      }
+    `)
+    const target = results.find(r => r.text.includes('first'))
+    assert.ok(target, 'Expected the value ensures')
+    assert.strictEqual(target.status, 'proved', 'result.first === a - b must flow through the inlined sub')
+  })
+
+  test('a genuinely wrong prop equality is still refuted', async () => {
+    const results = await verifyWithDeclares(`
+      export function delta(a: Decimal, b: Decimal) {
+        ensures(output().second.equals(output().first.add(1)));
+        const first: Decimal = a.sub(b);
+        const second: Decimal = first;
+        return { locked: true, first, second };
+      }
+    `)
+    const target = results.find(r => r.text.includes('add(1)'))
+    assert.ok(target, 'Expected the wrong ensures')
+    assert.strictEqual(target.status, 'disproved', 'second !== first + 1 — must not become vacuous')
+  })
+})
+
+describe('object-literal returns: modular calls in props', () => {
+  test('aliased props built from a multi-ensures registered call stay equal', async () => {
+    // The profit-locked shape: props computed through a registered function
+    // (conditional ensures — goes through __ret, not inlining) plus an alias.
+    // Memoized rewrites must give both props the SAME __ret.
+    const results = await verifyWithDeclares(`
+      function orZero(value: Decimal | undefined | null): Decimal {
+        ensures(value != null || output().equals(0));
+        ensures(value == null || output().equals(value));
+        return value ? value : ZERO;
+      }
+      export function delta(view: View) {
+        ensures(output().locked === true);
+        ensures(output().second.equals(output().first));
+        const prev: Decimal = orZero(view.previous?.cost || view.original);
+        const next: Decimal = orZero(view.current?.cost);
+        const first: Decimal = next.sub(prev);
+        const second: Decimal = first;
+        return { locked: true, first, second };
+      }
+    `)
+    const target = results.find(r => r.fn === 'delta' && r.text.includes('second'))
+    assert.ok(target, `Expected the equality ensures, got: ${results.map(r => r.text).join('; ')}`)
+    assert.strictEqual(target.status, 'proved',
+      'second === first by construction — even with untranslatable optional-chain args')
   })
 })
