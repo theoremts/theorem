@@ -110,3 +110,17 @@ describe('module constants: resolved, not assumed by hand', () => {
     assert.strictEqual(results.find(r => r.text.includes('=== LIMIT'))?.status, 'proved')
   })
 })
+
+describe('string module constants', () => {
+  test('a string const is a fact in bodies and at call sites', async () => {
+    const source = `
+      const PAID = "paid";
+      export function isPaid(status: string): boolean {
+        ensures(output() === (status === "paid"))
+        return status === PAID
+      }
+    `
+    const results = await verifyFileSource(source, join(dir, 'src', 'f.ts'))
+    assert.strictEqual(results.find(r => r.text.includes('status'))?.status, 'proved')
+  })
+})

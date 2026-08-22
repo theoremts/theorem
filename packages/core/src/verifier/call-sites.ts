@@ -41,7 +41,7 @@ export function extractCallSiteObligations(
 
   // Module constants are facts at call sites too — an argument or guard
   // mentioning MAX_PERCENTAGE means MAX_PERCENTAGE === 100, not a free var.
-  let moduleConstFacts = new Map<string, number>()
+  let moduleConstFacts = new Map<string, number | string>()
   try { moduleConstFacts = collectModuleConstFacts(file, fileName) } catch { /* best-effort */ }
 
   const tasks: VerificationTask[] = []
@@ -112,6 +112,17 @@ export function extractCallSiteObligations(
         if (argE?.kind !== 'ident' || vars.has(argE.name)) continue
         if (param.sort === 'ref-array' || param.sort === 'array' || param.sort === 'string') {
           vars.set(argE.name, makeConst(argE.name, param.sort, ctx))
+        }
+      }
+      // String-valued module consts referenced by this obligation must be
+      // created String-sorted BEFORE the generic pass defaults them to Real
+      // (the fact and any comparison against a string param would
+      // sort-mismatch and drop).
+      const substitutedText = prettyExpr(substituted)
+      for (const [constName, constValue] of moduleConstFacts) {
+        if (typeof constValue === 'string' && !vars.has(constName) &&
+            new RegExp(`\\b${constName}\\b`).test(substitutedText)) {
+          vars.set(constName, makeConst(constName, 'string', ctx))
         }
       }
       collectAndCreateVars(substituted, vars, ctx)
@@ -341,10 +352,11 @@ export function extractCallSiteObligations(
         const constVar = vars.get(constName)
         if (constVar === undefined || scopeAssignments.has(constName)) continue
         try {
+          const valZ3 = typeof constValue === 'string' ? ctx.String.val(constValue) : ctx.Real.val(constValue)
           // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
-          assumptions.push((constVar as any).eq(ctx.Real.val(constValue)) as Bool<'main'>)
-          assumptionLabels.push(`module const: ${constName} === ${constValue}`)
-        } catch { /* non-numeric sort — skip */ }
+          assumptions.push((constVar as any).eq(valZ3) as Bool<'main'>)
+          assumptionLabels.push(`module const: ${constName} === ${JSON.stringify(constValue)}`)
+        } catch { /* sort mismatch — skip */ }
       }
 
       const z3 = toZ3(substituted, vars, ctx)
@@ -801,11 +813,16 @@ function collectPathConditions(callNode: Node): Array<{ expr: Expr; negated: boo
         if (Node.isIfStatement(stmt) && !stmt.getElseStatement()) {
           const thenBranch = stmt.getThenStatement()
           if (isUnconditionalExit(thenBranch)) {
-            // Guard: if (BAD) return → after this, !BAD holds
+            // Guard: if (BAD) return → after this, !BAD holds — UNLESS a
+            // variable the guard reads is reassigned between the guard and
+            // the call (`if (w <= 0) return; w = -5; f(w)`): the guard
+            // spoke about the OLD value.
             const condNode = stmt.getExpression()
-            const parsed = parseExpr(condNode as Expression)
-            if (parsed) {
-              conditions.push({ expr: parsed, negated: true })
+            if (!guardInvalidatedBetween(condNode, stmt, callNode, parent)) {
+              const parsed = parseExpr(condNode as Expression)
+              if (parsed) {
+                conditions.push({ expr: parsed, negated: true })
+              }
             }
           }
         }
@@ -823,6 +840,49 @@ function isDescendantOf(node: Node, ancestor: Node): boolean {
   while (current) {
     if (current === ancestor) return true
     current = current.getParent()
+  }
+  return false
+}
+
+/**
+ * True when any identifier read by the guard condition is (re)assigned in the
+ * statements between the guard and the call — the negated guard would then
+ * describe a stale value. Scans assignments (`x = ...`, `x += ...`) and
+ * increments in the in-between statements, nested blocks included.
+ */
+function guardInvalidatedBetween(condNode: Node, guardStmt: Node, callNode: Node, block: Node): boolean {
+  const guarded = new Set<string>()
+  if (Node.isIdentifier(condNode)) guarded.add(condNode.getText())
+  for (const id of condNode.getDescendantsOfKind(SyntaxKind.Identifier)) {
+    const p = id.getParent()
+    // skip property NAMES (x.prop reads x, not prop)
+    if (p !== undefined && Node.isPropertyAccessExpression(p) && p.getNameNode() === id) continue
+    guarded.add(id.getText())
+  }
+  if (guarded.size === 0) return false
+
+  if (!Node.isBlock(block) && !Node.isSourceFile(block)) return false
+  const stmts = block.getStatements()
+  const from = stmts.indexOf(guardStmt as (typeof stmts)[number])
+  if (from < 0) return false
+  for (let i = from + 1; i < stmts.length; i++) {
+    const s = stmts[i]!
+    if (s.getEnd() > callNode.getPos() && s.getPos() > callNode.getPos()) break
+    for (const bin of s.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+      const op = bin.getOperatorToken().getText()
+      if (op !== '=' && !op.endsWith('=') || op === '==' || op === '===' || op === '<=' || op === '>=' || op === '!=' || op === '!==') continue
+      const lhs = bin.getLeft()
+      const root = Node.isIdentifier(lhs) ? lhs.getText()
+        : Node.isPropertyAccessExpression(lhs) ? lhs.getExpression().getText().split('.')[0]
+        : null
+      if (root !== null && root !== undefined && guarded.has(root)) return true
+    }
+    for (const un of [...s.getDescendantsOfKind(SyntaxKind.PostfixUnaryExpression), ...s.getDescendantsOfKind(SyntaxKind.PrefixUnaryExpression)]) {
+      const tok = (un as unknown as { getOperatorToken: () => number }).getOperatorToken()
+      if (tok !== SyntaxKind.PlusPlusToken && tok !== SyntaxKind.MinusMinusToken) continue
+      const operand = (un as { getOperand?: () => Node }).getOperand?.()
+      if (operand !== undefined && Node.isIdentifier(operand) && guarded.has(operand.getText())) return true
+    }
   }
   return false
 }

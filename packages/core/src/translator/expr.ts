@@ -164,8 +164,24 @@ export function toZ3(
         }
       }
 
-      // If the object doesn't exist yet, create it as an Array and use select
+      // String-keyed RECORD access: `rec[key]` with a string-sorted index
+      // becomes Select over an Array(String→Real) — an uninterpreted map,
+      // so the same key reads the same value (congruence) and different
+      // keys stay independent. Only when the record isn't already an
+      // Int-indexed array.
       if (objZ3 === undefined) {
+        const idxProbe = toZ3(expr.index, vars, ctx)
+        if (idxProbe !== null && isStringExpr(idxProbe, ctx)) {
+          try {
+            const rec = ctx.Array.const(objName, ctx.String.sort(), ctx.Real.sort()) as unknown as Z3Expr
+            vars.set(objName, rec)
+            return ctx.Select(rec as Z3Array, idxProbe as Z3Arith) as unknown as Z3Expr
+          } catch { /* fall through */ }
+        }
+      }
+
+      // If the object doesn't exist yet, create it as an Array and use select
+      if (objZ3 === undefined && vars.get(objName) === undefined) {
         try {
           const arrConst = makeArrayConst(objName, ctx)
           vars.set(objName, arrConst)
@@ -418,6 +434,43 @@ export function toZ3(
         const foldName = plainFoldName(expr)
         if (foldName !== null && vars.has(foldName)) return vars.get(foldName)!
       }
+
+      // Exact decimal rounding: x.toDecimalPlaces(d[, MODE]) with a literal
+      // digit count. Modeled via to_int (floor): scale, split off the
+      // fraction, resolve ties per mode — HALF_EVEN to the even neighbour,
+      // HALF_UP (decimal.js default) away from zero. This is what makes
+      // "rounded-of-sum vs sum-of-rounded" conservation properties
+      // refutable instead of absorbed by a ±0.005 bound. A user declare()
+      // on toDecimalPlaces takes precedence (it inlines before this runs).
+      if (expr.recv !== undefined && expr.callee.endsWith('.toDecimalPlaces') &&
+          expr.args.length >= 1 && expr.args[0]!.kind === 'literal') {
+        const places = expr.args[0]!.value
+        if (typeof places === 'number' && Number.isInteger(places) && places >= 0 && places <= 6) {
+          const xv = toZ3(expr.recv, vars, ctx)
+          if (xv !== null) {
+            try {
+              const modeArg = expr.args[1]
+              const modeText = modeArg?.kind === 'member' ? modeArg.property : ''
+              const halfEven = modeText.includes('HALF_EVEN')
+              const scale = ctx.Real.val(10 ** places)
+              const s = (xv as Z3Arith).mul(scale)
+              const k = ctx.ToInt(s)
+              const kR = ctx.ToReal(k)
+              const f = s.sub(kR)
+              const half = ctx.Real.val('1/2')
+              const up = kR.add(ctx.Real.val(1))
+              const kEven = (k.mod(ctx.Int.val(2)) as Arith<'main'>).eq(ctx.Int.val(0))
+              // HALF_UP ties go AWAY FROM ZERO: up for s >= 0, down for s < 0
+              const tie = halfEven
+                ? ctx.If(kEven, kR, up)
+                : ctx.If(s.ge(ctx.Real.val(0)), up, kR)
+              const rounded = ctx.If(f.lt(half), kR, ctx.If(f.gt(half), up, tie))
+              return (rounded as Z3Arith).div(scale) as unknown as Z3Expr
+            } catch { /* fall through */ }
+          }
+        }
+      }
+
       try { return translateCall(expr.callee, expr.args, vars, ctx) } catch { return null }
     }
 

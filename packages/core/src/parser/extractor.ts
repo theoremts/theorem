@@ -425,7 +425,14 @@ function extractDecoratedMethods(
       if (alreadyExtracted.has(name)) continue
 
       const decorators = method.getDecorators()
-      if (decorators.length === 0 && classInvariants.length === 0) continue
+      // Inline requires/ensures STATEMENTS in the method body count too —
+      // a class needs neither @invariant nor decorators for its methods to
+      // carry contracts (this was a silent skip: zero tasks, no warning).
+      const bodyProbe = method.getBody()
+      const hasInlineContracts = bodyProbe !== undefined && Node.isBlock(bodyProbe) &&
+        bodyProbe.getStatements().some(s =>
+          Node.isExpressionStatement(s) && tryExtractContract(s.getExpression() as Expression) !== null)
+      if (decorators.length === 0 && classInvariants.length === 0 && !hasInlineContracts) continue
 
       const contracts: Contract[] = []
       for (const dec of decorators) {
@@ -1975,6 +1982,12 @@ function tsTypeToSort(type: string): Sort {
 
   // Set types: Set<number>
   if (trimmed === 'Set<number>') return 'set'
+
+  // String-keyed records: Record<string, T> / { [key: string]: T } —
+  // uninterpreted String→Real maps (dynamic-key lookups get congruence)
+  if (/^Record<\s*string\s*,/.test(trimmed) || /^\{\s*\[\s*\w+\s*:\s*string\s*\]\s*:/.test(trimmed)) {
+    return 'record'
+  }
 
   // Detect numeric literal union types: 0 | 1 | 2, "Pending" | "Active", etc.
   // Only handle numeric literal unions for now (used for enum-like types).

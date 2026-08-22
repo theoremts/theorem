@@ -7,7 +7,7 @@
  * A NumericUnionSort constrains a variable to a finite set of numeric literals
  * (e.g. TypeScript type `0 | 1 | 2` for enums or status codes).
  */
-export type Sort = 'int' | 'real' | 'bool' | 'string' | 'array' | 'ref-array' | 'set' | 'unknown' | NumericUnionSort
+export type Sort = 'int' | 'real' | 'bool' | 'string' | 'array' | 'ref-array' | 'set' | 'record' | 'unknown' | NumericUnionSort
 
 export interface NumericUnionSort {
   kind: 'numeric-union'

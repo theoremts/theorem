@@ -135,3 +135,64 @@ describe('destructured params: call sites', () => {
       'caller requires on order.discount/order.subtotal must discharge the callee requires')
   })
 })
+
+describe('destructured returns: const { a, b } = call()', () => {
+  test('callee object ensures flow through the bindings', async () => {
+    const source = `
+      function split(amount: number): { net: number; fee: number } {
+        requires(amount >= 0)
+        ensures(output().net + output().fee === amount)
+        return { net: amount * 0.9, fee: amount * 0.1 }
+      }
+      export function total(amount: number): number {
+        requires(amount >= 0)
+        ensures(output() === amount)
+        const { net, fee } = split(amount)
+        return net + fee
+      }
+      export function totalWrong(amount: number): number {
+        requires(amount >= 0)
+        ensures(output() === amount)
+        const { net, fee } = split(amount)
+        return net + fee + 1
+      }
+    `
+    const ctx = await getContext()
+    const fns = extractFromSource(source, 'test.ts')
+    const registry = buildRegistry(fns)
+    const results: Array<{ fn: string; text: string; status: string }> = []
+    for (const ir of fns) {
+      if (ir.name === 'split') continue
+      for (const task of translate(ir, ctx, registry)) {
+        if (!task.contractText.includes('=== amount')) continue
+        results.push({ fn: ir.name ?? '?', text: task.contractText, status: (await check(task)).status })
+      }
+    }
+    assert.strictEqual(results.find(r => r.fn === 'total')?.status, 'proved',
+      'net + fee === amount must flow from the callee ensures through the destructuring')
+    assert.strictEqual(results.find(r => r.fn === 'totalWrong')?.status, 'disproved')
+  })
+
+  test('renamed bindings map to the right properties', async () => {
+    const source = `
+      function box(x: number): { value: number } {
+        ensures(output().value === x)
+        return { value: x }
+      }
+      export function unwrap(x: number): number {
+        ensures(output() === x)
+        const { value: v } = box(x)
+        return v
+      }
+    `
+    const ctx = await getContext()
+    const fns = extractFromSource(source, 'test.ts')
+    const registry = buildRegistry(fns)
+    for (const ir of fns) {
+      if (ir.name !== 'unwrap') continue
+      for (const task of translate(ir, ctx, registry)) {
+        assert.strictEqual((await check(task)).status, 'proved', task.contractText)
+      }
+    }
+  })
+})

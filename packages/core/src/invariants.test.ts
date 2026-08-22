@@ -199,3 +199,29 @@ describe('cross-file schema resolution', () => {
     assert.strictEqual(div.status, 'proved')
   })
 })
+
+describe('class methods with inline contracts, no @invariant', () => {
+  test('inline requires/ensures statements alone produce tasks', async () => {
+    const ctx = await getContext()
+    const source = `
+      export class TaxCalc {
+        rate: number;
+        constructor(rate: number) { this.rate = rate }
+        taxFor(amount: number): number {
+          requires(amount >= 0)
+          requires(this.rate >= 0)
+          ensures(output() >= 0)
+          return amount * this.rate
+        }
+      }
+    `
+    const irs = extractFromSource(source)
+    const method = irs.find(ir => ir.name === 'taxFor')
+    assert.ok(method, 'taxFor must be extracted — this was a silent skip (zero tasks, no warning)')
+    let proved = 0
+    for (const task of translate(method, ctx)) {
+      if ((await check(task)).status === 'proved') proved++
+    }
+    assert.ok(proved >= 1, 'the ensures must prove')
+  })
+})

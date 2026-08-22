@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process'
 import { resolve, join, relative } from 'node:path'
 import {
   extractFromSource,
+  resolveImportedFiles,
   extractDeclareContracts,
   prettyExpr,
   translate,
@@ -315,6 +316,27 @@ async function runVerify(
       const source = readFileSync(absPath, 'utf-8')
       allIRs.push(...extractFromSource(source, absPath))
     } catch { /* skip unreadable files */ }
+  }
+
+  // One-hop import expansion for SMALL runs: contracts of directly imported
+  // files join the registry (never the verify set), so a single-file verify
+  // sees its callees' requires/ensures instead of treating cross-file calls
+  // as unknown. Large runs skip this — the sharded path already builds the
+  // registry from the whole project.
+  if (files.length <= 12) {
+    const known = new Set(files)
+    for (const absPath of files) {
+      try {
+        const source = readFileSync(absPath, 'utf-8')
+        for (const dep of resolveImportedFiles(source, absPath)) {
+          if (known.has(dep)) continue
+          known.add(dep)
+          try {
+            allIRs.push(...extractFromSource(readFileSync(dep, 'utf-8'), dep))
+          } catch { /* unreadable import — skip */ }
+        }
+      } catch { /* skip */ }
+    }
   }
 
   // Load declare() contracts from .contracts.ts files

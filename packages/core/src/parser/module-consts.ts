@@ -1,5 +1,5 @@
 import { readFileSync, existsSync } from 'node:fs'
-import { resolve, dirname, join } from 'node:path'
+import { resolve, dirname, join, isAbsolute } from 'node:path'
 import { Project, Node, SyntaxKind, type SourceFile, type Expression } from 'ts-morph'
 import type { Expr, FunctionIR } from './ir.js'
 
@@ -34,17 +34,25 @@ function getConstProject(): Project {
 }
 
 // Caches — per-process; verify runs are short-lived
-const fileFactsCache = new Map<string, Map<string, number>>()
+const fileFactsCache = new Map<string, Map<string, ConstValue>>()
 const tsconfigCache = new Map<string, { baseUrl: string; paths: Record<string, string[]> } | null>()
 
-/** Folds a trusted-constant initializer to its numeric value, or null. */
-function foldConstExpr(node: Expression, known: Map<string, number>): number | null {
+/** A resolved module constant: numeric or string literal. */
+export type ConstValue = number | string
+
+/** Folds a trusted-constant initializer to its value, or null. */
+function foldConstExpr(node: Expression, known: Map<string, ConstValue>): ConstValue | null {
   if (Node.isParenthesizedExpression(node)) return foldConstExpr(node.getExpression(), known)
   if (Node.isAsExpression(node)) return foldConstExpr(node.getExpression(), known)
   if (Node.isNumericLiteral(node)) return Number(node.getLiteralValue())
+  // String constants: `const STATUS = "paid"` — a fact usable wherever the
+  // string field/param machinery compares against it.
+  if (Node.isStringLiteral(node) || Node.isNoSubstitutionTemplateLiteral(node)) {
+    return node.getLiteralValue()
+  }
   if (Node.isPrefixUnaryExpression(node) && node.getOperatorToken() === SyntaxKind.MinusToken) {
     const inner = foldConstExpr(node.getOperand() as Expression, known)
-    return inner === null ? null : -inner
+    return inner === null || typeof inner !== 'number' ? null : -inner
   }
   if (Node.isIdentifier(node)) {
     const v = known.get(node.getText())
@@ -54,8 +62,9 @@ function foldConstExpr(node: Expression, known: Map<string, number>): number | n
   if (Node.isNewExpression(node)) {
     const callee = node.getExpression().getText()
     const args = node.getArguments() ?? []
-    if ((callee === 'Decimal' || callee.endsWith('.Decimal')) && args.length === 1) {
-      return foldConstExpr(args[0] as Expression, known)
+    if ((callee === "Decimal" || callee.endsWith(".Decimal")) && args.length === 1) {
+      const inner = foldConstExpr(args[0] as Expression, known)
+      return typeof inner === "number" ? inner : null
     }
     return null
   }
@@ -64,7 +73,7 @@ function foldConstExpr(node: Expression, known: Map<string, number>): number | n
     if (op !== '+' && op !== '-' && op !== '*' && op !== '/') return null
     const l = foldConstExpr(node.getLeft(), known)
     const r = foldConstExpr(node.getRight(), known)
-    if (l === null || r === null) return null
+    if (typeof l !== "number" || typeof r !== "number") return null
     switch (op) {
       case '+': return l + r
       case '-': return l - r
@@ -76,8 +85,8 @@ function foldConstExpr(node: Expression, known: Map<string, number>): number | n
 }
 
 /** Module-scope `const NAME = <trusted literal>` facts declared in a file. */
-function collectOwnConsts(file: SourceFile): Map<string, number> {
-  const facts = new Map<string, number>()
+function collectOwnConsts(file: SourceFile): Map<string, ConstValue> {
+  const facts = new Map<string, ConstValue>()
   for (const stmt of file.getStatements()) {
     if (!Node.isVariableStatement(stmt)) continue
     if (stmt.getDeclarationKind() !== 'const') continue
@@ -87,7 +96,7 @@ function collectOwnConsts(file: SourceFile): Map<string, number> {
       const init = decl.getInitializer()
       if (init === undefined) continue
       const v = foldConstExpr(init, facts)
-      if (v !== null && Number.isFinite(v)) facts.set(nameNode.getText(), v)
+      if (v !== null && (typeof v === "string" || Number.isFinite(v))) facts.set(nameNode.getText(), v)
     }
   }
   return facts
@@ -165,10 +174,10 @@ function resolveSpecifier(spec: string, fromFile: string): string | null {
 }
 
 /** Const facts exported by a real file on disk (cached). */
-function collectFileConsts(absPath: string): Map<string, number> {
+function collectFileConsts(absPath: string): Map<string, ConstValue> {
   const cached = fileFactsCache.get(absPath)
   if (cached !== undefined) return cached
-  let facts = new Map<string, number>()
+  let facts = new Map<string, ConstValue>()
   try {
     const project = getConstProject()
     const file = project.getSourceFile(absPath) ?? project.addSourceFileAtPath(absPath)
@@ -257,9 +266,9 @@ export function injectModuleConstFacts(file: SourceFile, fileName: string, irs: 
   }
 }
 
-export function collectModuleConstFacts(file: SourceFile, fileName: string): Map<string, number> {
+export function collectModuleConstFacts(file: SourceFile, fileName: string): Map<string, ConstValue> {
   const facts = collectOwnConsts(file)
-  if (!fileName.startsWith('/')) return facts
+  if (!isAbsolute(fileName)) return facts
 
   for (const imp of file.getImportDeclarations()) {
     const named = imp.getNamedImports()
@@ -277,4 +286,29 @@ export function collectModuleConstFacts(file: SourceFile, fileName: string): Map
     }
   }
   return facts
+}
+
+/**
+ * Absolute paths of files DIRECTLY imported by `source` (one hop): relative
+ * specifiers and tsconfig `paths` aliases, same resolution as const facts.
+ * Used to pull callee contracts into the registry for small verify runs —
+ * a single-file verify then sees its imports' requires/ensures instead of
+ * treating cross-file calls as unknown.
+ */
+export function resolveImportedFiles(source: string, fileName: string): string[] {
+  if (!isAbsolute(fileName)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  const re = /(?:import|export)\s[^'"]*?from\s*['"]([^'"]+)['"]|import\s*['"]([^'"]+)['"]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(source)) !== null) {
+    const spec = m[1] ?? m[2]
+    if (spec === undefined) continue
+    const target = resolveSpecifier(spec, fileName)
+    if (target !== null && !seen.has(target)) {
+      seen.add(target)
+      out.push(target)
+    }
+  }
+  return out
 }

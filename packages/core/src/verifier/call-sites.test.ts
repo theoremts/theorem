@@ -165,3 +165,29 @@ describe('call-site: ensures propagation through variable assignment', () => {
       'mystery() has no contract — y must stay unconstrained')
   })
 })
+
+describe('call-site: early-exit guard stability', () => {
+  test('a guard over a reassigned variable is NOT assumed', async () => {
+    const results = await checkCallSites(`
+      function callee(x: number): number {
+        requires(nonNegative(x))
+        return x
+      }
+      function reassigned(v: number): number {
+        let w = v
+        if (w < 0) return 0
+        w = -5
+        return callee(w)
+      }
+      function stable(v: number): number {
+        if (v < 0) return 0
+        return callee(v)
+      }
+    `)
+    const bad = results.find(r => r.text.includes('callee(w)'))
+    const good = results.find(r => r.text.includes('callee(v)'))
+    assert.ok(bad && good, `Expected both obligations, got: ${results.map(r => r.text).join('; ')}`)
+    assert.notStrictEqual(bad.status, 'proved', 'the stale guard must not prove w >= 0')
+    assert.strictEqual(good.status, 'proved', 'the stable guard discharges the requires')
+  })
+})

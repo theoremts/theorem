@@ -839,6 +839,34 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
         // If array destructuring parsing fails, fall through to normal handling
       }
 
+      // ── Object destructuring: const { total, tax: t } = expr ────────────
+      // Each binding becomes member(expr, prop) — when expr is a registered
+      // call, the modular rewriter later turns it into __ret.prop with the
+      // callee's ensures attached (memoized, so all props share one __ret).
+      try {
+        const nameNode = decl.getNameNode()
+        if (Node.isObjectBindingPattern(nameNode)) {
+          const init = decl.getInitializer()
+          const parsedInit = init !== undefined && !isSchemaParseCall(init)
+            ? parseExpr(init as Expression)
+            : null
+          for (const el of nameNode.getElements()) {
+            if (!Node.isBindingElement(el)) continue
+            if (el.getDotDotDotToken() !== undefined) continue  // ...rest stays free
+            const local = el.getNameNode().getText()
+            if (parsedInit !== null) {
+              const prop = el.getPropertyNameNode()?.getText() ?? local
+              let bound: Expr = { kind: 'member', object: parsedInit, property: prop }
+              if (newBindings.size > 0) bound = substituteExpr(bound, newBindings)
+              newBindings.set(local, bound)
+            } else {
+              newBindings.set(local, { kind: 'ident', name: local })
+            }
+          }
+          continue
+        }
+      } catch { /* fall through to normal handling */ }
+
       const varName = decl.getName()
       const init = decl.getInitializer()
 

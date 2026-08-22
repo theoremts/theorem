@@ -41,6 +41,11 @@ export function makeConst(name: string, sort: Sort, ctx: Z3Context): AnyExpr<'ma
       try {
         return ctx.Array.const(name, ctx.Int.sort(), ctx.Int.sort()) as unknown as AnyExpr<'main'>
       } catch { return ctx.Real.const(name) }
+    case 'record':
+      // String-keyed record: uninterpreted String→Real map
+      try {
+        return ctx.Array.const(name, ctx.String.sort(), ctx.Real.sort()) as unknown as AnyExpr<'main'>
+      } catch { return ctx.Real.const(name) }
     case 'set':    return makeSetConst(name, ctx)
     default:       return ctx.Real.const(name)
   }
