@@ -36,6 +36,8 @@ Every contract is a **no-op at runtime**. Theorem is pure static analysis: your 
 - [Schemas as contracts](#schemas-as-contracts)
 - [Class invariants](#class-invariants)
 - [Verified mutation](#verified-mutation)
+- [Collection vocabulary](#collection-vocabulary)
+- [Exact rounding and money conservation](#exact-rounding-and-money-conservation)
 - [Counterexamples as regression tests](#counterexamples-as-regression-tests)
 - [Zero-annotation analysis: scan, suggest, infer](#zero-annotation-analysis-scan-suggest-infer)
 - [Editor integration](#editor-integration)
@@ -266,6 +268,57 @@ safeDivide(100, 0)                     // ✗ call-site check: violates positive
 
 Any call pattern works — `service.calculate(x)`, `this.payments.process(x)`.
 
+### Module constants are facts
+
+A module-scope `const` with a trusted initializer — a numeric or string literal, `new Decimal(lit)`, or arithmetic over other constants — is a value the verifier knows, everywhere the name appears. Same file or imported (relative paths and tsconfig `paths` aliases, one hop):
+
+```typescript
+// money/constants.ts
+export const ZERO = new Decimal(0);
+export const PERCENT_SCALE = 100;
+export const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// elsewhere
+import { PERCENT_SCALE } from "@/money/constants";
+
+export function toFraction(pct: number): number {
+  ensures(output() >= 0 || pct < 0)
+  return pct / PERCENT_SCALE            // ✓ division safety: PERCENT_SCALE === 100
+}
+```
+
+No `assume(ZERO.equals(0))` rituals. Only `const` qualifies — a `let` stays an honest free variable — and the facts hold at **call sites** too: `order(MIN_QTY)` discharges `requires(qty >= 10)` when `const MIN_QTY = 10`, and counterexamples show constants at their real values.
+
+### Destructured parameters and returns
+
+`function f({ lineItem, taxRate }: Input)` verifies like `f(lineItem, taxRate)` — bindings become typed parameters (sorts from the interface, renames and defaults honored), and call sites map object-literal arguments per property. The reverse direction works too:
+
+```typescript
+function split(amount: number): { net: number; fee: number } {
+  ensures(output().net + output().fee === amount)
+  return { net: amount * 0.9, fee: amount * 0.1 }
+}
+
+export function total(amount: number): number {
+  ensures(output() === amount)
+  const { net, fee } = split(amount)    // callee ensures attach to the bindings
+  return net + fee                      // ✓ proves via net + fee === amount
+}
+```
+
+### Guards travel to call sites
+
+If-guards enclosing a call and early-return guards before it become path conditions for the call-site check — including guards written with contracted methods:
+
+```typescript
+export function allocate(value: Decimal): Decimal {
+  if (value.lte(0)) return ZERO;        // early return...
+  return scale(value);                  // ✓ ...discharges scale's requires(value.gt(0))
+}
+```
+
+A guard over a variable that is **reassigned** between the guard and the call is discarded — it spoke about the old value.
+
 ## Loops
 
 A `while` loop is verified by **havoc + invariant**: each `invariant` must hold at loop entry, be preserved by one arbitrary iteration, and after the loop the *only* known facts are `invariant ∧ ¬condition`. `decreases` proves termination. Four obligations per loop, all discharged by the solver:
@@ -340,6 +393,25 @@ export function unitAdjustment(input: unknown): number {
 ```
 
 `z.number().int()` gives Z3 the integer fact TypeScript's `number` can't express. Schemas imported from other files are resolved automatically. **Effect Schema** has full parity: `Schema.decodeUnknownSync`, `Schema.Struct` refinements, `Schema.filter`.
+
+### Dedup transforms are uniqueness guarantees
+
+A `.transform()` whose body is the canonical dedup idiom makes uniqueness a **property of the parse output** — stronger than a refine, which merely rejects offending input:
+
+```typescript
+const RulesSchema = z.array(RuleSchema)
+  .transform((a) => [...new Map(a.map((x) => [x.key, x])).values()]);  // → uniqueBy(parsed, key)
+
+const IdsSchema = z.array(z.number())
+  .transform((ids) => [...new Set(ids)]);                              // → unique(parsed)
+
+export function apply(input: unknown): void {
+  const rules = RulesSchema.parse(input);
+  buildCalculator(rules);   // ✓ requires(uniqueBy(rules, r => r.key)) — the schema guarantees it
+}
+```
+
+The Set-size refine (`.refine(a => new Set(a).size === a.length)`) is also recognized; the transform form additionally *repairs* the data instead of throwing.
 
 ### `.refine()` is a model invariant
 
@@ -572,6 +644,54 @@ export function transfer(users: Account[], i: number, j: number, amt: number): v
 ```
 
 Every indexed write moves the sum by exactly its cell delta — an axiom valid only under `requires(unique(users))` (a duplicated reference would count its delta twice; without uniqueness the sum is honestly unconstrained). Two-state quantified contracts compose with loops: `ensures(forall(users, (u) => u.balance >= old(u.balance)))` proves through a crediting loop regardless of aliasing. The full tour: [`examples/collections.ts`](examples/collections.ts) and [`examples/schema-arrays.ts`](examples/schema-arrays.ts).
+
+### String fields and referential integrity
+
+Fields compared against string literals inside quantifiers translate through typed views of the heap, so domain rules over string-valued fields are real contracts:
+
+```typescript
+interface FeeRule { key: string; appliesTo: string; isEnabled: boolean }
+
+// Every enabled rule must resolve: to the base, or to another ENABLED rule.
+requires(forall(rules, (m) =>
+  !m.isEnabled ||
+  m.appliesTo === "baseCost" ||
+  exists(rules, (d) => d.key === m.appliesTo && d.isEnabled)))
+```
+
+At call sites, literal arrays carry their string facts: `[{ key: "a", appliesTo: "baseCost", isEnabled: true }, ...]` proves the guard — a dangling `appliesTo: "missing"` refutes it with a counterexample. Truthiness guards (`!m.isEnabled ||`) and field-vs-field equality (`d.key === m.appliesTo`) participate. `uniqueBy` over string keys proves for literal arrays with distinct keys.
+
+### String-keyed records
+
+`Record<string, T>` parameters are uninterpreted String→Real maps — dynamic-key lookups get **congruence** (same key, same value) without inventing values:
+
+```typescript
+export function convert(rates: Record<string, number>, currency: string): number {
+  requires(rates[currency] > 0)
+  ensures(output() > 0)
+  return rates[currency]          // ✓ same key — congruence
+}
+// reading rates[other] instead → refuted: different keys are independent
+```
+
+## Exact rounding and money conservation
+
+`x.toDecimalPlaces(d, mode)` with a literal digit count is modeled **exactly** — `ROUND_HALF_EVEN` ties go to the even neighbour, `ROUND_HALF_UP` ties go away from zero (both signs). That precision is what makes rounding-policy divergence *refutable* instead of absorbed by an error bound:
+
+```typescript
+export function taxConservation(a: number, b: number, r: number): number {
+  requires(a > 0 && b > 0 && r > 0 && r < 1)
+  // "tax of the sum" === "sum of per-line taxes"?
+  ensures(((a + b) * r).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN) ===
+          (a * r).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN) +
+          (b * r).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN))
+  return 0
+}
+// ✗ counterexample: a = 1, b = 1, r ≈ 0.0025 — per-line rounds to 0.00 twice,
+//   the sum rounds to 0.01. The footer and the total disagree by a cent.
+```
+
+If a UI computes tax by rounding the aggregate while persistence rounds per line, this is the property that catches it. (`Math.round` is likewise exact — JS half-up semantics, negative halves included.)
 
 ## Proof-backed editor experience
 
