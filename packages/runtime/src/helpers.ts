@@ -5,8 +5,27 @@
  *   ensures(output() > 0)
  *   ensures(output() <= price)
  */
+// output() must be SAFE to evaluate at runtime: expression-form contracts
+// (`ensures(output().total.equals(x))`) evaluate their argument eagerly, so
+// returning undefined crashes the annotated function the first time it runs
+// for real. The absorbing proxy swallows any property access, call, or
+// coercion and keeps returning itself — the whole chain evaluates to inert
+// junk that ensures() ignores.
+/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-explicit-any */
+const absorbing: any = new Proxy(function () { /* inert */ }, {
+  get(_target, prop) {
+    if (prop === Symbol.toPrimitive || prop === 'valueOf') return () => 0
+    if (prop === 'toString' || prop === Symbol.toStringTag) return () => '__theorem_output__'
+    if (prop === 'then') return undefined  // never thenable — await must not hang
+    return absorbing
+  },
+  apply() { return absorbing },
+  has() { return true },
+})
+/* eslint-enable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-explicit-any */
+
 export function output(): any {
-  return undefined
+  return absorbing
 }
 
 // Numeric domain helpers accept nullable values AND Decimal-like objects
@@ -83,13 +102,14 @@ export function defined<T>(value: T | null | undefined): value is T {
   return value != null
 }
 
-export function sorted(arr: number[]): boolean {
-  return arr.every((item, i) => i === 0 || (arr[i - 1] as number) <= item)
+export function sorted(_arr: number[]): boolean {
+  // TRUE no-op — evaluating at runtime costs O(n) per contracted call. Z3 evaluates.
+  return true
 }
 
-export function unique<T>(arr: T[], key?: (item: T) => unknown): boolean {
-  const values = key ? arr.map(key) : arr
-  return new Set(values).size === values.length
+export function unique<T>(_arr: T[], _key?: (item: T) => unknown): boolean {
+  // TRUE no-op — see sorted.
+  return true
 }
 
 /**
@@ -119,8 +139,9 @@ export function conserved(..._values: number[]): boolean {
  *
  *   ensures(seqEq(list(output()), [x, ...list(tail)]))
  */
-export function seqEq<T>(a: readonly T[], b: readonly T[]): boolean {
-  return a.length === b.length && a.every((v, i) => v === b[i])
+export function seqEq<T>(_a: readonly T[], _b: readonly T[]): boolean {
+  // TRUE no-op — arguments may be spec-only expressions (list(output())).
+  return true
 }
 
 /**

@@ -223,20 +223,20 @@ export function old<T>(value: T): T {
 export function forall(predicate: (x: any) => boolean): boolean
 /** Array form: `forall(arr, (item) => P(item))` — checks every element. */
 export function forall<T>(arr: T[], predicate: (item: T, index: number) => boolean): boolean
-export function forall(...args: unknown[]): boolean {
-  if (args.length === 1) return true  // Z3 quantifier — no-op at runtime
-  const [arr, pred] = args as [unknown[], (...a: unknown[]) => boolean]
-  return arr.every(pred)
+export function forall(..._args: unknown[]): boolean {
+  // TRUE no-op: executing the predicate at runtime would cost O(n) on every
+  // contracted call AND could throw (e.g. a method call on a null field) —
+  // turning a static annotation into a production crash. Z3 alone evaluates.
+  return true
 }
 
 /** Z3 quantifier form: `exists(x => P(x))` — always true at runtime. */
 export function exists(predicate: (x: any) => boolean): boolean
 /** Array form: `exists(arr, (item) => P(item))` — checks some element. */
 export function exists<T>(arr: T[], predicate: (item: T, index: number) => boolean): boolean
-export function exists(...args: unknown[]): boolean {
-  if (args.length === 1) return true  // Z3 quantifier — no-op at runtime
-  const [arr, pred] = args as [unknown[], (...a: unknown[]) => boolean]
-  return arr.some(pred)
+export function exists(..._args: unknown[]): boolean {
+  // TRUE no-op — see forall.
+  return true
 }
 
 // ---------------------------------------------------------------------------

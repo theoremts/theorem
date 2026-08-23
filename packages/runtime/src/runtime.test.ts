@@ -6,6 +6,9 @@ import {
   requires,
   ensures,
   invariant,
+  output,
+  seqEq,
+  uniqueBy,
   decreases,
   modifies,
   old,
@@ -230,43 +233,27 @@ describe('old(x)', () => {
 // forall / exists
 // ---------------------------------------------------------------------------
 
-describe('forall', () => {
-  test('returns true when all elements satisfy predicate', () => {
+describe('forall (static-only word — TRUE no-op at runtime)', () => {
+  test('always true, regardless of contents', () => {
     assert.ok(forall([1, 2, 3], (x) => x > 0))
-  })
-
-  test('returns false when some element fails predicate', () => {
-    assert.ok(!forall([1, -1, 3], (x) => x > 0))
-  })
-
-  test('returns true for empty array', () => {
+    assert.ok(forall([1, -1, 3], (x) => x > 0))
     assert.ok(forall([], () => false))
   })
 
-  test('passes index to predicate', () => {
-    const indices: number[] = []
-    forall([10, 20, 30], (_x, i) => { indices.push(i); return true })
-    assert.deepEqual(indices, [0, 1, 2])
+  test('NEVER executes the predicate — a throwing predicate must be safe', () => {
+    assert.ok(forall([10, 20, 30], () => { throw new Error('predicate must never run') }))
   })
 })
 
-describe('exists', () => {
-  test('returns true when at least one element satisfies predicate', () => {
+describe('exists (static-only word — TRUE no-op at runtime)', () => {
+  test('always true, regardless of contents', () => {
     assert.ok(exists([1, -1, 3], (x) => x < 0))
+    assert.ok(exists([1, 2, 3], (x) => x < 0))
+    assert.ok(exists([], () => true))
   })
 
-  test('returns false when no element satisfies predicate', () => {
-    assert.ok(!exists([1, 2, 3], (x) => x < 0))
-  })
-
-  test('returns false for empty array', () => {
-    assert.ok(!exists([], () => true))
-  })
-
-  test('passes index to predicate', () => {
-    const indices: number[] = []
-    exists([10, 20, 30], (_x, i) => { indices.push(i); return false })
-    assert.deepEqual(indices, [0, 1, 2])
+  test('NEVER executes the predicate', () => {
+    assert.ok(exists([10, 20, 30], () => { throw new Error('predicate must never run') }))
   })
 })
 
@@ -356,49 +343,24 @@ describe('between', () => {
   })
 })
 
-describe('sorted', () => {
-  test('returns true for sorted array', () => {
+describe('sorted (static-only word — TRUE no-op at runtime)', () => {
+  test('always true — Z3 alone evaluates sortedness', () => {
     assert.ok(sorted([1, 2, 3, 4]))
-  })
-
-  test('returns true for array with equal elements', () => {
-    assert.ok(sorted([2, 2, 2]))
-  })
-
-  test('returns true for single element array', () => {
-    assert.ok(sorted([5]))
-  })
-
-  test('returns true for empty array', () => {
+    assert.ok(sorted([3, 1, 2]))
     assert.ok(sorted([]))
-  })
-
-  test('returns false for unsorted array', () => {
-    assert.ok(!sorted([3, 1, 2]))
   })
 })
 
-describe('unique', () => {
-  test('returns true for array with unique values', () => {
+describe('unique (static-only word — TRUE no-op at runtime)', () => {
+  test('always true — Z3 alone evaluates distinctness', () => {
     assert.ok(unique([1, 2, 3]))
-  })
-
-  test('returns false for array with duplicate values', () => {
-    assert.ok(!unique([1, 2, 1]))
-  })
-
-  test('returns true for empty array', () => {
+    assert.ok(unique([1, 2, 1]))
     assert.ok(unique([]))
   })
 
-  test('uses key function when provided', () => {
+  test('NEVER executes the key function', () => {
     const items = [{ id: 1 }, { id: 2 }, { id: 1 }]
-    assert.ok(!unique(items, (item) => item.id))
-  })
-
-  test('returns true when key function produces all unique values', () => {
-    const items = [{ id: 1 }, { id: 2 }, { id: 3 }]
-    assert.ok(unique(items, (item) => item.id))
+    assert.ok(unique(items, () => { throw new Error('key must never run') }))
   })
 })
 
@@ -457,5 +419,43 @@ describe('defineConfig', () => {
     }
     const result = defineConfig(config)
     assert.strictEqual(result, config)
+  })
+})
+
+describe('runtime safety: contracts must be evaluable no-ops', () => {
+  test('expression-form output() chains never throw', () => {
+    assert.doesNotThrow(() => {
+      const fn = (x: number) => {
+        ensures(output().subtotal.equals(output().cost.add(output().fee)))
+        ensures(output().total >= x)
+        ensures(!output().flag || output().count + 1 > 0)
+        return { subtotal: x, cost: x, fee: 0, total: x, flag: true, count: 1 }
+      }
+      fn(10)
+    })
+  })
+
+  test('quantifiers and collection vocabulary do not execute predicates', () => {
+    const explosive = () => { throw new Error('predicate must never run') }
+    assert.doesNotThrow(() => {
+      const arr = [{ v: null as { gte(n: number): boolean } | null }]
+      requires(forall(arr, (m) => m.v!.gte(0)))
+      requires(exists(arr, explosive))
+      requires(unique(arr, explosive))
+      requires(sorted([3, 1, 2]) === true)
+      requires(seqEq(arr, arr))
+      requires(uniqueBy(arr, explosive))
+    })
+    assert.strictEqual(sorted([3, 1, 2]), true, 'sorted is a static-only word — always true at runtime')
+  })
+
+  test('output() coerces harmlessly in arithmetic and string contexts', () => {
+    assert.doesNotThrow(() => {
+      const o = output()
+      void (o + 1)
+      void `${o}`
+      void (o > 0)
+      void o.a.b.c(1, 2).d
+    })
   })
 })
