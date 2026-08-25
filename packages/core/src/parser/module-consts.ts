@@ -254,14 +254,20 @@ export function injectModuleConstFacts(file: SourceFile, fileName: string, irs: 
     const paramNames = new Set(ir.params.map(p => p.name))
     for (const [name, value] of facts) {
       if (!used.has(name) || paramNames.has(name)) continue
-      ir.contracts.unshift({
-        kind: 'assume',
-        predicate: {
-          kind: 'binary', op: '===',
-          left: { kind: 'ident', name },
-          right: { kind: 'literal', value },
-        },
-      })
+      const predicate = {
+        kind: 'binary', op: '===',
+        left: { kind: 'ident', name },
+        right: { kind: 'literal', value },
+      } as const
+      ir.contracts.unshift({ kind: 'assume', predicate })
+      // Functions WITH positional check/assume steps skip top-level assume
+      // contracts ("already processed positionally") and a check at position
+      // 0 snapshots assumptions before the contract loop — the fact must
+      // ALSO lead the steps or check-only functions lose it (same silent
+      // drop as schema facts).
+      if (ir.bodySteps !== undefined) {
+        ir.bodySteps.unshift({ kind: 'assume', predicate })
+      }
     }
   }
 }

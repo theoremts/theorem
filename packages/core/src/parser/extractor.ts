@@ -191,6 +191,12 @@ export function extractFromSource(source: string, fileName = 'input.ts', registr
   // one-hop imports through relative/alias specifiers.
   try { injectModuleConstFacts(file, fileName, results) } catch { /* best-effort */ }
 
+  // Stamp the defining file: registries use it to stop same-named functions
+  // in different files from inheriting each other's contracts.
+  for (const r of results) {
+    if (r.sourceFile === undefined) r.sourceFile = fileName
+  }
+
   return results
 }
 

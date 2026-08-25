@@ -755,6 +755,32 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
     return bindings.size > 0 ? substituteExpr(parsed, bindings) : parsed
   }
 
+  // ── try { A } catch { B } — a branch under an UNKNOWABLE condition. Model
+  // as a ternary whose guard is an untranslatable call: the translator
+  // havocs it into a free Bool, so BOTH completions stay reachable and
+  // branch-structure properties prove (previously the whole body dropped
+  // and true ensures refuted with a free result). A `finally` that returns
+  // would override both branches — bail to stay sound.
+  if (Node.isTryStatement(first)) {
+    const finallyBlock = first.getFinallyBlock()
+    if (finallyBlock !== undefined &&
+        finallyBlock.getStatements().some(s => Node.isReturnStatement(s))) {
+      return null
+    }
+    const tryExpr = stmtToExprWithBindings(first.getTryBlock(), rest, new Map(bindings))
+    const catchClause = first.getCatchClause()
+    const catchExpr = catchClause !== undefined
+      ? stmtToExprWithBindings(catchClause.getBlock(), rest, new Map(bindings))
+      : parseWithBindings(rest, bindings)
+    if (tryExpr === null || catchExpr === null) return null
+    return {
+      kind: 'ternary',
+      condition: { kind: 'call', callee: '__nothrow', args: [] },
+      then: tryExpr,
+      else: catchExpr,
+    }
+  }
+
   // ── if (cond) ... — could be if/return (ternary) or if/assign (binding update) ──
   if (Node.isIfStatement(first)) {
     let cond = parseExpr(first.getExpression() as Expression)
@@ -874,6 +900,36 @@ function parseWithBindings(stmts: Statement[], bindings: Map<string, Expr>): Exp
       // is opaque to Z3 (binding x to the call would make x.field untranslatable),
       // and the schema constraints on x.* are injected as assume contracts.
       if (init && isSchemaParseCall(init)) continue
+
+      // `const hit = xs.find(f)` — bind hit to a SYMBOLIC element:
+      //   hit := __found ? xs[__findidx] : null
+      // The translator gives __found/__findidx linked domain facts
+      // (found ⟹ 0 <= idx < xs.length), so quantified element facts
+      // (forall(xs, v => P(v))) instantiate on the found value, and
+      // `hit === undefined` guards resolve to !__found.
+      if (init && Node.isCallExpression(init)) {
+        const calleeText = init.getExpression().getText()
+        if (calleeText.endsWith('.find') && init.getArguments().length >= 1) {
+          const recvNode = (init.getExpression() as import('ts-morph').PropertyAccessExpression).getExpression()
+          const recvParsed = parseExpr(recvNode as Expression)
+          const baseFlat = recvParsed !== null ? flattenForFind(recvParsed) : null
+          if (recvParsed !== null && baseFlat !== null) {
+            const n = nextFindId()
+            const bound: Expr = {
+              kind: 'ternary',
+              condition: { kind: 'ident', name: `__found__${baseFlat}__${n}` },
+              then: {
+                kind: 'element-access',
+                object: newBindings.size > 0 ? substituteExpr(recvParsed, newBindings) : recvParsed,
+                index: { kind: 'ident', name: `__findidx__${baseFlat}__${n}` },
+              },
+              else: { kind: 'literal', value: null },
+            }
+            newBindings.set(varName, bound)
+            continue
+          }
+        }
+      }
 
       // Dedup idioms as TRUSTED contracts (like Array.prototype.sort):
       //   [...new Map(arr.map(x => [x.key, x])).values()]  → uniqueBy(v, key)
@@ -1797,4 +1853,21 @@ function substituteIdents(expr: Expr, bindings: Map<string, Expr>): Expr {
     default:
       return expr
   }
+}
+
+// ---------------------------------------------------------------------------
+// find() symbolic bindings — support machinery
+// ---------------------------------------------------------------------------
+
+let _findIdCounter = 0
+function nextFindId(): number { return _findIdCounter++ }
+
+/** Flat name of a find() receiver, safe for embedding in a var name. */
+function flattenForFind(e: Expr): string | null {
+  if (e.kind === 'ident') return e.name
+  if (e.kind === 'member') {
+    const inner = flattenForFind(e.object)
+    return inner === null ? null : `${inner}.${e.property}`
+  }
+  return null
 }

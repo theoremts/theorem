@@ -13,6 +13,7 @@ import {
   printFileReport,
   verifyToSarif,
   buildRegistry,
+  filterRegistryForFile,
   extractCallSiteObligations,
   translateWithAutoInvariants,
 } from '@theoremts/core'
@@ -183,6 +184,12 @@ async function verifyFile(
     return null
   }
 
+  // Restrict the global registry to what THIS file can see — same-named
+  // functions in unrelated files must not lend their contracts (phantom
+  // failures AND unsound assumed ensures).
+  if (registry !== undefined && registry.size > 0) {
+    registry = filterRegistryForFile(source, absPath, registry)
+  }
   const irs = extractFromSource(source, absPath, registry)
 
   // Skip files with no contracts AND no registry (nothing to verify)
@@ -206,7 +213,15 @@ async function verifyFile(
       process.stderr.write(`${dim}skipped ${ir.name ?? '(anonymous)'} in ${displayPath}: ${err instanceof Error ? err.message : String(err)}${reset}\n`)
       continue
     }
-    if (tasks.length === 0) continue
+    if (tasks.length === 0) {
+      // Contracts present but NOTHING translated is a silent-drop hazard —
+      // "No contract violations found" would be a lie of omission. Warn.
+      const contractCount = ir.contracts.filter(c => c.kind === 'requires' || c.kind === 'ensures' || c.kind === 'check').length
+      if (contractCount > 0) {
+        process.stderr.write(`${yellow}⚠ ${ir.name ?? '(anonymous)'} in ${displayPath}: ${contractCount} contract(s) present but no obligation could be translated — the body shape is not yet modeled; contracts are NOT being checked${reset}\n`)
+      }
+      continue
+    }
 
     if (opts.debug) debugTranslator(tasks)
 

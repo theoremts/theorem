@@ -8,6 +8,7 @@ import type { AnyExpr, Bool } from 'z3-solver'
 import type { Z3Context } from '../solver/context.js'
 import type { Expr, Predicate } from '../parser/ir.js'
 import type { ContractRegistry } from '../registry/index.js'
+import { filterRegistryForFile } from '../registry/index.js'
 import type { VerificationTask } from '../translator/index.js'
 import { inlinePureMethodCalls, buildCallMapping, requiredParamCount, paramPositionCount } from '../translator/index.js'
 import { parseExpr, tryDedupIdiom, buildPairwiseDistinctFact } from '../parser/expr.js'
@@ -29,6 +30,11 @@ export function extractCallSiteObligations(
   registry: ContractRegistry,
   ctx: Z3Context,
 ): VerificationTask[] {
+  if (registry.size === 0) return []
+
+  // Same-named functions in unrelated files must not lend their contracts
+  // here — restrict to what THIS file can actually see.
+  registry = filterRegistryForFile(source, fileName, registry)
   if (registry.size === 0) return []
 
   const { Project } = require('ts-morph') as typeof import('ts-morph')
@@ -572,7 +578,71 @@ function collectScopeAssignments(callNode: Node): { assignments: Map<string, Exp
     current = parent
   }
 
+  // SOUNDNESS: a fact recorded from a declaration/assignment is STALE if the
+  // variable is written again anywhere before the call — including writes
+  // NESTED inside branches or loops, which the top-level walk above never
+  // visits. Without this, `let p = ZERO; if (c) { p = f(x) } use(p)` "proved"
+  // obligations against ZERO — a false proof masking real violations.
+  const scopeRoot = callNode.getAncestors().find(a =>
+    Node.isFunctionDeclaration(a) || Node.isArrowFunction(a) ||
+    Node.isMethodDeclaration(a) || Node.isFunctionExpression(a) ||
+    Node.isConstructorDeclaration(a)) ?? callNode.getSourceFile()
+  const writePositions = new Map<string, number[]>()
+  for (const bin of scopeRoot.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+    const op = bin.getOperatorToken().getText()
+    const isAssign = op === '=' || (op.endsWith('=') && !['==', '===', '<=', '>=', '!=', '!=='].includes(op))
+    if (!isAssign) continue
+    const lhs = bin.getLeft()
+    if (!Node.isIdentifier(lhs)) continue
+    const name = lhs.getText()
+    if (!writePositions.has(name)) writePositions.set(name, [])
+    writePositions.get(name)!.push(bin.getPos())
+  }
+  for (const un of [...scopeRoot.getDescendantsOfKind(SyntaxKind.PostfixUnaryExpression), ...scopeRoot.getDescendantsOfKind(SyntaxKind.PrefixUnaryExpression)]) {
+    const tok = (un as unknown as { getOperatorToken: () => number }).getOperatorToken()
+    if (tok !== SyntaxKind.PlusPlusToken && tok !== SyntaxKind.MinusMinusToken) continue
+    const operand = (un as { getOperand?: () => Node }).getOperand?.()
+    if (operand === undefined || !Node.isIdentifier(operand)) continue
+    const name = operand.getText()
+    if (!writePositions.has(name)) writePositions.set(name, [])
+    writePositions.get(name)!.push(un.getPos())
+  }
+  for (const name of [...assignments.keys()]) {
+    const writes = writePositions.get(name)
+    if (writes === undefined) continue
+    // The map holds the LAST top-level record before the call; find its
+    // position: the latest top-level write/declaration <= call. Any OTHER
+    // write strictly between that record and the call invalidates the fact.
+    // Conservative shortcut: if any write to the name is NESTED (not one of
+    // the positions the top-level walk visited), we can't order it reliably
+    // against the record — drop the fact when it sits before the call.
+    const decl = scopeRoot.getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+      .filter(d => Node.isIdentifier(d.getNameNode()) && d.getName() === name && d.getPos() < callNode.getPos())
+      .map(d => d.getPos())
+    const recordPos = Math.max(...decl, ...writes.filter(w => w < callNode.getPos() && !isNestedWrite(scopeRoot, w)), -1)
+    const invalidating = writes.some(w => w > recordPos && w < callNode.getPos() && isNestedWrite(scopeRoot, w))
+    if (invalidating) assignments.delete(name)
+  }
+
   return { assignments, sorts }
+}
+
+/** True when the write at `pos` is nested under a branch/loop (not a plain
+ *  top-level statement of a block on the call's ancestor chain). */
+function isNestedWrite(scopeRoot: Node, pos: number): boolean {
+  const node = scopeRoot.getDescendantAtPos(pos)
+  if (node === undefined) return true
+  let cur: Node | undefined = node
+  while (cur !== undefined && cur !== scopeRoot) {
+    if (Node.isIfStatement(cur) || Node.isForStatement(cur) || Node.isForOfStatement(cur) ||
+        Node.isForInStatement(cur) || Node.isWhileStatement(cur) || Node.isDoStatement(cur) ||
+        Node.isSwitchStatement(cur) || Node.isTryStatement(cur) || Node.isConditionalExpression(cur) ||
+        Node.isArrowFunction(cur) || Node.isFunctionExpression(cur)) {
+      return true
+    }
+    cur = cur.getParent()
+  }
+  return false
 }
 
 /** Detects `X.sort()` / `X.sort((a, b) => a - b)` — see the extractor twin. */

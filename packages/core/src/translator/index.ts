@@ -956,6 +956,18 @@ function foldBoundFromForall(
     x.kind === 'member' && x.property === field &&
     x.object.kind === 'element-access' && flat(x.object.object) === arrFlat
   const cmp = (e: Expr): { op: '>=' | '<='; c: number } | null => {
+    // Vocabulary forms first: nonNegative(x)/positive(x)/gte(x, lit)/lte(x, lit)
+    // are how real contracts spell the bound — a raw-comparison-only match
+    // silently ignored them (g4d).
+    if (e.kind === 'call' && e.args.length >= 1 && isProj(e.args[0]!)) {
+      if (e.callee === 'nonNegative' || e.callee === 'positive') return { op: '>=', c: 0 }
+      if ((e.callee === 'gte' || e.callee === 'gt') && e.args[1]?.kind === 'literal' && typeof e.args[1].value === 'number') {
+        return { op: '>=', c: e.args[1].value }
+      }
+      if ((e.callee === 'lte' || e.callee === 'lt') && e.args[1]?.kind === 'literal' && typeof e.args[1].value === 'number') {
+        return { op: '<=', c: e.args[1].value }
+      }
+    }
     if (e.kind !== 'binary') return null
     if (!isProj(e.left) || e.right.kind !== 'literal' || typeof e.right.value !== 'number') return null
     if (e.op === '>=' || e.op === '>') return { op: '>=', c: e.right.value }
@@ -1486,7 +1498,14 @@ function collectIdents(expr: Expr, out: Set<string>): void {
 function ensureIdentVars(expr: Expr, vars: Map<string, AnyExpr<'main'>>, ctx: Z3Context): void {
   switch (expr.kind) {
     case 'ident':
-      if (!vars.has(expr.name)) vars.set(expr.name, makeConst(expr.name, 'real', ctx))
+      if (!vars.has(expr.name)) {
+        // find() symbolic vars carry their sort in the name — a default
+        // Real here would poison the Bool/Int treatment downstream.
+        const sort = expr.name.startsWith('__found__') ? 'bool'
+          : expr.name.startsWith('__findidx__') ? 'int'
+          : 'real'
+        vars.set(expr.name, makeConst(expr.name, sort, ctx))
+      }
       break
     case 'binary':
       ensureIdentVars(expr.left, vars, ctx)
@@ -1762,7 +1781,46 @@ function collectDomainConstraints(
   const constraints: Bool<'main'>[] = []
   for (const [name, expr] of vars) {
     if (name.endsWith('.length')) {
-      try { constraints.push((expr as Arith<'main'>).ge(ctx.Real.val(0))) } catch {}
+      // Int-sorted lengths reject a Real zero — fall back to Int.val(0)
+      // (this was a silent drop: Int lengths had NO >= 0 fact).
+      try { constraints.push((expr as Arith<'main'>).ge(ctx.Real.val(0))) } catch {
+        try { constraints.push((expr as Arith<'main'>).ge(ctx.Int.val(0))) } catch { /* not arithmetic */ }
+      }
+      // arr.filter(f).length <= arr.length — the base name is encoded in
+      // the var name by the translator's filtered-length handling.
+      const filtered = /^__filtered__(.+?)__\d+\.length$/.exec(name)
+      if (filtered !== null) {
+        const baseLen = vars.get(`${filtered[1]}.length`)
+        if (baseLen !== undefined) {
+          try { constraints.push((expr as Arith<'main'>).le(baseLen as Arith<'main'>)) } catch {}
+        }
+      }
+    }
+
+    // find() symbolic elements: __found__<base>__N implies its paired index
+    // is a REAL position — 0 <= idx < base.length — so quantified element
+    // facts instantiate on the found value. Unfound stays a free miss.
+    const found = /^__found__(.+?)__(\d+)$/.exec(name)
+    if (found !== null) {
+      const idx = vars.get(`__findidx__${found[1]}__${found[2]}`)
+      let baseLen = vars.get(`${found[1]}.length`)
+      if (baseLen === undefined && idx !== undefined) {
+        // nothing else read the base length — mint it (with its >= 0 fact)
+        baseLen = ctx.Int.const(`${found[1]}.length`) as unknown as AnyExpr<'main'>
+        vars.set(`${found[1]}.length`, baseLen)
+        try { constraints.push((baseLen as Arith<'main'>).ge(ctx.Int.val(0))) } catch { /* skip */ }
+      }
+      if (idx !== undefined && baseLen !== undefined) {
+        try {
+          constraints.push(ctx.Implies(
+            expr as Bool<'main'>,
+            ctx.And(
+              (idx as Arith<'main'>).ge(ctx.Int.val(0)),
+              (idx as Arith<'main'>).lt(baseLen as Arith<'main'>),
+            ),
+          ))
+        } catch { /* sorts unexpected — skip */ }
+      }
     }
   }
 

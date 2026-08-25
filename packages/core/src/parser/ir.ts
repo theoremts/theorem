@@ -163,6 +163,10 @@ export interface FunctionIR {
    * which objects `spec(root)` reads — trusted, used for frame bridges.
    */
   footprints?: Map<string, string> | undefined
+  /** Absolute path of the defining file — used to keep same-named functions
+   *  in DIFFERENT files from inheriting each other's contracts. Declares
+   *  deliberately leave this unset (they are global by design). */
+  sourceFile?: string | undefined
 }
 
 /** One step of a heap-mode body. */

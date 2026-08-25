@@ -14,6 +14,18 @@ type Z3Set = SMTSet<'main'>
 /** Fresh names for havoc'd (untranslatable) ternary guards — see the ternary case. */
 let havocCondCounter = 0
 
+/** Stable key per distinct filter-call text so repeated occurrences unify. */
+const filterLenKeys = new Map<string, number>()
+function filterLenKeyOf(call: Expr): number {
+  const text = JSON.stringify(call)
+  let k = filterLenKeys.get(text)
+  if (k === undefined) {
+    k = filterLenKeys.size
+    filterLenKeys.set(text, k)
+  }
+  return k
+}
+
 /**
  * Converts an Expr IR node to a Z3 expression.
  * Returns null when the node cannot be represented (unsupported syntax).
@@ -87,6 +99,26 @@ export function toZ3(
         } catch { /* fall through to flat variable */ }
       }
 
+      // Transformed-array lengths: `arr.map(f).length` IS arr.length (map
+      // preserves length — exact); `arr.filter(f).length` is SOME k with
+      // 0 <= k <= arr.length (free Int; bounds via domain constraints, the
+      // name encodes the base so collectDomainConstraints can find it).
+      if (expr.property === 'length' && expr.object.kind === 'call' && expr.object.recv !== undefined) {
+        if (expr.object.callee.endsWith('.map')) {
+          return toZ3({ kind: 'member', object: expr.object.recv, property: 'length' }, vars, ctx)
+        }
+        if (expr.object.callee.endsWith('.filter')) {
+          const baseFlat = flattenMember(expr.object.recv)
+          if (baseFlat !== null) {
+            // ensure the base length var exists so the upper bound can bind
+            toZ3({ kind: 'member', object: expr.object.recv, property: 'length' }, vars, ctx)
+            const key = `__filtered__${baseFlat}__${filterLenKeyOf(expr.object)}.length`
+            if (!vars.has(key)) vars.set(key, ctx.Int.const(key) as unknown as Z3Expr)
+            return vars.get(key)!
+          }
+        }
+      }
+
       // Element field access: users[i].balance → Select(__field_balance, Select(users, i))
       // (read-only view of the heap encoding — field maps as uninterpreted arrays)
       if (expr.object.kind === 'element-access') {
@@ -141,6 +173,11 @@ export function toZ3(
 
     // ── Element access: arr[i] ───────────────────────────────────
     case 'element-access': {
+      // find() symbolic indices materialize as Int consts on first use —
+      // their bounds arrive via domain constraints (found ⟹ in range).
+      if (expr.index.kind === 'ident' && expr.index.name.startsWith('__findidx__') && !vars.has(expr.index.name)) {
+        vars.set(expr.index.name, ctx.Int.const(expr.index.name) as unknown as Z3Expr)
+      }
       // Member-array access (user.scores[k]) flattens to the dotted name
       const objName = expr.object.kind === 'ident'
         ? expr.object.name
@@ -225,7 +262,12 @@ export function toZ3(
 
     // ── Ternary: condition ? then : else → Z3 ITE ────────────────
     case 'ternary': {
-      let cond = toZ3(expr.condition, vars, ctx)
+      // Bare-ident guards translate bool-first: a fresh ident becomes a
+      // NAMED free Bool (repeated occurrences of the same guard unify —
+      // unlike per-occurrence havoc), an existing var comes back as-is.
+      let cond = expr.condition.kind === 'ident'
+        ? toZ3(expr.condition, vars, ctx, 'bool')
+        : toZ3(expr.condition, vars, ctx)
       if (cond === null) {
         // Untranslatable guard (optional chains, string methods, unknown
         // calls) — model it as a FREE boolean instead of dropping the whole
@@ -311,7 +353,31 @@ export function toZ3(
       // null/undefined comparisons: x === null, output() === null, etc.
       // Model as a boolean variable __is_null_<name> since Z3 has no null value.
       if (expr.op === '===' || expr.op === '!==') {
-        const isNullLiteral = (e: Expr) => e.kind === 'literal' && e.value === null
+        const isNullLiteral = (e: Expr) => (e.kind === 'literal' && e.value === null) ||
+          (e.kind === 'ident' && e.name === 'undefined')
+
+        // A ternary WITH a literal-null branch compared to null resolves to
+        // its own condition: `(found ? xs[i] : null) === undefined` ⟺ !found.
+        // This is what makes `const hit = xs.find(f); if (hit === undefined)`
+        // guards translate after SSA substitution.
+        const subjTernary = isNullLiteral(expr.right) ? expr.left : isNullLiteral(expr.left) ? expr.right : null
+        if (subjTernary !== null && subjTernary.kind === 'ternary' &&
+            (isNullLiteral(expr.left) || isNullLiteral(expr.right))) {
+          const thenNull = subjTernary.then.kind === 'literal' && subjTernary.then.value === null
+          const elseNull = subjTernary.else.kind === 'literal' && subjTernary.else.value === null
+          if (thenNull !== elseNull) {
+            const condZ3 = subjTernary.condition.kind === 'ident'
+              ? toZ3(subjTernary.condition, vars, ctx, 'bool')
+              : toZ3(subjTernary.condition, vars, ctx)
+            if (condZ3 !== null) {
+              try {
+                // value is null ⟺ (cond if then-null else !cond)
+                const isNull = thenNull ? condZ3 as Z3Bool : ctx.Not(condZ3 as Z3Bool)
+                return expr.op === '===' ? isNull as unknown as Z3Expr : ctx.Not(isNull) as unknown as Z3Expr
+              } catch { /* fall through */ }
+            }
+          }
+        }
         const getNullSubject = (e: Expr): string | null => {
           if (e.kind === 'ident') return e.name
           if (e.kind === 'call' && e.callee === 'output') return 'result'

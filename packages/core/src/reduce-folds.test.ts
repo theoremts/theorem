@@ -217,3 +217,19 @@ describe('for-of accumulation folds', () => {
     assert.strictEqual(results.find(r => r.text.includes('output() >= 0'))?.status, 'disproved')
   })
 })
+
+describe('fold bounds from vocabulary predicates', () => {
+  test('forall(arr, it => nonNegative(it.f)) bounds the sum', async () => {
+    const results = await verifyAll(`
+      interface Entry { hours: number }
+      export function totalHours(entries: Entry[]): number {
+        requires(forall(entries, (it) => nonNegative(it.hours)))
+        ensures(nonNegative(output()))
+        return entries.reduce((acc, it) => acc + it.hours, 0)
+      }
+    `)
+    const target = results.find(r => r.text.includes('output'))
+    assert.ok(target, 'Expected the ensures task')
+    assert.strictEqual(target.status, 'proved', 'vocabulary bound must feed the fold axiom')
+  })
+})

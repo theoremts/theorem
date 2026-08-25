@@ -191,3 +191,38 @@ describe('call-site: early-exit guard stability', () => {
     assert.strictEqual(good.status, 'proved', 'the stable guard discharges the requires')
   })
 })
+
+describe('registry: same-name functions in different files', () => {
+  test('a local uncontracted function shadows a foreign same-named contract', async () => {
+    const { buildRegistry } = await import('../registry/index.js')
+    const { extractFromSource } = await import('../parser/index.js')
+    const ctx = await getContext()
+    const fileA = `
+      export function summarize(xs: number[]): number {
+        requires(forall(xs, (v) => v >= 0))
+        ensures(output() >= 0)
+        return xs.length
+      }
+    `
+    const fileB = `
+      function summarize(text: string): number {
+        return text.length - 10
+      }
+      export function use(text: string): number {
+        return summarize(text)
+      }
+    `
+    const registry = buildRegistry([
+      ...extractFromSource(fileA, '/tmp/reg-a.ts'),
+      ...extractFromSource(fileB, '/tmp/reg-b.ts'),
+    ])
+    const tasks = extractCallSiteObligations(fileB, '/tmp/reg-b.ts', registry, ctx)
+    assert.strictEqual(tasks.length, 0,
+      'fileB defines its own summarize — fileA contracts must not leak (phantom failures)')
+    const tasksA = extractCallSiteObligations(fileA + `
+      var xs = [1, 2]
+      var r = summarize(xs)
+    `, '/tmp/reg-a.ts', registry, ctx)
+    assert.ok(tasksA.length >= 1, 'same-file calls still check normally')
+  })
+})
