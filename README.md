@@ -141,6 +141,18 @@ function applyDiscount(price: number, percent: number): number {
 }
 ```
 
+**Runtime safety rule**: contract calls are no-ops, but an EXPRESSION-form
+predicate evaluates its argument when the function runs. `output()` and every
+Theorem word are safe to evaluate — but *your own data* may not be:
+`ensures(output().equals(item.basis!.sub(paid)))` throws at runtime when
+`basis` is absent. For any predicate that dereferences nullable data, use the
+**arrow form** — the verifier reads the body statically and the runtime never
+calls it:
+
+```typescript
+ensures(() => output().equals(item.basis!.sub(paid)))   // never executed at runtime
+```
+
 If `requires` is violated → **caller's fault**. If `ensures` doesn't hold → **implementation bug**. A missing precondition is itself a finding:
 
 ```typescript
